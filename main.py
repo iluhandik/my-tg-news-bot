@@ -4,20 +4,30 @@ from datetime import datetime
 from config import DONOR_CHANNELS, CHECK_INTERVAL_SECONDS, CHANNEL_USERNAME
 from database import init_db, compute_hash, is_news_processed, mark_news_processed
 from tg_scraper import fetch_channel_posts
+from channel_sync import sync_user_channel_topics
 from ad_detector import is_advertisement
 from consensus import check_cross_donor_consensus
+from topic_filter import is_topic_already_covered, register_published_topic
 from ai_processor import process_news_with_ai
 from telegram_poster import send_telegram_message, send_telegram_photo, send_telegram_video_media
 from video_maker import build_short_video
 from social_poster import post_video_to_social_networks
 
+# Пауза між публікаціями новин (1 хвилина як просив користувач)
+DELAY_BETWEEN_POSTS_SECONDS = 60
+
 def run_news_cycle():
-    """Аналіз усіх каналів-донорів: публікуємо ВСІ актуальні якісні новини без штучних обмежень."""
+    """Аналіз каналів-донорів із синхронізацією з власним каналом та паузою в 1 хвилину."""
     posts_published = 0
 
     print(f"\n{'='*55}")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Публікуємо всі якісні свіжі новини...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Пауза між постами: {DELAY_BETWEEN_POSTS_SECONDS} сек")
     print(f"{'='*55}")
+
+    # 1. СИНХРОНІЗАЦІЯ З ВАШИМ КАНАЛОМ @kropivnit:
+    # Зчитуємо останні пости з вашого каналу, щоб бот знав, що ви вже виставили вручну,
+    # і НІКОЛИ не запостив це саме з інших донорів!
+    sync_user_channel_topics(CHANNEL_USERNAME, limit=25)
 
     for channel in DONOR_CHANNELS:
         posts = fetch_channel_posts(channel, limit=3)
@@ -28,23 +38,27 @@ def run_news_cycle():
             video_url = p.get("video_url")
             post_id = p.get("post_id", "")
 
-            # 1. АНТИРЕКЛАМА: жорстко відсікаємо будь-яку рекламу, кол-центри, казино чи піар
+            # 2. АНТИРЕКЛАМА ТА ФІЛЬТР РУТИННИХ ТРИВОГ БЕЗ ПОДІЙ:
             if is_advertisement(raw_text):
                 continue
 
-            # 2. ПЕРЕВІРКА НА ДУБЛІКАТ: якщо цю новину вже публікували — пропускаємо
+            # 3. ТЕХНІЧНИЙ ДУБЛЬ
             news_hash = compute_hash(channel, raw_text[:120])
             if is_news_processed(news_hash):
                 continue
 
-            # 3. ПЕРЕВІРКА РЕЗОНАНСУ (правило 3 донорів)
+            # 4. СМИСЛОВИЙ АНТИДУБЛЬ (перевіряє і базу, і синхронізовані пости вашого каналу!)
+            if is_topic_already_covered(raw_text):
+                mark_news_processed(news_hash, channel, post_id, is_breaking=False, video_generated=False)
+                continue
+
+            # 5. ПЕРЕВІРКА РЕЗОНАНСУ
             consensus_count, matched_donors = check_cross_donor_consensus(channel, raw_text)
             has_multi_donor_consensus = (consensus_count >= 3)
 
-            # 4. AI ОБРОБКА: переклад, очищення від донорів, звичайний шрифт
+            # 6. AI ОБРОБКА ТА ФІЛЬТРАЦІЯ
             ai_data = process_news_with_ai(raw_text)
             if not ai_data:
-                # Якщо AI відхилив або виявив приховану рекламу — фіксуємо й пропускаємо
                 mark_news_processed(news_hash, channel, post_id, is_breaking=False, video_generated=False)
                 continue
 
@@ -55,7 +69,12 @@ def run_news_cycle():
             is_mega_news = ai_data.get("is_mega_news", False) or has_multi_donor_consensus
             news_score = 10 if has_multi_donor_consensus else ai_data.get("news_score", 5)
 
-            # 5. ПУБЛІКАЦІЯ В КАНАЛ @kropivnit
+            # Якщо це вже не перший пост за цикл — робимо паузу рівно 1 хвилину!
+            if posts_published > 0:
+                print(f"[ПАУЗА]: Очікуємо {DELAY_BETWEEN_POSTS_SECONDS} секунд перед наступним постом...")
+                time.sleep(DELAY_BETWEEN_POSTS_SECONDS)
+
+            # 7. ПУБЛІКАЦІЯ В КАНАЛ @kropivnit
             posted = False
             if video_url:
                 posted = send_telegram_video_media(video_url, caption=telegram_post)
@@ -66,11 +85,13 @@ def run_news_cycle():
 
             if posted:
                 posts_published += 1
-                print(f"✅ ОПУБЛІКОВАНО В {CHANNEL_USERNAME} (Оцінка: {news_score}/10): {telegram_post[:50]}...")
+                headline_first_line = telegram_post.split("\n")[0]
+                register_published_topic(headline_first_line, raw_text)
+                print(f"✅ ОПУБЛІКОВАНО В {CHANNEL_USERNAME} (Оцінка: {news_score}/10): {headline_first_line[:50]}...")
             else:
                 print(f"❌ Помилка надсилання в Telegram: {channel}/{post_id}")
 
-            # 6. ВІДЕО ДЛЯ СОЦМЕРЕЖ (якщо мега-подія або підтверджено 3+ донорами з фото/відео)
+            # 8. ВІДЕО ДЛЯ СОЦМЕРЕЖ (якщо мега-новина або 3 донори)
             video_done = False
             if is_mega_news and posted and (photo_url or video_url):
                 headline = ai_data.get("video_headline", "ГОЛОВНІ НОВИНИ")
@@ -100,10 +121,7 @@ def run_news_cycle():
             # Фіксуємо пост у базі
             mark_news_processed(news_hash, channel, post_id, is_breaking=is_mega_news, video_generated=video_done)
 
-            # Невелика пауза між постами (3 секунди) для стабільності Telegram API
-            time.sleep(3)
-
-    print(f"\nЦикл завершено. Загалом опубліковано свіжих новин: {posts_published}\n")
+    print(f"\nЦикл завершено. Опубліковано свіжих новин: {posts_published}\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Новинний бот для @kropivnit")
