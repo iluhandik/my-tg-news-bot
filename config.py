@@ -11,19 +11,15 @@ CHANNEL_NAME = "Оперативні Новини України"
 CHANNEL_USERNAME = "@kropivnit"
 CHANNEL_INVITE_LINK = "https://t.me/kropivnit"
 
-# Фільтр давності: беремо актуальні новини за останні 24 години (відсікаємо архівні новини тижневої/місячної давності)
 MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
-
-# Інтервал безперервного сканування 24/7 у секундах (кожні 45 секунд — моментальний пост при виході)
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "45"))
 
-# AI
+# AI: використовуємо llama-3.1-8b-instant (доступна на всіх 100% безкоштовних акаунтах Groq)
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
+AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
 BREAKING_NEWS_THRESHOLD = 8
 
-# Джерела (канали-донори)
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
