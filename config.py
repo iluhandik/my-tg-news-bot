@@ -11,22 +11,23 @@ CHANNEL_NAME = "Оперативні Новини України"
 CHANNEL_USERNAME = "@kropivnit"
 CHANNEL_INVITE_LINK = "https://t.me/kropivnit"
 
-MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "45"))
+MAX_NEWS_AGE_HOURS = 18
+CHECK_INTERVAL_SECONDS = 60
 
-# AI: використовуємо llama-3.1-8b-instant (доступна на всіх 100% безкоштовних акаунтах Groq)
+# AI
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
 BREAKING_NEWS_THRESHOLD = 8
 
+# Повний список каналів-донорів (Supernova повернуто за вимогою!)
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
     "UaOnlii",
     "insiderUKR",
-    "exilenova_plus",
     "supernova_plus",
+    "exilenova_plus",
     "chp_zahid",
     "zsuwar",
     "nefedoov365",

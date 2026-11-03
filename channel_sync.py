@@ -2,13 +2,11 @@ import html
 import re
 import urllib.request
 from typing import List
-from topic_filter import register_published_topic
 
-def sync_user_channel_topics(channel_username: str = "kropivnit", limit: int = 25):
+def get_channel_recent_posts(channel_username: str = "kropivnit", limit: int = 15) -> List[str]:
     """
-    Зчитує останні дописи безпосередньо з вашого каналу @kropivnit
-    та записує їх у базу тем. Якщо ви виклали пост вручну — бот гарантовано
-    не викладе цю ж новину повторно з інших донорів!
+    Зчитує останні опубліковані пости безпосередньо з вашого каналу @kropivnit.
+    Повертає список коротких описів останніх новин каналу для ШІ-перевірки дублікатів.
     """
     clean_name = channel_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
     url = f"https://t.me/s/{clean_name}"
@@ -17,10 +15,10 @@ def sync_user_channel_topics(channel_username: str = "kropivnit", limit: int = 2
         "Accept-Language": "uk-UA,uk;q=0.9"
     }
 
-    synced_count = 0
+    recent_posts = []
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             html_raw = resp.read().decode("utf-8", errors="ignore")
 
         blocks = html_raw.split('<div class="tgme_widget_message_wrap')
@@ -30,15 +28,14 @@ def sync_user_channel_topics(channel_username: str = "kropivnit", limit: int = 2
                 continue
             
             raw_text = text_match.group(1)
-            raw_text = re.sub(r"<br\s*/?>", "\n", raw_text)
+            raw_text = re.sub(r"<br\s*/?>", " ", raw_text)
             raw_text = re.sub(r"<[^>]+>", "", raw_text)
             clean_text = html.unescape(raw_text).strip()
 
-            if len(clean_text) > 25:
-                headline = clean_text.split("\n")[0][:60]
-                register_published_topic(headline, clean_text)
-                synced_count += 1
+            if len(clean_text) > 20:
+                recent_posts.append(clean_text[:120])
 
-        print(f"[СИНХРОНІЗАЦІЯ]: Успішно синхронізовано {synced_count} останніх постів із вашого каналу @{clean_name}.")
     except Exception as e:
-        print(f"[СИНХРОНІЗАЦІЯ]: Не вдалося синхронізувати пости з @{clean_name}: {e}")
+        print(f"[СИНХРОНІЗАЦІЯ]: Помилка читання каналу @{clean_name}: {e}")
+
+    return recent_posts

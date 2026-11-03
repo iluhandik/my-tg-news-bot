@@ -1,18 +1,23 @@
 import json
-import urllib.request
-import urllib.parse
 import os
 import re
 import requests
 from typing import Optional
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, MEDIA_DIR
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, MEDIA_DIR, CHANNEL_USERNAME
+from media_watermarker import brand_image, brand_video
+
+# Канали, які накладають грубі водяні знаки на свої фото та відео
+CHANNELS_WITH_HEAVY_WATERMARKS = {
+    "supernova_plus",
+    "exilenova_plus"
+}
 
 def strip_html_tags(text: str) -> str:
     """Видаляє HTML теги на випадок збою розмітки."""
     return re.sub(r"<[^>]+>", "", text)
 
 def send_telegram_message(text: str, channel_id: Optional[str] = None) -> bool:
-    """Надсилає текстове повідомлення в канал з HTML-розміткою (жирний, цитати)."""
+    """Надсилає текстове повідомлення в канал з HTML-розміткою."""
     target_id = channel_id or TELEGRAM_CHANNEL_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -25,7 +30,6 @@ def send_telegram_message(text: str, channel_id: Optional[str] = None) -> bool:
         resp = requests.post(url, data=payload, timeout=20)
         res = resp.json()
         if not res.get("ok", False):
-            # Якщо Telegram свариться на незакритий HTML-тег — надсилаємо чистим текстом
             payload["text"] = strip_html_tags(text)
             payload.pop("parse_mode", None)
             resp = requests.post(url, data=payload, timeout=20)
@@ -35,44 +39,37 @@ def send_telegram_message(text: str, channel_id: Optional[str] = None) -> bool:
         print(f"[Telegram]: Помилка надсилання тексту: {e}")
         return False
 
-def send_telegram_photo(photo_url: str, caption: str, channel_id: Optional[str] = None) -> bool:
+def send_telegram_photo(photo_url: str, caption: str, donor_channel: str = "", channel_id: Optional[str] = None) -> bool:
     """
-    Надсилає фото з HTML-підписом:
-    1. Спроба за прямим URL.
-    2. Якщо Telegram не може відкрити URL — скачує фото і шле файлом (multipart).
+    Надсилає фото в канал:
+    - Якщо фото з каналу з чужими вотермарками (наприклад supernova_plus) -> накладає нашу плашку.
+    - Якщо фото чисте (УНІАН, офіційні джерела тощо) -> залишає його 100% оригінальним і чистим без жодних вотермарок!
     """
     target_id = channel_id or TELEGRAM_CHANNEL_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     caption_text = caption[:1024]
 
-    # Спроба 1: за URL
-    try:
-        payload = {
-            "chat_id": target_id,
-            "photo": photo_url,
-            "caption": caption_text,
-            "parse_mode": "HTML"
-        }
-        resp = requests.post(url, data=payload, timeout=20)
-        res = resp.json()
-        if res.get("ok", False):
-            print(f"[Telegram]: Фото успішно надіслано за прямим посиланням.")
-            return True
-        else:
-            print(f"[Telegram]: Не вдалося за URL ({res.get('description')}). Завантажуємо локально...")
-    except Exception as e:
-        print(f"[Telegram]: Збій відправки за URL: {e}")
+    raw_img_path = os.path.join(MEDIA_DIR, "raw_download_photo.jpg")
+    branded_img_path = os.path.join(MEDIA_DIR, "branded_post_photo.jpg")
 
-    # Спроба 2: скачуємо фото і шлемо як файл
-    temp_img_path = os.path.join(MEDIA_DIR, "temp_post_photo.jpg")
+    has_heavy_watermark = donor_channel.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
+
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         img_resp = requests.get(photo_url, headers=headers, timeout=15)
         if img_resp.status_code == 200 and len(img_resp.content) > 500:
-            with open(temp_img_path, "wb") as f:
+            with open(raw_img_path, "wb") as f:
                 f.write(img_resp.content)
 
-            with open(temp_img_path, "rb") as f:
+            # Брендуємо ТІЛЬКИ якщо це донор із нав'язливими водяними знаками!
+            if has_heavy_watermark:
+                final_img = brand_image(raw_img_path, branded_img_path, watermark_text=CHANNEL_USERNAME)
+                print(f"[Telegram]: Замінено чужий вотермарк з @{donor_channel} на наш {CHANNEL_USERNAME}.")
+            else:
+                final_img = raw_img_path
+                print(f"[Telegram]: Фото з @{donor_channel} чисте, публікуємо без зайвих вотермарок.")
+
+            with open(final_img, "rb") as f:
                 files = {"photo": ("photo.jpg", f, "image/jpeg")}
                 data = {
                     "chat_id": target_id,
@@ -82,7 +79,6 @@ def send_telegram_photo(photo_url: str, caption: str, channel_id: Optional[str] 
                 resp = requests.post(url, data=data, files=files, timeout=30)
                 res = resp.json()
                 if not res.get("ok", False):
-                    # Пробуємо без HTML якщо тег не пройшов
                     f.seek(0)
                     data["caption"] = strip_html_tags(caption_text)
                     data.pop("parse_mode", None)
@@ -90,75 +86,69 @@ def send_telegram_photo(photo_url: str, caption: str, channel_id: Optional[str] 
                     res = resp.json()
 
                 if res.get("ok", False):
-                    print(f"[Telegram]: Фото успішно завантажено файлом і опубліковано!")
+                    print(f"[Telegram]: Фото успішно опубліковано!")
                     return True
                 else:
-                    print(f"[Telegram]: Помилка відправки файлу фото: {res}")
+                    print(f"[Telegram]: Помилка відправки фото: {res}")
     except Exception as e:
-        print(f"[Telegram]: Збій завантаження фото файлом: {e}")
+        print(f"[Telegram]: Збій обробки фото: {e}")
 
-    # Резерв: текстом
     return send_telegram_message(caption, channel_id=target_id)
 
-def send_telegram_video_media(video_url: str, caption: str, channel_id: Optional[str] = None) -> bool:
-    """Надсилає оригінальне відео з HTML-описом."""
+def send_telegram_video_media(video_url: str, caption: str, donor_channel: str = "", channel_id: Optional[str] = None) -> bool:
+    """
+    Надсилає оригінальне відео в канал:
+    - Брендує тільки якщо джерело має чужі нав'язливі водяні знаки.
+    """
     target_id = channel_id or TELEGRAM_CHANNEL_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     caption_text = caption[:1024]
 
-    # Спроба 1: за URL
-    try:
-        payload = {
-            "chat_id": target_id,
-            "video": video_url,
-            "caption": caption_text,
-            "parse_mode": "HTML"
-        }
-        resp = requests.post(url, data=payload, timeout=25)
-        res = resp.json()
-        if res.get("ok", False):
-            print(f"[Telegram]: Відео успішно опубліковано за прямим посиланням.")
-            return True
-        else:
-            print(f"[Telegram]: Не вдалося надіслати відео за URL ({res.get('description')}). Завантажуємо локально...")
-    except Exception as e:
-        print(f"[Telegram]: Збій надсилання відео за URL: {e}")
+    raw_vid_path = os.path.join(MEDIA_DIR, "raw_download_video.mp4")
+    branded_vid_path = os.path.join(MEDIA_DIR, "branded_post_video.mp4")
 
-    # Спроба 2: скачуємо відео і відправляємо файлом
-    temp_vid_path = os.path.join(MEDIA_DIR, "temp_post_video.mp4")
+    has_heavy_watermark = donor_channel.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
+
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        vid_resp = requests.get(video_url, headers=headers, timeout=30, stream=True)
+        vid_resp = requests.get(video_url, headers=headers, timeout=35, stream=True)
         if vid_resp.status_code == 200:
-            with open(temp_vid_path, "wb") as f:
+            with open(raw_vid_path, "wb") as f:
                 for chunk in vid_resp.iter_content(chunk_size=1024*1024):
                     if chunk:
                         f.write(chunk)
 
-            if os.path.exists(temp_vid_path) and os.path.getsize(temp_vid_path) > 5000:
-                with open(temp_vid_path, "rb") as f:
+            if os.path.exists(raw_vid_path) and os.path.getsize(raw_vid_path) > 5000:
+                if has_heavy_watermark:
+                    final_video = brand_video(raw_vid_path, branded_vid_path, watermark_text=CHANNEL_USERNAME)
+                    print(f"[Telegram]: Замінено вотермарк на відео з @{donor_channel}.")
+                else:
+                    final_video = raw_vid_path
+                    print(f"[Telegram]: Відео з @{donor_channel} публікуємо в чистому оригіналі.")
+
+                with open(final_video, "rb") as f:
                     files = {"video": ("video.mp4", f, "video/mp4")}
                     data = {
                         "chat_id": target_id,
                         "caption": caption_text,
                         "parse_mode": "HTML"
                     }
-                    resp = requests.post(url, data=data, files=files, timeout=60)
+                    resp = requests.post(url, data=data, files=files, timeout=75)
                     res = resp.json()
                     if not res.get("ok", False):
                         f.seek(0)
                         data["caption"] = strip_html_tags(caption_text)
                         data.pop("parse_mode", None)
-                        resp = requests.post(url, data=data, files={"video": ("video.mp4", f, "video/mp4")}, timeout=60)
+                        resp = requests.post(url, data=data, files={"video": ("video.mp4", f, "video/mp4")}, timeout=75)
                         res = resp.json()
 
                     if res.get("ok", False):
-                        print(f"[Telegram]: Відео успішно завантажено файлом і опубліковано!")
+                        print(f"[Telegram]: Відео успішно опубліковано!")
                         return True
                     else:
-                        print(f"[Telegram]: Помилка надсилання відеофайлу: {res}")
+                        print(f"[Telegram]: Помилка надсилання відео: {res}")
     except Exception as e:
-        print(f"[Telegram]: Збій завантаження відеофайлу: {e}")
+        print(f"[Telegram]: Збій обробки відео: {e}")
 
     return send_telegram_message(caption, channel_id=target_id)
 
