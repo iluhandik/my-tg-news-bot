@@ -1,23 +1,23 @@
 import json
+import urllib.request
+import urllib.parse
 import os
 import re
 import requests
 from typing import Optional
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, MEDIA_DIR, CHANNEL_USERNAME
 from media_watermarker import brand_image, brand_video
+from topic_filter import is_media_duplicate, register_media
 
-# Канали, які накладають грубі водяні знаки на свої фото та відео
 CHANNELS_WITH_HEAVY_WATERMARKS = {
     "supernova_plus",
     "exilenova_plus"
 }
 
 def strip_html_tags(text: str) -> str:
-    """Видаляє HTML теги на випадок збою розмітки."""
     return re.sub(r"<[^>]+>", "", text)
 
 def send_telegram_message(text: str, channel_id: Optional[str] = None) -> bool:
-    """Надсилає текстове повідомлення в канал з HTML-розміткою."""
     target_id = channel_id or TELEGRAM_CHANNEL_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -41,9 +41,7 @@ def send_telegram_message(text: str, channel_id: Optional[str] = None) -> bool:
 
 def send_telegram_photo(photo_url: str, caption: str, donor_channel: str = "", channel_id: Optional[str] = None) -> bool:
     """
-    Надсилає фото в канал:
-    - Якщо фото з каналу з чужими вотермарками (наприклад supernova_plus) -> накладає нашу плашку.
-    - Якщо фото чисте (УНІАН, офіційні джерела тощо) -> залишає його 100% оригінальним і чистим без жодних вотермарок!
+    Завантажує фото, перевіряє на дублікат за хешем зображення, брендує при потребі та публікує.
     """
     target_id = channel_id or TELEGRAM_CHANNEL_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -51,23 +49,24 @@ def send_telegram_photo(photo_url: str, caption: str, donor_channel: str = "", c
 
     raw_img_path = os.path.join(MEDIA_DIR, "raw_download_photo.jpg")
     branded_img_path = os.path.join(MEDIA_DIR, "branded_post_photo.jpg")
-
     has_heavy_watermark = donor_channel.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
 
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         img_resp = requests.get(photo_url, headers=headers, timeout=15)
         if img_resp.status_code == 200 and len(img_resp.content) > 500:
+            # ПЕРЕВІРКА НА ДУБЛЬ ФОТО ЗА ХЕШЕМ:
+            if is_media_duplicate(img_resp.content, photo_url):
+                print(f"[АНТИДУБЛЬ]: Це саме фото вже було опубліковане раніше! Відхиляємо дублікат.")
+                return False
+
             with open(raw_img_path, "wb") as f:
                 f.write(img_resp.content)
 
-            # Брендуємо ТІЛЬКИ якщо це донор із нав'язливими водяними знаками!
             if has_heavy_watermark:
                 final_img = brand_image(raw_img_path, branded_img_path, watermark_text=CHANNEL_USERNAME)
-                print(f"[Telegram]: Замінено чужий вотермарк з @{donor_channel} на наш {CHANNEL_USERNAME}.")
             else:
                 final_img = raw_img_path
-                print(f"[Telegram]: Фото з @{donor_channel} чисте, публікуємо без зайвих вотермарок.")
 
             with open(final_img, "rb") as f:
                 files = {"photo": ("photo.jpg", f, "image/jpeg")}
@@ -87,6 +86,7 @@ def send_telegram_photo(photo_url: str, caption: str, donor_channel: str = "", c
 
                 if res.get("ok", False):
                     print(f"[Telegram]: Фото успішно опубліковано!")
+                    register_media(img_resp.content, photo_url)
                     return True
                 else:
                     print(f"[Telegram]: Помилка відправки фото: {res}")
@@ -96,18 +96,19 @@ def send_telegram_photo(photo_url: str, caption: str, donor_channel: str = "", c
     return send_telegram_message(caption, channel_id=target_id)
 
 def send_telegram_video_media(video_url: str, caption: str, donor_channel: str = "", channel_id: Optional[str] = None) -> bool:
-    """
-    Надсилає оригінальне відео в канал:
-    - Брендує тільки якщо джерело має чужі нав'язливі водяні знаки.
-    """
+    """Завантажує оригінальне відео, перевіряє дублікати, брендує та публікує."""
     target_id = channel_id or TELEGRAM_CHANNEL_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     caption_text = caption[:1024]
 
     raw_vid_path = os.path.join(MEDIA_DIR, "raw_download_video.mp4")
     branded_vid_path = os.path.join(MEDIA_DIR, "branded_post_video.mp4")
-
     has_heavy_watermark = donor_channel.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
+
+    # Перевірка дубля за URL відео
+    if is_media_duplicate(b"", video_url):
+        print(f"[АНТИДУБЛЬ]: Це саме відео вже було опубліковане раніше! Відхиляємо дубль.")
+        return False
 
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -121,10 +122,8 @@ def send_telegram_video_media(video_url: str, caption: str, donor_channel: str =
             if os.path.exists(raw_vid_path) and os.path.getsize(raw_vid_path) > 5000:
                 if has_heavy_watermark:
                     final_video = brand_video(raw_vid_path, branded_vid_path, watermark_text=CHANNEL_USERNAME)
-                    print(f"[Telegram]: Замінено вотермарк на відео з @{donor_channel}.")
                 else:
                     final_video = raw_vid_path
-                    print(f"[Telegram]: Відео з @{donor_channel} публікуємо в чистому оригіналі.")
 
                 with open(final_video, "rb") as f:
                     files = {"video": ("video.mp4", f, "video/mp4")}
@@ -144,6 +143,7 @@ def send_telegram_video_media(video_url: str, caption: str, donor_channel: str =
 
                     if res.get("ok", False):
                         print(f"[Telegram]: Відео успішно опубліковано!")
+                        register_media(b"", video_url)
                         return True
                     else:
                         print(f"[Telegram]: Помилка надсилання відео: {res}")
@@ -153,7 +153,6 @@ def send_telegram_video_media(video_url: str, caption: str, donor_channel: str =
     return send_telegram_message(caption, channel_id=target_id)
 
 def send_telegram_local_video(video_path: str, caption: str, target_chat_id: str) -> bool:
-    """Надсилає згенероване відео адміну для соцмереж."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     if not os.path.exists(video_path):
         return False

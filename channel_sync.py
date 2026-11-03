@@ -2,11 +2,14 @@ import html
 import re
 import urllib.request
 from typing import List
+from topic_filter import register_published_topic
 
-def get_channel_recent_posts(channel_username: str = "kropivnit", limit: int = 15) -> List[str]:
+def get_channel_recent_posts(channel_username: str = "kropivnit", limit: int = 20) -> List[str]:
     """
-    Зчитує останні опубліковані пости безпосередньо з вашого каналу @kropivnit.
-    Повертає список коротких описів останніх новин каналу для ШІ-перевірки дублікатів.
+    Зчитує останні дописи безпосередньо з вашого каналу @kropivnit
+    та автоматично реєструє їхні назви та географічні назви в базі тем.
+    Це гарантує, що якщо ви виклали пост вручну — бот НІКОЛИ не запостить
+    цю саму подію з жодного іншого каналу-донора!
     """
     clean_name = channel_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
     url = f"https://t.me/s/{clean_name}"
@@ -33,9 +36,13 @@ def get_channel_recent_posts(channel_username: str = "kropivnit", limit: int = 1
             clean_text = html.unescape(raw_text).strip()
 
             if len(clean_text) > 20:
+                headline = clean_text.split("\n")[0][:60]
+                # Реєструємо кожну новину з вашого каналу в антидублікаторі!
+                register_published_topic(headline, clean_text)
                 recent_posts.append(clean_text[:120])
 
+        print(f"[СИНХРОНІЗАЦІЯ]: Успішно синхронізовано {len(recent_posts)} останніх постів вашого каналу.")
     except Exception as e:
-        print(f"[СИНХРОНІЗАЦІЯ]: Помилка читання каналу @{clean_name}: {e}")
+        print(f"[СИНХРОНІЗАЦІЯ]: Не вдалося зчитати @{clean_name}: {e}")
 
     return recent_posts
