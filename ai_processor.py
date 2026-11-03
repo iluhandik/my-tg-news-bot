@@ -1,12 +1,11 @@
 import json
 import re
 import html
-import urllib.request
-import urllib.parse
+import requests
 from typing import Dict, Any, Optional
 from config import AI_PROVIDER, AI_API_KEY, AI_MODEL, BREAKING_NEWS_THRESHOLD
 
-SYSTEM_PROMPT = f"""Ти — головний редактор всеукраїнського новинного каналу.
+SYSTEM_PROMPT = f"""Ти — головний редактор всеукраїнського новинного Telegram-каналу.
 Твоє завдання — перетворити сиру новину на професійний, якісний пост для Telegram.
 
 СУВОРІ ПРАВИЛА:
@@ -47,15 +46,15 @@ def clean_donor_mentions(text: str) -> str:
 
 def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
     """
-    Обробляє новину через AI.
-    Якщо ключ AI не налаштований або запит не вдався — повертає None,
-    щоб НЕ засмічувати канал сирим російським чи невідредагованим текстом!
+    Обробляє новину через AI за допомогою бібліотеки requests з правильним User-Agent
+    (щоб Cloudflare на api.groq.com не блокував запит помилкою 403 Forbidden).
     """
     cleaned_input = clean_donor_mentions(raw_text)
     if not cleaned_input or len(cleaned_input) < 25:
         return None
 
-    if not AI_API_KEY or AI_API_KEY.startswith("YOUR_"):
+    api_key = (AI_API_KEY or "").strip()
+    if not api_key or api_key.startswith("YOUR_"):
         print("[AI ПОМИЛКА]: Ключ AI_API_KEY не вказано в Secrets! Бот не публікує сирий текст без обробки.")
         return None
 
@@ -70,22 +69,30 @@ def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
             "response_format": {"type": "json_object"},
             "temperature": 0.2
         }
+        
+        # Обов'язковий User-Agent щоб захист Cloudflare на серверах Groq не відбивав запит як 403 Forbidden
         headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {AI_API_KEY}"
+            "Accept": "application/json"
         }
-        req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            parsed = json.loads(data["choices"][0]["message"]["content"])
+
+        resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
+        
+        if resp.status_code != 200:
+            print(f"[AI ПОМИЛКА {resp.status_code}]: {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        parsed = json.loads(data["choices"][0]["message"]["content"])
+        
+        if parsed.get("is_ad", False):
+            print("[AI ФІЛЬТР]: AI розпізнав цей пост як рекламу/спам і відхилив його.")
+            return None
             
-            # Якщо AI розпізнав це як рекламу — відкидаємо
-            if parsed.get("is_ad", False):
-                print("[AI ФІЛЬТР]: AI розпізнав цей пост як рекламу/спам і відхилив його.")
-                return None
-                
-            return parsed
+        return parsed
+
     except Exception as e:
         print(f"[AI ПОМИЛКА]: Не вдалося викликати AI ({AI_PROVIDER}): {e}")
-        # Ніколи не публікуємо сирий текст, якщо AI не зміг його обробити!
         return None
