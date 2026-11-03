@@ -1,102 +1,105 @@
 import time
-import sys
 import argparse
 from datetime import datetime
-from config import RSS_FEEDS, CHECK_INTERVAL_SECONDS, CHANNEL_NAME, CHANNEL_USERNAME
+from config import DONOR_CHANNELS, CHECK_INTERVAL_SECONDS, CHANNEL_USERNAME
 from database import init_db, compute_hash, is_news_processed, mark_news_processed
-from parser import fetch_rss_feed
+from tg_scraper import fetch_channel_posts
+from ad_detector import is_advertisement
+from consensus import check_cross_donor_consensus
 from ai_processor import process_news_with_ai
-from telegram_poster import send_telegram_message, send_telegram_photo, send_telegram_video
+from telegram_poster import send_telegram_message, send_telegram_photo, send_telegram_video_media
 from video_maker import build_short_video
-from social_poster import post_to_all_socials_ayrshare, notify_admin_with_video
+from social_poster import post_video_to_social_networks
 
 def run_news_cycle():
-    """Один цикл перевірки новинних стрічок та публікації."""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Початок перевірки джерел новин...")
-    total_new = 0
+    """Безперервний аналіз каналів-донорів у реальному часі."""
+    total_processed = 0
 
-    for feed_url in RSS_FEEDS:
-        print(f"Сканування: {feed_url}")
-        articles = fetch_rss_feed(feed_url)
+    for channel in DONOR_CHANNELS:
+        posts = fetch_channel_posts(channel, limit=3)
 
-        for article in articles:
-            title = article["title"]
-            content = article["content"]
-            image_url = article.get("image_url")
-            link = article.get("link", "")
+        for p in posts:
+            raw_text = p["text"]
+            photo_url = p.get("photo_url")
+            video_url = p.get("video_url")
+            post_id = p.get("post_id", "")
 
-            news_hash = compute_hash(title, content)
+            # 1. СУВОРИЙ АНТИРЕКЛАМНИЙ ФАЙРВОЛ: миттєво відсікаємо будь-яку рекламу, казино, крипту чи взаємопіар
+            if is_advertisement(raw_text):
+                continue
 
+            news_hash = compute_hash(channel, raw_text[:120])
             if is_news_processed(news_hash):
                 continue
 
-            print(f"\n--> Знайдено нову новину: {title[:70]}...")
-            total_new += 1
+            # 2. ПЕРЕВІРКА РЕЗОНАНСУ: якщо новина вийшла у 2-3+ донорах одночасно — це 99% ТОП-новина!
+            consensus_count, matched_donors = check_cross_donor_consensus(channel, raw_text)
+            has_multi_donor_consensus = (consensus_count >= 3)
 
-            # 1. AI-рерайт та очищення від згадок першоджерел
-            ai_data = process_news_with_ai(title, content)
+            if has_multi_donor_consensus:
+                print(f"🔥 ПІДТВЕРДЖЕНО 3+ ДОНОРАМИ {matched_donors}! ТОП-НОВИНА: {raw_text[:60]}...")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Нова подія з @{channel}: {raw_text[:60]}...")
+
+            total_processed += 1
+
+            # 3. AI-редагування: переклад на солов'їну, видалення лінків/вотермарок, без підписів
+            ai_data = process_news_with_ai(raw_text)
             telegram_post = ai_data.get("telegram_post", "")
-            is_mega_news = ai_data.get("is_mega_news", False)
-            news_score = ai_data.get("news_score", 5)
+            is_mega_news = ai_data.get("is_mega_news", False) or has_multi_donor_consensus
+            news_score = 10 if has_multi_donor_consensus else ai_data.get("news_score", 5)
 
-            # 2. Публікація в Telegram-канал
+            # 4. Негайний пост у Telegram-канал @kropivnit
             posted = False
-            if image_url:
-                posted = send_telegram_photo(image_url, caption=telegram_post)
+            if video_url:
+                posted = send_telegram_video_media(video_url, caption=telegram_post)
+            elif photo_url:
+                posted = send_telegram_photo(photo_url, caption=telegram_post)
             else:
                 posted = send_telegram_message(telegram_post)
 
-            print(f"Опубліковано в Telegram (Оцінка важливості: {news_score}/10): {posted}")
+            print(f"-> Опубліковано в @kropivnit (Резонанс: {consensus_count} донорів, Оцінка: {news_score}/10): {posted}")
 
-            # 3. Якщо це мега-новина — створюємо коротке відео для Shorts/Reels/TikTok
-            video_generated = False
+            # 5. Якщо новина підтверджена 3 донорами або мега-важлива — монтуємо ролик для соцмереж
+            video_done = False
             if is_mega_news:
-                print(f"🔥 УВАГА: Мега-новина ({news_score}/10)! Запуск генерації вертикального відео...")
-                headline = ai_data.get("video_headline", title[:40])
-                script = ai_data.get("video_script", content[:300])
+                headline = ai_data.get("video_headline", "ГОЛОВНІ НОВИНИ УКРАЇНИ")
+                script = ai_data.get("video_script", "")
+                social_caption = ai_data.get("social_caption", "")
 
                 timestamp = int(time.time())
-                video_filename = f"short_{timestamp}.mp4"
+                video_filename = f"social_viral_{timestamp}.mp4"
+
                 video_path = build_short_video(
                     headline=headline,
                     script_text=script,
-                    image_url=image_url,
+                    image_url=photo_url,
                     output_filename=video_filename
                 )
 
                 if video_path:
-                    video_generated = True
-                    print(f"Відео успішно створено: {video_path}")
-                    
-                    # Надсилаємо відео у свій Telegram-канал
-                    video_caption = f"⚡️ **ВІДЕО: {headline}**\n\n{script[:300]}...\n\n👉 Підпишись: {CHANNEL_USERNAME}"
-                    send_telegram_video(video_path, caption=video_caption)
+                    video_done = True
+                    # Відправляємо ВИКЛЮЧНО в TikTok/Reels/Shorts/Threads/FB (у ТГ-канал не публікується!)
+                    post_video_to_social_networks(
+                        video_path=video_path,
+                        headline=headline,
+                        script_text=script,
+                        social_caption=social_caption
+                    )
 
-                    # Сповіщаємо адміна
-                    notify_admin_with_video(video_path, title=headline, script_text=script)
-
-                    # Публікація в соцмережі (TikTok, YouTube Shorts, Reels, Threads)
-                    # (за наявності публічного URL або через API)
-                    # post_to_all_socials_ayrshare(...)
-
-            # Позначаємо новину як оброблену в БД
-            mark_news_processed(news_hash, title, link, is_breaking=is_mega_news, video_generated=video_generated)
-
-            # Пауза між публікаціями щоб не спамити у канал
-            time.sleep(5)
-
-    print(f"Цикл завершено. Оброблено нових публікацій: {total_new}\n")
+            # Фіксуємо пост у базі
+            mark_news_processed(news_hash, channel, post_id, is_breaking=is_mega_news, video_generated=video_done)
+            time.sleep(3)
 
 def main():
-    parser = argparse.ArgumentParser(description="Автоматичний новинний бот та генератор відео для Telegram і соцмереж.")
-    parser.add_argument("--once", action="store_true", help="Виконати перевірку один раз і завершити роботу.")
+    parser = argparse.ArgumentParser(description="Автономний новинний бот 24/7 для @kropivnit")
+    parser.add_argument("--once", action="store_true", help="Один прогін")
     args = parser.parse_args()
 
     init_db()
     print("=" * 60)
-    print(f"🚀 СИСТЕМА АВТОМАТИЗАЦІЇ НОВИН ТА ВІДЕО ЗАПУЩЕНА")
-    print(f"Канал: {CHANNEL_NAME} ({CHANNEL_USERNAME})")
-    print(f"Інтервал перевірки: {CHECK_INTERVAL_SECONDS} секунд")
+    print(f"🚀 ЦІЛОДОБОВИЙ МОНІТОРИНГ НОВИН 24/7 АКТИВОВАНО")
+    print(f"Канал: {CHANNEL_USERNAME} | Інтервал сканування: {CHECK_INTERVAL_SECONDS} секунд")
     print("=" * 60)
 
     if args.once:
@@ -107,8 +110,7 @@ def main():
         try:
             run_news_cycle()
         except Exception as e:
-            print(f"Критична помилка в циклі: {e}")
-        
+            print(f"Помилка в циклі: {e}")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
