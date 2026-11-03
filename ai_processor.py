@@ -1,58 +1,63 @@
 import json
 import re
+import html
 import urllib.request
 import urllib.parse
-from typing import Dict, Any
-from config import AI_PROVIDER, AI_API_KEY, AI_MODEL, CHANNEL_INVITE_LINK, BREAKING_NEWS_THRESHOLD
+from typing import Dict, Any, Optional
+from config import AI_PROVIDER, AI_API_KEY, AI_MODEL, BREAKING_NEWS_THRESHOLD
 
-SYSTEM_PROMPT = f"""Ти — професійний редактор всеукраїнського новинного Telegram-каналу.
-Канал висвітлює головні оперативні новини України: ситуація на фронті, ракетні/дронові небезпеки, енергетика, важливі державні рішення та міжнародні події.
+SYSTEM_PROMPT = f"""Ти — головний редактор всеукраїнського новинного каналу.
+Твоє завдання — перетворити сиру новину на професійний, якісний пост для Telegram.
 
-Суворі правила оформлення постів:
-1. ПОВНІСТЮ ОЧИСТИТИ текст від будь-яких згадок першоджерел:
-   - Видалити всі назви каналів ("Инсайдер", "Украина Сейчас", "УНИАН", "Supernova", "Труха", "Цензор", "Захід" тощо).
-   - Видалити всі нікнейми з собачкою (@...).
-   - Видалити всі посилання (t.me/..., http, https).
-   - Видалити всі заклики підписатися та рекламу.
-2. ПЕРЕКЛАСТИ НА ЧИСТУ УКРАЇНСЬКУ МОВУ (без російських слів, кальок і суржику).
-3. НІЯКИХ ПІДПИСІВ У КІНЦІ ПОСТУ:
-   - НЕ додавай жодних підписів типу "👉 Підписатися", "Джерело", "Стежте за новинами". Пост має закінчуватися сухими фактами новини!
-4. ЗАБОРОНА ЗНАЧКА "💬":
-   - Значок "💬" використовує особисто автор каналу для своїх думок. НЕ використовуй його у новинах.
-5. СТРУКТУРА ПОСТУ:
-   - Влучний емодзі на початку (⚡️, 🚨, 🇺🇦, 💥, ⚔️, 📢) + сильний, інформативний заголовок жирним шрифтом.
-   - 2-3 короткі, чіткі абзаци з головними фактами без зайвої води.
-6. ВІДЕО ДЛЯ СОЦМЕРЕЖ (TIKTOK / REELS / SHORTS):
-   - Якщо новина масштабна (оцінка >= {BREAKING_NEWS_THRESHOLD}), підготувати динамічний 30-секундний сценарій для вертикального відео.
-   - У сценарії для соцмереж заклик підписатися на Telegram залишається ("Більше деталей у нашому Telegram-каналі за посиланням у шапці профілю!").
+СУВОРІ ПРАВИЛА:
+1. МОВА: 100% чиста українська мова. Якщо текст російською мовою — повністю і грамотно переклади його на українську. Жодного російського слова!
+2. ОЧИЩЕННЯ ВІД ДОНОРІВ:
+   - ПОВНІСТЮ видали будь-які хвости, водяні знаки та скорочення донорів: "УС /", "УС", "Инсайдер", "УНИАН", "Supernova", "Труха", "Цензор", "Захід".
+   - Видали всі нікнейми (@u_now, @insiderUKR тощо) та всі посилання (t.me/..., http/https).
+3. ШРИФТ ТА ОФОРМЛЕННЯ (БЕЗ КАПСУ!):
+   - Заголовок пиши ЗВИЧАЙНИМИ РЕЧЕННЯМИ (перша літера велика, решта маленькі). ЗАБОРОНЕНО писати заголовок КАПСОМ!
+   - На початку заголовка постав 1 доречний емодзі: ⚡️, 🚨, 🇺🇦, 💥, ⚔️, 💡, 📢.
+   - Сам заголовок виділи жирним шрифтом: **Заголовок**.
+   - Під заголовком — 1-2 короткі, чіткі абзаци з головною суттю події без води.
+4. ЗАБОРОНИ:
+   - ЖОДНИХ підписів у кінці (не пиши "Підписатися", "Джерело", посилання).
+   - ЖОДНОГО значка "💬" (його ставить тільки автор каналу особисто).
+   - Якщо новина виглядає як реклама (казино, заробітки, розіграші, боти, кол-центри) — встанови "is_ad": true.
 
 Формат відповіді СТРОГО валідний JSON:
 {{
-  "telegram_post": "Готовий текст посту для Telegram українською мовою з Markdown (БЕЗ підпису в кінці)",
-  "news_score": 8,
-  "is_mega_news": true,
-  "video_headline": "КОРОТКИЙ ЗАГОЛОВОК КАПСОМ ДЛЯ ВІДЕО (3-5 СЛІВ)",
-  "video_script": "Текст дикторської озвучки для Shorts/Reels/TikTok",
-  "social_caption": "Опис для відео в TikTok/Reels/Shorts із закликом перейти в Telegram"
+  "is_ad": false,
+  "telegram_post": "Текст якісного посту для Telegram українською мовою без капсу і без підписів",
+  "news_score": 7,
+  "is_mega_news": false,
+  "video_headline": "Короткий заголовок для відео",
+  "video_script": "Текст дикторської озвучки для відео (якщо news_score >= {BREAKING_NEWS_THRESHOLD})",
+  "social_caption": "Опис для соцмереж"
 }}
 """
 
 def clean_donor_mentions(text: str) -> str:
-    """Видаляє посилання та назви сторонніх каналів."""
+    """Видаляє HTML сутності, посилання та назви сторонніх каналів."""
+    text = html.unescape(text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"t\.me/\S+", "", text)
     text = re.sub(r"@[a-zA-Z0-9_]+", "", text)
-    text = re.sub(r"(?i)(подписаться|підписатися|прислать новость|надіслати новину|инсайдер|украина сейчас|униан|supernova|труха)\b[^\n]*", "", text)
+    text = re.sub(r"(?i)\b(ус\s*/?|украина сейчас|инсайдер|униан|supernova|труха)\b", "", text)
     return text.strip()
 
-def process_news_with_ai(raw_text: str) -> Dict[str, Any]:
-    """Обробляє та адаптує новину через AI."""
+def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Обробляє новину через AI.
+    Якщо ключ AI не налаштований або запит не вдався — повертає None,
+    щоб НЕ засмічувати канал сирим російським чи невідредагованим текстом!
+    """
     cleaned_input = clean_donor_mentions(raw_text)
-    if not cleaned_input:
-        cleaned_input = raw_text
+    if not cleaned_input or len(cleaned_input) < 25:
+        return None
 
     if not AI_API_KEY or AI_API_KEY.startswith("YOUR_"):
-        return fallback_process(cleaned_input)
+        print("[AI ПОМИЛКА]: Ключ AI_API_KEY не вказано в Secrets! Бот не публікує сирий текст без обробки.")
+        return None
 
     try:
         api_url = "https://api.groq.com/openai/v1/chat/completions" if AI_PROVIDER.lower() == "groq" else "https://api.openai.com/v1/chat/completions"
@@ -60,10 +65,10 @@ def process_news_with_ai(raw_text: str) -> Dict[str, Any]:
             "model": AI_MODEL,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Сирий текст новини:\n{cleaned_input}"}
+                {"role": "user", "content": f"Оброби цей текст новини:\n{cleaned_input}"}
             ],
             "response_format": {"type": "json_object"},
-            "temperature": 0.3
+            "temperature": 0.2
         }
         headers = {
             "Content-Type": "application/json",
@@ -71,34 +76,16 @@ def process_news_with_ai(raw_text: str) -> Dict[str, Any]:
         }
         req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            return json.loads(res["choices"][0]["message"]["content"])
+            data = json.loads(resp.read().decode("utf-8"))
+            parsed = json.loads(data["choices"][0]["message"]["content"])
+            
+            # Якщо AI розпізнав це як рекламу — відкидаємо
+            if parsed.get("is_ad", False):
+                print("[AI ФІЛЬТР]: AI розпізнав цей пост як рекламу/спам і відхилив його.")
+                return None
+                
+            return parsed
     except Exception as e:
-        print(f"Помилка виклику AI ({AI_PROVIDER}): {e}")
-        return fallback_process(cleaned_input)
-
-def fallback_process(text: str) -> Dict[str, Any]:
-    """Резервна обробка без підпису."""
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    first_line = lines[0][:80] if lines else "ВАЖЛИВА НОВИНА"
-    body = "\n\n".join(lines[1:3]) if len(lines) > 1 else text[:300]
-    
-    is_breaking = any(w in text.lower() for w in ["вибух", "війна", "терміново", "удар", "наступ", "атака", "ракета", "зсу", "дрон"])
-    score = 8 if is_breaking else 5
-
-    post = f"⚡️ **{first_line.upper()}**\n\n{body}"
-
-    script = (
-        f"Термінова новина! {first_line}. "
-        f"Більше оперативних деталей та відео без цензури — у нашому Telegram-каналі. "
-        f"Посилання закріплено в описі профілю, переходьте та підписуйтесь!"
-    )
-
-    return {
-        "telegram_post": post,
-        "news_score": score,
-        "is_mega_news": score >= BREAKING_NEWS_THRESHOLD,
-        "video_headline": first_line[:40].upper(),
-        "video_script": script,
-        "social_caption": f"{first_line}\n\nБільше деталей у Telegram: {CHANNEL_INVITE_LINK}\n#новини #україна #shorts #reels #tiktok"
-    }
+        print(f"[AI ПОМИЛКА]: Не вдалося викликати AI ({AI_PROVIDER}): {e}")
+        # Ніколи не публікуємо сирий текст, якщо AI не зміг його обробити!
+        return None

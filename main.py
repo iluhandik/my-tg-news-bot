@@ -11,20 +11,32 @@ from telegram_poster import send_telegram_message, send_telegram_photo, send_tel
 from video_maker import build_short_video
 from social_poster import post_video_to_social_networks
 
+MAX_POSTS_PER_RUN = 1
+
 def run_news_cycle():
-    """Безперервний аналіз каналів-донорів у реальному часі."""
-    total_processed = 0
+    """Безперервний аналіз новин з жорстким контролем якості."""
+    posts_published = 0
+
+    print(f"\n{'='*55}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Ліміт: {MAX_POSTS_PER_RUN} пост")
+    print(f"{'='*55}")
 
     for channel in DONOR_CHANNELS:
-        posts = fetch_channel_posts(channel, limit=3)
+        if posts_published >= MAX_POSTS_PER_RUN:
+            break
+
+        posts = fetch_channel_posts(channel, limit=2)
 
         for p in posts:
+            if posts_published >= MAX_POSTS_PER_RUN:
+                break
+
             raw_text = p["text"]
             photo_url = p.get("photo_url")
             video_url = p.get("video_url")
             post_id = p.get("post_id", "")
 
-            # 1. СУВОРИЙ АНТИРЕКЛАМНИЙ ФАЙРВОЛ: миттєво відсікаємо будь-яку рекламу, казино, крипту чи взаємопіар
+            # 1. АНТИРЕКЛАМА
             if is_advertisement(raw_text):
                 continue
 
@@ -32,24 +44,24 @@ def run_news_cycle():
             if is_news_processed(news_hash):
                 continue
 
-            # 2. ПЕРЕВІРКА РЕЗОНАНСУ: якщо новина вийшла у 2-3+ донорах одночасно — це 99% ТОП-новина!
+            # 2. ПЕРЕВІРКА РЕЗОНАНСУ (правило 3 донорів)
             consensus_count, matched_donors = check_cross_donor_consensus(channel, raw_text)
             has_multi_donor_consensus = (consensus_count >= 3)
 
-            if has_multi_donor_consensus:
-                print(f"🔥 ПІДТВЕРДЖЕНО 3+ ДОНОРАМИ {matched_donors}! ТОП-НОВИНА: {raw_text[:60]}...")
-            else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Нова подія з @{channel}: {raw_text[:60]}...")
-
-            total_processed += 1
-
-            # 3. AI-редагування: переклад на солов'їну, видалення лінків/вотермарок, без підписів
+            # 3. AI ОБРОБКА
             ai_data = process_news_with_ai(raw_text)
+            if not ai_data:
+                mark_news_processed(news_hash, channel, post_id, is_breaking=False, video_generated=False)
+                continue
+
             telegram_post = ai_data.get("telegram_post", "")
+            if not telegram_post or len(telegram_post) < 30:
+                continue
+
             is_mega_news = ai_data.get("is_mega_news", False) or has_multi_donor_consensus
             news_score = 10 if has_multi_donor_consensus else ai_data.get("news_score", 5)
 
-            # 4. Негайний пост у Telegram-канал @kropivnit
+            # 4. ПУБЛІКАЦІЯ В КАНАЛ @kropivnit (1 пост)
             posted = False
             if video_url:
                 posted = send_telegram_video_media(video_url, caption=telegram_post)
@@ -58,28 +70,33 @@ def run_news_cycle():
             else:
                 posted = send_telegram_message(telegram_post)
 
-            print(f"-> Опубліковано в @kropivnit (Резонанс: {consensus_count} донорів, Оцінка: {news_score}/10): {posted}")
+            if posted:
+                posts_published += 1
+                print(f"✅ УСПІШНО ОПУБЛІКОВАНО В {CHANNEL_USERNAME}: {telegram_post[:60]}...")
+            else:
+                print(f"❌ Помилка надсилання в Telegram: {channel}/{post_id}")
 
-            # 5. Якщо новина підтверджена 3 донорами або мега-важлива — монтуємо ролик для соцмереж
+            # 5. ГЕНЕРАЦІЯ ВІДЕО ДЛЯ СОЦМЕРЕЖ (лише якщо є реальне фото або відео події!)
             video_done = False
-            if is_mega_news:
-                headline = ai_data.get("video_headline", "ГОЛОВНІ НОВИНИ УКРАЇНИ")
+            if is_mega_news and posted and (photo_url or video_url):
+                headline = ai_data.get("video_headline", "ГОЛОВНІ НОВИНИ")
                 script = ai_data.get("video_script", "")
                 social_caption = ai_data.get("social_caption", "")
 
                 timestamp = int(time.time())
                 video_filename = f"social_viral_{timestamp}.mp4"
 
+                # Передаємо реальне відео або фото
                 video_path = build_short_video(
                     headline=headline,
                     script_text=script,
                     image_url=photo_url,
+                    source_video_url=video_url,
                     output_filename=video_filename
                 )
 
                 if video_path:
                     video_done = True
-                    # Відправляємо ВИКЛЮЧНО в TikTok/Reels/Shorts/Threads/FB (у ТГ-канал не публікується!)
                     post_video_to_social_networks(
                         video_path=video_path,
                         headline=headline,
@@ -87,21 +104,17 @@ def run_news_cycle():
                         social_caption=social_caption
                     )
 
-            # Фіксуємо пост у базі
+            # Записуємо в базу
             mark_news_processed(news_hash, channel, post_id, is_breaking=is_mega_news, video_generated=video_done)
-            time.sleep(3)
+
+    print(f"Цикл завершено. Опубліковано: {posts_published}\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="Автономний новинний бот 24/7 для @kropivnit")
-    parser.add_argument("--once", action="store_true", help="Один прогін")
+    parser = argparse.ArgumentParser(description="Новинний бот для @kropivnit")
+    parser.add_argument("--once", action="store_true", help="Один запуск")
     args = parser.parse_args()
 
     init_db()
-    print("=" * 60)
-    print(f"🚀 ЦІЛОДОБОВИЙ МОНІТОРИНГ НОВИН 24/7 АКТИВОВАНО")
-    print(f"Канал: {CHANNEL_USERNAME} | Інтервал сканування: {CHECK_INTERVAL_SECONDS} секунд")
-    print("=" * 60)
-
     if args.once:
         run_news_cycle()
         return
