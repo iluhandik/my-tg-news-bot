@@ -2,8 +2,8 @@ import json
 import re
 import html
 import requests
-from typing import Dict, Any, Optional
-from config import AI_PROVIDER, AI_API_KEY, AI_MODEL, BREAKING_NEWS_THRESHOLD
+from typing import Dict, Any, Optional, List
+from config import AI_PROVIDER, AI_API_KEY, BREAKING_NEWS_THRESHOLD
 
 SYSTEM_PROMPT = f"""Ти — головний редактор всеукраїнського новинного Telegram-каналу.
 Твоє завдання — перетворити сиру новину на якісний, професійний пост для Telegram.
@@ -44,20 +44,44 @@ def clean_donor_mentions(text: str) -> str:
     text = re.sub(r"(?i)\b(ус\s*/?|украина сейчас|инсайдер|униан|supernova|труха)\b", "", text)
     return text.strip()
 
-# Список перевірених безкоштовних моделей Groq у порядку пріоритету
-GROQ_MODELS = [
-    "llama-3.1-8b-instant",
-    "llama3-8b-8192",
-    "llama-3.3-70b-versatile",
-    "mixtral-8x7b-32768"
-]
+CACHED_AVAILABLE_MODELS: List[str] = []
+
+def get_available_models(api_key: str, headers: dict) -> List[str]:
+    """
+    Автоматично запитує в API Groq список ТОЧНО доступних моделей для вашого акаунта.
+    Це гарантує, що бот обере робочу модель і ніколи не впаде через 404 (model_not_found).
+    """
+    global CACHED_AVAILABLE_MODELS
+    if CACHED_AVAILABLE_MODELS:
+        return CACHED_AVAILABLE_MODELS
+
+    try:
+        url = "https://api.groq.com/openai/v1/models"
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            # Відфільтровуємо аудіо та захисні моделі (whisper, guard)
+            active_models = [
+                m["id"] for m in data 
+                if not any(x in m["id"].lower() for x in ["whisper", "guard", "vision", "embed"])
+            ]
+            print(f"[AI ДІАГНОСТИКА]: Доступні текстові моделі у вашому акаунті Groq: {active_models}")
+            CACHED_AVAILABLE_MODELS = active_models
+            return active_models
+        else:
+            print(f"[AI ДІАГНОСТИКА]: Не вдалося отримати список моделей (Статус {resp.status_code}): {resp.text[:120]}")
+    except Exception as e:
+        print(f"[AI ДІАГНОСТИКА]: Помилка перевірки списку моделей: {e}")
+
+    # Резервний список на випадок збою запиту списку
+    return [
+        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
+        "gemma2-9b-it"
+    ]
 
 def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
-    """
-    Обробляє новину через AI.
-    Якщо обрана модель недоступна на безкоштовному тарифі (404),
-    автоматично перемикається на гарантовано доступну llama-3.1-8b-instant.
-    """
+    """Обробляє новину через AI за допомогою динамічно визначеної робочої моделі."""
     cleaned_input = clean_donor_mentions(raw_text)
     if not cleaned_input or len(cleaned_input) < 25:
         return None
@@ -74,15 +98,15 @@ def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
         "Accept": "application/json"
     }
 
-    # Моделі для спроби
-    models_to_try = [AI_MODEL] if AI_MODEL else []
-    for m in GROQ_MODELS:
-        if m not in models_to_try:
-            models_to_try.append(m)
+    # Отримуємо точний список моделей, які зараз підтримуються акаунтом
+    available_models = get_available_models(api_key, headers)
+    if not available_models:
+        print("[AI ПОМИЛКА]: Немає доступних текстових моделей.")
+        return None
 
-    api_url = "https://api.groq.com/openai/v1/chat/completions" if AI_PROVIDER.lower() == "groq" else "https://api.openai.com/v1/chat/completions"
+    api_url = "https://api.groq.com/openai/v1/chat/completions"
 
-    for model_name in models_to_try:
+    for model_name in available_models:
         try:
             payload = {
                 "model": model_name,
@@ -96,13 +120,12 @@ def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
 
             resp = requests.post(api_url, json=payload, headers=headers, timeout=25)
             
-            # Якщо модель недоступна (404) — пробуємо наступну в списку!
             if resp.status_code == 404:
-                print(f"[AI]: Модель {model_name} недоступна (404). Пробуємо альтернативну...")
+                print(f"[AI]: Модель {model_name} повернула 404. Перевіряємо наступну...")
                 continue
 
             if resp.status_code != 200:
-                print(f"[AI ПОМИЛКА {resp.status_code} на моделі {model_name}]: {resp.text[:150]}")
+                print(f"[AI ПОМИЛКА {resp.status_code} на {model_name}]: {resp.text[:120]}")
                 continue
 
             data = resp.json()
@@ -112,12 +135,12 @@ def process_news_with_ai(raw_text: str) -> Optional[Dict[str, Any]]:
                 print("[AI ФІЛЬТР]: AI розпізнав цей пост як рекламу/спам і відхилив його.")
                 return None
 
-            print(f"[AI]: Успішно оброблено моделлю {model_name}!")
+            print(f"✅ [AI]: УСПІШНО ОБРОБЛЕНО через модель {model_name}!")
             return parsed
 
         except Exception as e:
             print(f"[AI ПОМИЛКА на {model_name}]: {e}")
             continue
 
-    print("[AI ПОМИЛКА]: Жодна з моделей Groq не змогла відповісти.")
+    print("[AI ПОМИЛКА]: Жодна з моделей Groq не змогла сформувати відповідь.")
     return None
