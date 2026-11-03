@@ -1,0 +1,57 @@
+name: Run Telegram News Bot
+
+on:
+  schedule:
+    # Запуск кожні 15 хвилин цілодобово
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Кнопка ручного запуску
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install FFmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run news cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          CHANNEL_NAME: ${{ secrets.CHANNEL_NAME }}
+          CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
+          CHANNEL_INVITE_LINK: ${{ secrets.CHANNEL_INVITE_LINK }}
+          AI_PROVIDER: 'groq'
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: 'llama-3.3-70b-versatile'
+          BREAKING_NEWS_THRESHOLD: '8'
+        run: |
+          python main.py --once
+
+      - name: Save processed news database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f news.db ]; then
+            git add news.db
+            git diff-index --quiet HEAD || git commit -m "Оновлення бази новин [skip ci]"
+            git push
+          fi
