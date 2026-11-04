@@ -346,10 +346,11 @@ def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
 
 # Завжди активний список уже опублікованих тем, щоб бот НІКОЛИ не публікував повтори:
 SEEDED_TOPICS = [
+    {"capitals": ["поклад", "сбу", "набу"], "stems": ["поклад", "сбу", "набу", "звіль", "фігур", "мексик"], "headline": "Поклад звільнив співробітників СБУ фігурантів НАБУ"},
     {"capitals": ["трамп", "байден"], "stems": ["трамп", "байден", "прези", "білог", "докум"], "headline": "Трамп не є президентом дезінформація"},
     {"capitals": ["fpv", "ждуни", "електропередач"], "stems": ["ждуни", "елект", "ліні", "дрони", "висок", "дріт"], "headline": "FPV дрони ждуни на лініях електропередач"},
     {"capitals": ["маск", "ілон", "республік"], "stems": ["маск", "ілон", "витра", "кампан", "вибор", "респуб", "парті"], "headline": "Ілон Маск витратив гроші на вибори"},
-    {"capitals": ["донец", "фенік", "адиге", "ozon"], "stems": ["донец", "фенік", "київст", "адиге", "ozon"], "headline": "Донецьк Фенікс та Адигейськ Ozon"},
+    {"capitals": ["донец", "дрони", "фенік", "адиге", "ozon"], "stems": ["донец", "телек", "інфра", "фенік", "київст", "адиге", "ozon"], "headline": "Донецьк Фенікс та Адигейськ Ozon"},
     {"capitals": ["філат", "кирил"], "stems": ["філат", "кирил", "росі", "патрі"], "headline": "Філатов та Кирил"},
     {"capitals": ["борів", "андрі", "зелен"], "stems": ["борів", "андрі", "звіль", "зелен"], "headline": "Борівська Андріївка та Зелений Гай"},
     {"capitals": ["боров", "андре", "зелен"], "stems": ["боров", "андре", "звіль", "зелен"], "headline": "Боровская Андреевка"},
@@ -359,6 +360,53 @@ SEEDED_TOPICS = [
     {"capitals": ["vanta", "stark"], "stems": ["vanta", "stark", "кораб", "стеж"], "headline": "Німецький безпілотний корабель Vanta 24"},
     {"capitals": ["родна", "гаван"], "stems": ["родна", "гаван", "свєта", "води"], "headline": "Родная гавань Крим"},
 ]
+
+
+# ==================== ХМАРНА БАЗА ДАНИХ TELEGRAM (НЕЗНИЩЕННА ПАМ'ЯТЬ) ====================
+def load_cloud_state_from_telegram() -> dict:
+    if not TELEGRAM_BOT_TOKEN or not ADMIN_CHAT_ID:
+        return {}
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat?chat_id={ADMIN_CHAT_ID}"
+        r = requests.get(url, timeout=10).json()
+        if r.get("ok"):
+            pinned = r.get("result", {}).get("pinned_message", {})
+            text = pinned.get("text", "")
+            if "#BOT_STATE#" in text:
+                raw_json = text.split("#BOT_STATE#")[1].strip()
+                state = json.loads(raw_json)
+                print(f"[ХМАРНА БАЗА TELEGRAM]: Успішно відновлено {len(state.get('topics', []))} тем з хмари Telegram!")
+                return state
+    except Exception as e:
+        print(f"[ХМАРНА БАЗА TELEGRAM]: Помилка читання: {e}")
+    return {}
+
+def save_cloud_state_to_telegram(state: dict):
+    if not TELEGRAM_BOT_TOKEN or not ADMIN_CHAT_ID:
+        return
+    try:
+        url_get = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat?chat_id={ADMIN_CHAT_ID}"
+        r = requests.get(url_get, timeout=10).json()
+        pinned_id = None
+        if r.get("ok"):
+            pinned = r.get("result", {}).get("pinned_message", {})
+            if "#BOT_STATE#" in pinned.get("text", ""):
+                pinned_id = pinned.get("message_id")
+
+        payload_text = f"📌 [ХМАРНА БАЗА АНТИДУБЛІКАТІВ]\n#BOT_STATE#\n{json.dumps(state, ensure_ascii=False)}"
+
+        if pinned_id:
+            edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+            requests.post(edit_url, json={"chat_id": ADMIN_CHAT_ID, "message_id": pinned_id, "text": payload_text[:4096]}, timeout=10)
+        else:
+            send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            res = requests.post(send_url, json={"chat_id": ADMIN_CHAT_ID, "text": payload_text[:4096]}, timeout=10).json()
+            if res.get("ok"):
+                new_msg_id = res["result"]["message_id"]
+                pin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
+                requests.post(pin_url, json={"chat_id": ADMIN_CHAT_ID, "message_id": new_msg_id, "disable_notification": True}, timeout=10)
+    except Exception as e:
+        print(f"[ХМАРНА БАЗА TELEGRAM]: Помилка збереження: {e}")
 
 def is_post_id_processed(post_id: str) -> bool:
     ids = set(load_json(PROCESSED_IDS_FILE))
@@ -450,7 +498,7 @@ def sync_channel_history(channel_username: str) -> List[str]:
     # 1. ОФІЦІЙНЕ TELEGRAM BOT API: зчитуємо пости каналу через getUpdates
     if TELEGRAM_BOT_TOKEN:
         try:
-            upd_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?limit=100"
+            upd_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-50&limit=50&allowed_updates=%5B%22channel_post%22%2C%22edited_channel_post%22%5D"
             resp = requests.get(upd_url, timeout=12).json()
             if resp.get("ok"):
                 for item in resp.get("result", []):
@@ -867,6 +915,30 @@ def run():
     print("="*55)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Балансування донорів, фільтр сміття та заміна вотермарок.")
     print(f"{'='*55}")
+
+    # 0. ВІДНОВЛЮЄМО НЕЗНИЩЕННУ ПАМ'ЯТЬ З ТЕЛЕГРАМ-ХМАРИ
+    cloud = load_cloud_state_from_telegram()
+    if cloud:
+        if cloud.get("topics"):
+            cur_t = load_json(TOPICS_FILE)
+            cur_t_heads = {x.get("headline") for x in cur_t}
+            for ct in cloud["topics"]:
+                if ct.get("headline") not in cur_t_heads:
+                    cur_t.append(ct)
+            save_json(TOPICS_FILE, cur_t[-400:])
+
+        if cloud.get("media"):
+            cur_m = load_json(MEDIA_HASH_FILE)
+            cur_m_hashes = {x.get("content_hash") for x in cur_m}
+            for cm in cloud["media"]:
+                if cm.get("content_hash") and cm.get("content_hash") not in cur_m_hashes:
+                    cur_m.append(cm)
+            save_json(MEDIA_HASH_FILE, cur_m[-400:])
+
+        if cloud.get("ids"):
+            cur_ids = set(load_json(PROCESSED_IDS_FILE))
+            cur_ids.update(cloud["ids"])
+            save_json(PROCESSED_IDS_FILE, list(cur_ids)[-600:])
 
     recent_channel_posts = sync_channel_history(CHANNEL_USERNAME)
     published_count = 0
