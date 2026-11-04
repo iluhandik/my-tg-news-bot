@@ -27,21 +27,19 @@ CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") el
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant").strip()
-
-# Знижено поріг, щоб відео для соцмереж створювалися регулярно для бойових та важливих новин!
 BREAKING_NEWS_THRESHOLD = 6
 
+# Пріоритетні джерела (Supernova обмежено суто бойовими зведеннями)
 DONOR_CHANNELS = [
-    "u_now",
     "uniannet",
-    "UaOnlii",
+    "u_now",
     "insiderUKR",
-    "supernova_plus",
-    "exilenova_plus",
-    "chp_zahid",
+    "UaOnlii",
     "zsuwar",
+    "chp_zahid",
     "nefedoov365",
-    "inslandd"
+    "inslandd",
+    "supernova_plus"  # Поставлено в кінець списку, щоб не забивати канал побутовим трешем
 ]
 
 CHANNELS_WITH_HEAVY_WATERMARKS = {
@@ -49,8 +47,7 @@ CHANNELS_WITH_HEAVY_WATERMARKS = {
     "exilenova_plus"
 }
 
-# Щоб бот встигав за новинами на безкоштовному GitHub: до 3 якісних новин за прогін з паузою 60 секунд
-MAX_POSTS_PER_RUN = 3
+MAX_POSTS_PER_RUN = 2
 DELAY_BETWEEN_POSTS = 60
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,7 +60,7 @@ WATERMARK_FILE = os.path.join(BASE_DIR, "watermark.png")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ==================== АВТОВИПРАВЛЕННЯ СУРЖИКУ ТА КАЛЬОК (БЕЗ БЛОКУВАННЯ) ====================
+# ==================== АВТОВИПРАВЛЕННЯ СУРЖИКУ ====================
 CALQUE_REPLACEMENTS = [
     (r"(?i)\bслежк([а-яіїєґ]*)\b", "стеження"),
     (r"(?i)\bтенево([а-яіїєґ]*)\b", r"тіньово\1"),
@@ -82,12 +79,11 @@ CALQUE_REPLACEMENTS = [
 ]
 
 def fix_ukrainian_calques(text: str) -> str:
-    """Автоматично замінює суржик і російські слова на літературну українську мову без відхилення новини!"""
     for pattern, replacement in CALQUE_REPLACEMENTS:
         text = re.sub(pattern, replacement, text)
     return text
 
-# ==================== АНТИРЕКЛАМА ====================
+# ==================== АНТИРЕКЛАМА ТА ФІЛЬТР ПОБУТОВОГО СПАМУ ====================
 COMMON_STOP_WORDS = {
     "сьогодні", "зараз", "вчора", "цього", "після", "також", "було", "проти", "може",
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
@@ -109,6 +105,12 @@ AD_PATTERNS = [
     r"(?i)\b(лайків|лайки|коментарів|фанатів|противників|просвітів|харчок|ізонів|янос)\b",
 ]
 
+# Побутовий треш, сарказм та скарги цивільних (як у пості про «Родная гавань»)
+TRASH_AND_SARCASTIC_PATTERNS = [
+    r"(?i)\b(родная гавань|у вас как|будни.*в крыму|все немного в шоке|проснулись без|залезла на крышу)\b",
+    r"(?i)\b(девочки|доброго дня всем|смотрите что прислали|жалуются на свет|сидеть без света)\b",
+]
+
 ROUTINE_ALERT_TRIGGERS = [
     r"(?i)\b(жовта тривога|повітряна тривога|оголошено тривогу|загроза бпла|пройдіть в укриття|відбій тривоги)\b",
     r"(?i)\b(активність ворожої авіації|загроза застосування балістики|зліт міг|тривога в областях)\b",
@@ -120,22 +122,46 @@ REAL_EVENT_MARKERS = [
     "удар", "пошкоджен", "атакован", "знищен", "ракета впала", "дрон поцілив"
 ]
 
-def is_advertisement(text: str) -> bool:
+def is_unwanted_content(channel: str, text: str) -> bool:
+    """Відсікає рекламу, побутові мем-відео та порожні сирени."""
     if not text or len(text.strip()) < 20:
         return True
     clean = html.unescape(text).lower()
+
+    # 1. Реклама
     for pattern in AD_PATTERNS:
         if re.search(pattern, clean):
             return True
+
+    # 2. Побутовий треш та саркастичні пости
+    for pattern in TRASH_AND_SARCASTIC_PATTERNS:
+        if re.search(pattern, clean):
+            print(f"[ФІЛЬТР]: Відхилено побутовий треш/сарказм: {clean[:45]}...")
+            return True
+
+    # 3. Суворий фільтр для Supernova: тільки бойові зведення та удари!
+    if channel.lower() == "supernova_plus":
+        combat_terms = ["зсу", "дрон", "удар", "вибух", "знищен", "уражен", "бавовн", "ппо", "ракета", "артилер", "фронт", "наступ"]
+        has_combat = any(t in clean for t in combat_terms)
+        if not has_combat:
+            print("[ФІЛЬТР Supernova]: Пропускаємо побутовий пост (немає бойових дій чи ударів).")
+            return True
+
+    # 4. Рутинні тривоги без подій
     is_routine = any(re.search(pat, clean) for pat in ROUTINE_ALERT_TRIGGERS)
     if is_routine:
         has_real_event = any(m in clean for m in REAL_EVENT_MARKERS)
         if not has_real_event:
             return True
+
     return False
 
-# ==================== БРЕНДОВИЙ МЕДІА-БЕЙДЖ НА ЧУЖІ ВОТЕРМАРКИ ====================
+# ==================== ПРАВИЛЬНА ЗАМІНА ВОТЕРМАРКИ (СТЕРТИ ЧУЖУ І ПОСТАВИТИ НАШУ) ====================
 def apply_watermark_to_image(img_path: str, output_path: str) -> str:
+    """
+    Повністю стирає чужий напис Supernova розмиттям його зони
+    та накладає наш фірмовий медіа-бейдж поверх нього.
+    """
     try:
         if not os.path.exists(WATERMARK_FILE) or not os.path.exists(img_path):
             return img_path
@@ -144,30 +170,49 @@ def apply_watermark_to_image(img_path: str, output_path: str) -> str:
         width, height = base_img.size
         wm = Image.open(WATERMARK_FILE).convert("RGBA")
 
-        wm_w = max(180, int(width * 0.32))
+        # Розмір нашого бейджа (34% ширини кадру)
+        wm_w = max(200, int(width * 0.34))
         wm_h = int(wm.height * (wm_w / wm.width))
         wm_resized = wm.resize((wm_w, wm_h), Image.Resampling.LANCZOS)
 
+        # 1. СТИРАЄМО ЧУЖУ ВОТЕРМАРКУ (зона в центрі кадру де сидить Supernova)
+        erase_w = int(width * 0.55)
+        erase_h = int(height * 0.16)
+        erase_x = (width - erase_w) // 2
+        erase_y = (height - erase_h) // 2
+
+        blur_box = (erase_x, erase_y, erase_x + erase_w, erase_y + erase_h)
+        erased_area = base_img.crop(blur_box).filter(ImageFilter.GaussianBlur(18))
+        base_img.paste(erased_area, blur_box)
+
+        # 2. СТАВИМО НАШ БЕЙДЖ ТОЧНО НА ЦЕ МІСЦЕ
         pos_x = (width - wm_w) // 2
-        pos_y = int(height * 0.65)
-
-        blur_box = (max(0, pos_x - 10), max(0, pos_y - 8), min(width, pos_x + wm_w + 10), min(height, pos_y + wm_h + 8))
-        crop_area = base_img.crop(blur_box).filter(ImageFilter.GaussianBlur(14))
-        base_img.paste(crop_area, blur_box)
-
+        pos_y = (height - wm_h) // 2
         base_img.paste(wm_resized, (pos_x, pos_y), mask=wm_resized)
+
         base_img.save(output_path, "JPEG", quality=92)
         return output_path
     except Exception as e:
-        print(f"[БРЕНДУВАННЯ ФОТО]: Помилка: {e}")
+        print(f"[ВОТЕРМАРКА ФОТО]: Помилка: {e}")
         return img_path
 
 def apply_watermark_to_video(video_path: str, output_path: str) -> str:
+    """Стирає чужий напис розмиттям по центру відео та накладає наш бейдж."""
     try:
         if not os.path.exists(WATERMARK_FILE) or not os.path.exists(video_path):
             return video_path
 
-        filter_complex = f"[1:v]scale=iw*0.32:-1[wm];[0:v][wm]overlay=(W-w)/2:H*0.65[v]"
+        # Фільтр FFmpeg:
+        # 1. Розмиваємо прямокутну зону чужого напису по центру (delogo або boxblur)
+        # 2. Накладаємо наш бейдж точно в центр
+        filter_complex = (
+            "[0:v]split[main][crop_in];"
+            "[crop_in]crop=w=in_w*0.55:h=in_h*0.16:x=(in_w-out_w)/2:y=(in_h-out_h)/2,boxblur=10:2[blurred];"
+            "[main][blurred]overlay=(W-w)/2:(H-h)/2[base];"
+            "[1:v][base]scale2ref=w=main_w*0.35:h=-1[wm][base_ref];"
+            "[base_ref][wm]overlay=(W-w)/2:(H-h)/2[v]"
+        )
+
         cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
@@ -183,7 +228,7 @@ def apply_watermark_to_video(video_path: str, output_path: str) -> str:
             return output_path
         return video_path
     except Exception as e:
-        print(f"[БРЕНДУВАННЯ ВІДЕО]: Помилка: {e}")
+        print(f"[ВОТЕРМАРКА ВІДЕО]: {e}")
         return video_path
 
 # ==================== ЗБЕРЕЖЕННЯ ТА АНТИДУБЛІКАТ ====================
@@ -217,7 +262,7 @@ def is_topic_already_covered(text: str) -> bool:
     topics = load_json(TOPICS_FILE)
     cur_caps, cur_stems = extract_entities_and_stems(text)
     now = time.time()
-    min_time = now - (48 * 3600)  # Пам'ятаємо теми 48 годин!
+    min_time = now - (48 * 3600)
 
     for t in topics:
         if t.get("timestamp", 0) < min_time:
@@ -225,12 +270,13 @@ def is_topic_already_covered(text: str) -> bool:
         prev_caps = set(t.get("capitals", []))
         prev_stems = set(t.get("stems", []))
 
-        # Збіг географічних назв чи об'єктів (наприклад: гвардійське + аеродром, або керч + крим)
+        # 1. Збіг 2 власних назв (наприклад гвардійське + аеродром, або боровська + андріївка)
         common_caps = cur_caps.intersection(prev_caps)
         if len(common_caps) >= 2:
             print(f"[АНТИДУБЛЬ ГЕО]: Збіг сутностей {common_caps} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
             return True
 
+        # 2. Збіг 3 ключових слів
         common_stems = cur_stems.intersection(prev_stems)
         if len(common_stems) >= 3:
             print(f"[АНТИДУБЛЬ СЕНСУ]: Збіг слів {common_stems} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
@@ -308,22 +354,19 @@ def sync_channel_history(channel_username: str) -> List[str]:
 SYSTEM_PROMPT = """Ти — професійний український журналіст та суворий фактчекер новинного каналу.
 Твоє завдання — перекласти та відредагувати новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ строго за фактами.
 
-ОСНОВНИЙ АКЦЕНТ:
-- Роби головний акцент на подіях в Україні (фронт, обстріли, енергетика, державні рішення).
-- Світові новини публікуй обов'язково, якщо вони вагомі або прямо впливають на Україну (допомога США, ЄС, санкції).
+ОСНОВНИЙ ПРІОРИТЕТ:
+- Головний акцент — на подіях в Україні (фронт, енергетика, обстріли, важливі закони).
+- Світові новини публікуй тільки якщо вони вагомі (допомога партнерів, санкції, геополітика).
 
 СУВОРІ ПРАВИЛА:
 1. АНТИДУБЛІКАТ:
    - Тобі надано список останніх публікацій каналу.
-   - Якщо ця сама подія ВЖЕ є в каналі (наприклад: аеродром у Криму, блекаут у Керчі/Сімферополі, Боровська Андріївка, дрон на дереві) — негайно встанови "is_duplicate": true!
-2. АНТИФЕЙК:
-   - Працюй ТІЛЬКИ з реальними фактами донора. Суворо заборонено вигадувати мерів, людей (як вигадані «Ковальчуки») чи вигадані цитати!
+   - Якщо ця сама подія ВЖЕ є в каналі — негайно встанови "is_duplicate": true!
+2. КАТЕГОРИЧНА ЗАБОРОНА ВИГАДУВАТИ ЛОКАЦІЇ ТА ЛЮДЕЙ:
+   - СУВОРО ЗАБОРОНЕНО вигадувати села (як вигадане «село Родна Гавань»), області (як приписана «Херсонська область»), мерів, людей чи посадовців!
+   - Не сприймай іронічні фрази чи сарказм (як «родная гавань») за назви населених пунктів!
    - Блок <blockquote> використовуй ТІЛЬКИ тоді, коли в тексті донора Є реальна цитата конкретної реальної особи. Якщо прямої мови в оригіналі НЕМАЄ — жодних <blockquote> НЕ СТАВ!
 3. МОВА: 100% чиста українська мова БЕЗ КАЛЬОК.
-   - Замість «слежка» — «стеження».
-   - Замість «теневой» — «тіньовий».
-   - Замість «Семья» — «Сім'я».
-   - Замість «видео розповсюдився» — «відео поширилося».
 4. ОФОРМЛЕННЯ:
    - Заголовок <b>жирним</b> з 1 емодзі. Звичайними реченнями, БЕЗ КАПСУ!
    - 1-2 короткі фактичні абзаци.
@@ -401,7 +444,6 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
             if parsed.get("is_ad", False):
                 return None
 
-            # АВТОВИПРАВЛЕННЯ КАЛЬОК У ЗГЕНЕРОВАНОМУ ТЕКСТІ
             if "telegram_post" in parsed:
                 parsed["telegram_post"] = fix_ukrainian_calques(parsed["telegram_post"])
 
@@ -412,7 +454,6 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
 
 # ==================== ВІРУСНІ ВІДЕО ДЛЯ СОЦМЕРЕЖ ====================
 def build_short_video(headline: str, script_text: str, image_url: Optional[str] = None, source_video_url: Optional[str] = None, output_filename: str = "viral_short.mp4") -> str:
-    """Генерує вертикальне відео 9:16 з дикторською озвучкою для TikTok / Shorts / Reels."""
     if not image_url and not source_video_url:
         return ""
 
@@ -420,7 +461,6 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
     audio_path = os.path.join(MEDIA_DIR, "temp_voice.m4a")
     clean_speech = re.sub(r'[\U00010000-\U0010ffff]', '', script_text).strip()
 
-    # Озвучка Edge-TTS
     try:
         cmd = ["edge-tts", "--voice", "uk-UA-OstapNeural", "--rate=+10%", "--text", clean_speech, "--write-media", audio_path]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
@@ -430,7 +470,6 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
     if not os.path.exists(audio_path):
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "12", "-c:a", "aac", audio_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # Тривалість
     dur = 12.0
     try:
         res = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -443,7 +482,6 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
     l1 = lines[0] if len(lines) > 0 else "ГОЛОВНІ НОВИНИ"
     l2 = lines[1] if len(lines) > 1 else ""
 
-    # Монтаж з живим відео або фото
     if source_video_url:
         temp_src = os.path.join(MEDIA_DIR, "temp_src.mp4")
         r = requests.get(source_video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
@@ -486,10 +524,9 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
     return ""
 
 def send_admin_social_video(video_path: str, headline: str, caption: str):
-    """Надсилає змонтований ролик вам в особисті повідомлення."""
     if not ADMIN_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-    msg = f"🎬 <b>ВІДЕО ДЛЯ TIKTOK / SHORTS / REELS</b>\n\n📌 <b>{headline}</b>\n\n📝 <i>Опис для вставки:</i>\n{caption}\n\n🔗 <i>Реклама каналу: {CHANNEL_USERNAME}</i>"
+    msg = f"🎬 <b>ВІДЕО ДЛЯ TIKTOK / SHORTS / REELS</b>\n\n📌 <b>{headline}</b>\n\n📝 <i>Опис:</i>\n{caption}\n\n🔗 <i>Реклама: {CHANNEL_USERNAME}</i>"
     try:
         with open(video_path, "rb") as f:
             requests.post(url, data={"chat_id": ADMIN_CHAT_ID, "caption": msg[:1024], "parse_mode": "HTML"}, files={"video": ("video.mp4", f, "video/mp4")}, timeout=90)
@@ -515,10 +552,13 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
                     for chunk in r.iter_content(chunk_size=1024*1024):
                         if chunk: f.write(chunk)
 
+                # Замінюємо чужу вотермарку на НАШ МЕДІА-БЕЙДЖ
                 if has_heavy_wm and os.path.exists(WATERMARK_FILE):
                     final_video = apply_watermark_to_video(temp_vid, branded_vid)
+                    print(f"[Telegram]: Замінено чужий вотермарк з @{donor} на медіа-бейдж {CHANNEL_NAME}.")
                 else:
                     final_video = temp_vid
+                    print(f"[Telegram]: Чисте відео з @{donor}, публікуємо без вотермарки.")
 
                 with open(final_video, "rb") as f:
                     resp = requests.post(f"{url_base}/sendVideo", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"video": ("video.mp4", f, "video/mp4")}, timeout=75)
@@ -542,8 +582,10 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
 
                 if has_heavy_wm and os.path.exists(WATERMARK_FILE):
                     final_img = apply_watermark_to_image(temp_img, branded_img)
+                    print(f"[Telegram]: Замінено чужий вотермарк з @{donor} на медіа-бейдж {CHANNEL_NAME}.")
                 else:
                     final_img = temp_img
+                    print(f"[Telegram]: Чисте фото з @{donor}, публікуємо без вотермарки.")
 
                 with open(final_img, "rb") as f:
                     resp = requests.post(f"{url_base}/sendPhoto", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"photo": ("photo.jpg", f, "image/jpeg")}, timeout=30)
@@ -599,7 +641,7 @@ def fetch_posts(channel: str) -> List[Dict]:
 # ==================== ГОЛОВНИЙ ЦИКЛ ====================
 def run():
     print(f"\n{'='*55}")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Публікуємо до {MAX_POSTS_PER_RUN} постів з паузою {DELAY_BETWEEN_POSTS}с.")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Жорсткий відсів сміття та заміна вотермарок.")
     print(f"{'='*55}")
 
     recent_channel_posts = sync_channel_history(CHANNEL_USERNAME)
@@ -619,25 +661,30 @@ def run():
             photo = p["photo_url"]
             video = p["video_url"]
 
-            # 1. Антиреклама
-            if is_advertisement(text): continue
+            # 1. Відсікаємо рекламу, сарказм, побутові скарги та небойовий треш Supernova
+            if is_unwanted_content(channel, text):
+                continue
 
-            # 2. Смисловий антидубль (географія та ключові сутності)
-            if is_topic_already_covered(text): continue
+            # 2. Смисловий антидубль (географія та теми за 48 годин)
+            if is_topic_already_covered(text):
+                continue
 
-            # 3. Медіадубль (якщо це саме відео чи фото вже було)
-            if video and is_media_duplicate(b"", video): continue
+            # 3. Медіадубль
+            if video and is_media_duplicate(b"", video):
+                continue
 
-            # 4. ШІ-обробка з автозаміною суржику та звіркою проти вашого каналу
+            # 4. ШІ-обробка з автозаміною суржику та звіркою з вашим каналом
             ai = process_news_with_ai(text, recent_channel_posts)
-            if not ai: continue
+            if not ai:
+                continue
 
             post_text = ai.get("telegram_post", "")
-            if len(post_text) < 25: continue
+            if len(post_text) < 25:
+                continue
 
-            # Пауза між постами (1 хвилина), якщо це не перший пост запуск
+            # Пауза між постами
             if published_count > 0:
-                print(f"[ПАУЗА]: Чекаємо {DELAY_BETWEEN_POSTS} секунд перед наступним постом...")
+                print(f"[ПАУЗА]: Очікуємо {DELAY_BETWEEN_POSTS} сек перед наступним постом...")
                 time.sleep(DELAY_BETWEEN_POSTS)
 
             # 5. Публікація в Telegram
@@ -649,7 +696,7 @@ def run():
                 recent_channel_posts.insert(0, head)
                 print(f"✅ УСПІШНО ОПУБЛІКОВАНО ({published_count}/{MAX_POSTS_PER_RUN}): {head[:50]}...")
 
-                # 6. ГЕНЕРАЦІЯ ВІДЕО ДЛЯ TIKTOK / REELS (для всіх новин із бойовими відео або високим балом!)
+                # 6. ВІДЕО ДЛЯ СОЦМЕРЕЖ (якщо бойове відео або важлива подія)
                 is_mega = ai.get("is_mega_news", False) or (ai.get("news_score", 5) >= BREAKING_NEWS_THRESHOLD)
                 if (is_mega or video) and (photo or video):
                     v_head = ai.get("video_headline", "ГОЛОВНІ НОВИНИ")
@@ -661,7 +708,7 @@ def run():
                         send_admin_social_video(created_video, v_head, v_caption)
                         print(f"🎬 Змонтовано та надіслано адміну ролик для соцмереж!")
 
-    print(f"\n[ЗАВЕРШЕННЯ]: Опубліковано свіжих новин: {published_count}. Чекаємо наступного запуску.")
+    print(f"\n[ЗАВЕРШЕННЯ]: Опубліковано свіжих якісних новин: {published_count}. Чекаємо наступного запуску.")
 
 if __name__ == "__main__":
     run()
