@@ -10,7 +10,7 @@ import textwrap
 import urllib
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Set
 import requests
 from PIL import Image, ImageFilter
@@ -34,15 +34,13 @@ BREAKING_NEWS_THRESHOLD = 6
 
 # Пріоритетні джерела (Supernova обмежено суто бойовими зведеннями)
 DONOR_CHANNELS = [
-    "uniannet",
     "u_now",
+    "uniannet",
     "insiderUKR",
     "UaOnlii",
-    "zsuwar",
     "chp_zahid",
-    "nefedoov365",
-    "inslandd",
-    "supernova_plus"  # Поставлено в кінець списку, щоб не забивати канал побутовим трешем
+    "supernova_plus",
+    "zsuwar"
 ]
 
 CHANNELS_WITH_HEAVY_WATERMARKS = {
@@ -59,6 +57,9 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 TOPICS_FILE = os.path.join(BASE_DIR, "published_topics.json")
 MEDIA_HASH_FILE = os.path.join(BASE_DIR, "media_hashes.json")
 WATERMARK_FILE = os.path.join(BASE_DIR, "watermark.png")
+MAX_POST_AGE_HOURS = 4.0
+PROCESSED_IDS_FILE = os.path.join(BASE_DIR, "processed_ids.json")
+
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -82,6 +83,35 @@ CALQUE_REPLACEMENTS = [
 ]
 
 def fix_ukrainian_calques(text: str) -> str:
+    # 1. Жорстке викорінення російських абревіатур та кальок ЗСУ
+    text = re.sub(r"всу", "ЗСУ", text, flags=re.IGNORECASE)
+    text = re.sub(r"військові сили україни", "Збройні Сили України", text, flags=re.IGNORECASE)
+    text = re.sub(r"военные силы украины", "Збройні Сили України", text, flags=re.IGNORECASE)
+
+    # 2. Калька «у даний момент» -> «наразі» з урахуванням регістру
+    def fix_moment(m):
+        orig = m.group(0)
+        return "Наразі" if orig[0].isupper() else "наразі"
+    text = re.sub(r"(у|в|на)\s+дан(и|н)й\s+момент", fix_moment, text, flags=re.IGNORECASE)
+
+    # 3. Виправлення русифікованих топонімів (Борівська Андріївка тощо)
+    def fix_borivska(m):
+        orig = m.group(0)
+        suf = m.group(1) if m.lastindex else ""
+        root = "Борівськ" if orig[0].isupper() else "борівськ"
+        return root + suf
+
+    def fix_andriivka(m):
+        orig = m.group(0)
+        suf = m.group(1) if m.lastindex else ""
+        root = "Андріївк" if orig[0].isupper() else "андріївк"
+        return root + suf
+
+    text = re.sub(r"боровськ([а-яіїєґ]*)", fix_borivska, text, flags=re.IGNORECASE)
+    text = re.sub(r"боровск([а-яіїєґ]*)", fix_borivska, text, flags=re.IGNORECASE)
+    text = re.sub(r"андреївк([а-яіїєґ]*)", fix_andriivka, text, flags=re.IGNORECASE)
+    text = re.sub(r"андреевк([а-яіїєґ]*)", fix_andriivka, text, flags=re.IGNORECASE)
+
     for pattern, replacement in CALQUE_REPLACEMENTS:
         text = re.sub(pattern, replacement, text)
     return text
@@ -261,8 +291,31 @@ def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
             stems.add(w[:5] if len(w) >= 5 else w)
     return capitals_norm, stems
 
+
+# Завжди активний список уже опублікованих тем, щоб бот НІКОЛИ не публікував повтори:
+SEEDED_TOPICS = [
+    {"capitals": ["борів", "андрі", "зелен"], "stems": ["борів", "андрі", "звіль", "зелен"], "headline": "Борівська Андріївка та Зелений Гай"},
+    {"capitals": ["боров", "андре", "зелен"], "stems": ["боров", "андре", "звіль", "зелен"], "headline": "Боровская Андреевка"},
+    {"capitals": ["гвард", "крим", "аерод"], "stems": ["гвард", "аерод", "крим", "альфа"], "headline": "Аеродром Гвардійське в Криму"},
+    {"capitals": ["житом", "укреп"], "stems": ["житом", "світл", "вимкн", "укреп"], "headline": "Житомиробленерго та відключення"},
+    {"capitals": ["креме", "світл"], "stems": ["креме", "світл", "приль", "тес"], "headline": "Кременчуцька ТЕС та Світловодськ"},
+    {"capitals": ["vanta", "stark"], "stems": ["vanta", "stark", "кораб", "стеж"], "headline": "Німецький безпілотний корабель Vanta 24"},
+    {"capitals": ["родна", "гаван"], "stems": ["родна", "гаван", "свєта", "води"], "headline": "Родная гавань Крим"},
+]
+
+def is_post_id_processed(post_id: str) -> bool:
+    ids = set(load_json(PROCESSED_IDS_FILE))
+    return post_id in ids
+
+def register_post_id(post_id: str):
+    if not post_id: return
+    ids = load_json(PROCESSED_IDS_FILE)
+    if post_id not in ids:
+        ids.append(post_id)
+        save_json(PROCESSED_IDS_FILE, ids[-600:])
+
 def is_topic_already_covered(text: str) -> bool:
-    topics = load_json(TOPICS_FILE)
+    topics = SEEDED_TOPICS + load_json(TOPICS_FILE)
     cur_caps, cur_stems = extract_entities_and_stems(text)
     now = time.time()
     min_time = now - (48 * 3600)
@@ -619,6 +672,23 @@ def fetch_posts(channel: str) -> List[Dict]:
         for b in blocks[1:][-4:]:
             p_id = re.search(r'data-post="([^"]+)"', b)
             if not p_id: continue
+            post_id = p_id.group(1)
+
+            # Перевірка на вже збережений/оброблений post_id
+            if is_post_id_processed(post_id):
+                continue
+
+            # Перевірка віку публікації (максимум MAX_POST_AGE_HOURS)
+            time_match = re.search(r'<time[^>]+datetime="([^"]+)"', b)
+            if time_match:
+                try:
+                    dt = datetime.fromisoformat(time_match.group(1).replace("Z", "+00:00"))
+                    diff_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                    if diff_hours > MAX_POST_AGE_HOURS:
+                        print(f"[ПАРСЕР]: Пропускаємо старий пост {post_id} ({diff_hours:.1f} год тому).")
+                        continue
+                except Exception:
+                    pass
             
             t_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*<div class="tgme_widget_message_footer', b, re.DOTALL)
             raw_text = html.unescape(re.sub(r"<[^>]+>", " ", t_match.group(1))).strip() if t_match else ""
@@ -635,7 +705,7 @@ def fetch_posts(channel: str) -> List[Dict]:
                     "text": raw_text,
                     "photo_url": photo_url,
                     "video_url": video_url,
-                    "post_id": p_id.group(1)
+                    "post_id": post_id
                 })
     except Exception as e:
         print(f"[ПАРСЕР]: Помилка читання @{channel}: {e}")
