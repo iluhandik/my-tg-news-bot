@@ -38,9 +38,11 @@ DONOR_CHANNELS = [
     "uniannet",
     "insiderUKR",
     "UaOnlii",
-    "chp_zahid",
+    "nefedoov365",
+    "inslandd",
+    "zsuwar",
     "supernova_plus",
-    "zsuwar"
+    "chp_zahid"
 ]
 
 CHANNELS_WITH_HEAVY_WATERMARKS = {
@@ -48,7 +50,7 @@ CHANNELS_WITH_HEAVY_WATERMARKS = {
     "exilenova_plus"
 }
 
-MAX_POSTS_PER_RUN = 2
+MAX_POSTS_PER_RUN = 3
 DELAY_BETWEEN_POSTS = 60
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +68,13 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==================== АВТОВИПРАВЛЕННЯ СУРЖИКУ ====================
 CALQUE_REPLACEMENTS = [
+    (r"(?i)запорі[зс]хсталь", "Запоріжсталь"),
+    (r"(?i)запорожсталь", "Запоріжсталь"),
+    (r"(?i)криворі[зс]хсталь", "Криворіжсталь"),
+    (r"(?i)балл[іи]стич([а-яіїєґ]*)", r"балістич"),
+    (r"(?i)баллістик([а-яіїєґ]*)", r"балістик"),
+    (r"(?i)минулого року фірма", "минулого року підприємство"),
+
     (r"(?i)\bслежк([а-яіїєґ]*)\b", "стеження"),
     (r"(?i)\bтенево([а-яіїєґ]*)\b", r"тіньово\1"),
     (r"(?i)\bтеневи([а-яіїєґ]*)\b", r"тіньови\1"),
@@ -144,6 +153,13 @@ TRASH_AND_SARCASTIC_PATTERNS = [
     r"(?i)\b(девочки|доброго дня всем|смотрите что прислали|жалуются на свет|сидеть без света)\b",
 ]
 
+LOCAL_MUNICIPAL_PATTERNS = [
+    r"(?i)(тестуванн[яі]\s+систем[и]?\s+сповіщен|тестуватимуть\s+систему|навчальн[іа]\s+тривог|перевірк[аи]\s+сирен|звучатимуть\s+сирени)",
+    r"(?i)(графік\s+за\s+районами|дрогобицький|золочівський|самбірський|стрийський|яворівський|шептицький)\s+район",
+    r"(?i)(львів'яни|кияни|одесити|харків'яни|дніпряни),\s*(з|у|на|сьогодні|завтра|увага)",
+    r"(?i)(планов[іе]\s+ремонт[и]?\s+мереж|відключенн[яі]\s+газу\s+у|ремонт\s+водоканал|перекритт[яі]\s+руху\s+на\s+вулиц)",
+]
+
 ROUTINE_ALERT_TRIGGERS = [
     r"(?i)\b(жовта тривога|повітряна тривога|оголошено тривогу|загроза бпла|пройдіть в укриття|відбій тривоги)\b",
     r"(?i)\b(активність ворожої авіації|загроза застосування балістики|зліт міг|тривога в областях)\b",
@@ -170,6 +186,19 @@ def is_unwanted_content(channel: str, text: str) -> bool:
     for pattern in TRASH_AND_SARCASTIC_PATTERNS:
         if re.search(pattern, clean):
             print(f"[ФІЛЬТР]: Відхилено побутовий треш/сарказм: {clean[:45]}...")
+            return True
+
+    # 2.1 Локальні муніципальні сповіщення, ремонтні графіки та навчальні сирени
+    for pattern in LOCAL_MUNICIPAL_PATTERNS:
+        if re.search(pattern, clean):
+            print(f"[ФІЛЬТР]: Відхилено локальне муніципальне сповіщення/сирени: {clean[:45]}...")
+            return True
+
+    # 2.2 Для регіонального каналу chp_zahid пропускаємо ТІЛЬКИ загальнонаціональні події!
+    if channel.lower() == "chp_zahid":
+        national_keywords = ["удар", "ракета", "шахед", "дрон", "вибух", "ппо", "блекаут", "світл", "енерг", "кордон", "загинул", "пожеж"]
+        if not any(k in clean for k in national_keywords):
+            print(f"[ФІЛЬТР chp_zahid]: Пропускаємо локальну дрібницю (немає всеукраїнського значення).")
             return True
 
     # 3. Суворий фільтр для Supernova: тільки бойові зведення та удари!
@@ -422,8 +451,12 @@ SYSTEM_PROMPT = """Ти — професійний український жур
    - СУВОРО ЗАБОРОНЕНО вигадувати села (як вигадане «село Родна Гавань»), області (як приписана «Херсонська область»), мерів, людей чи посадовців!
    - Не сприймай іронічні фрази чи сарказм (як «родная гавань») за назви населених пунктів!
    - Блок <blockquote> використовуй ТІЛЬКИ тоді, коли в тексті донора Є реальна цитата конкретної реальної особи. Якщо прямої мови в оригіналі НЕМАЄ — жодних <blockquote> НЕ СТАВ!
-3. МОВА: 100% чиста українська мова БЕЗ КАЛЬОК.
-4. ОФОРМЛЕННЯ:
+3. ВСЕУКРАЇНСЬКИЙ МАСШТАБ:
+   - Канал є ВСЕУКРАЇНСЬКИМ! КАТЕГОРИЧНО ВІДКИДАЙ локальні муніципальні оголошення окремих міст/районів (тестування сирен у Львові/Стрию, ремонт труб, локальні графіки газу/води чи дрібні ДТП). Встановлюй "is_ad": true для таких постів!
+4. БЕЗДОГАННА МОВА ТА ПРАВОПИС:
+   - Тільки чиста солов'їна мова. Жодних кальок: ЗСУ (не ВСУ), Збройні Сили України (не Військові сили), наразі (не у даний момент).
+   - Власні назви та терміни: Запоріжсталь (не Запорізхсталь!), балістичний/балістика (з 1 буквою «л»), підприємство/комбінат (не «фірма»).
+5. ОФОРМЛЕННЯ:
    - Заголовок <b>жирним</b> з 1 емодзі. Звичайними реченнями, БЕЗ КАПСУ!
    - 1-2 короткі фактичні абзаци.
    - ЖОДНИХ підписів у кінці, жодного значка "💬".
@@ -515,7 +548,7 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
 
     out_path = os.path.join(OUTPUT_DIR, output_filename)
     audio_path = os.path.join(MEDIA_DIR, "temp_voice.m4a")
-    clean_speech = re.sub(r'[\U00010000-\U0010ffff]', '', script_text).strip()
+    clean_speech = re.sub(r'[𐀀-􏿿]', '', script_text).strip()
 
     try:
         cmd = ["edge-tts", "--voice", "uk-UA-OstapNeural", "--rate=+10%", "--text", clean_speech, "--write-media", audio_path]
@@ -533,10 +566,26 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
     except Exception:
         pass
 
-    head_clean = re.sub(r'[\U00010000-\U0010ffff]', '', headline).upper()[:45].replace(":", "\\:").replace("'", "")
+    # Очищуємо заголовок від емодзі, двокрапок та лапок
+    head_clean = re.sub(r'[𐀀-􏿿]', '', headline).upper()[:50].replace(":", " - ").replace("'", "").replace('"', '').strip()
     lines = textwrap.wrap(head_clean, width=22)
     l1 = lines[0] if len(lines) > 0 else "ГОЛОВНІ НОВИНИ"
     l2 = lines[1] if len(lines) > 1 else ""
+
+    # СУЧАСНИЙ ДИЗАЙН У БЕЗПЕЧНІЙ ЗОНІ ДЛЯ TIKTOK / REELS / SHORTS:
+    header_draw = (
+        f"drawbox=x=40:y=200:w=1000:h=280:color=black@0.85:t=fill,"
+        f"drawbox=x=40:y=200:w=1000:h=8:color=red:t=fill,"
+        f"drawtext=text='ТЕРМІНОВА НОВИНА':fontcolor=yellow:fontsize=42:x=(w-text_w)/2:y=230,"
+        f"drawtext=text='{l1}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=300"
+        + (f",drawtext=text='{l2}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=370" if l2 else "")
+    )
+    cta_draw = (
+        f",drawbox=x=60:y=1460:w=960:h=150:color=black@0.85:t=fill,"
+        f"drawbox=x=60:y=1460:w=960:h=6:color=yellow:t=fill,"
+        f"drawtext=text='БІЛЬШЕ В ТЕЛЕГРАМ - {CHANNEL_USERNAME}':fontcolor=yellow:fontsize=42:x=(w-text_w)/2:y=1495,"
+        f"drawtext=text='Посилання закріплено в шапці профілю':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=1555"
+    )
 
     if source_video_url:
         temp_src = os.path.join(MEDIA_DIR, "temp_src.mp4")
@@ -545,17 +594,12 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
             with open(temp_src, "wb") as f: f.write(r.content)
             fc = (
                 f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-                f"[0:v]scale=1040:1040:force_original_aspect_ratio=decrease[fg];"
-                f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
-                f"[base]drawbox=x=0:y=80:w=1080:h=260:color=black@0.75:t=fill,"
-                f"drawtext=text='ТЕРМІНОВА НОВИНА':fontcolor=yellow:fontsize=46:x=(w-text_w)/2:y=110,"
-                f"drawtext=text='{l1}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=175"
-                + (f",drawtext=text='{l2}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=235" if l2 else "")
-                + f",drawbox=x=0:y=h-260:w=1080:h=200:color=black@0.8:t=fill,"
-                f"drawtext=text='БІЛЬШЕ В ТЕЛЕГРАМ\\: {CHANNEL_USERNAME}':fontcolor=yellow:fontsize=46:x=(w-text_w)/2:y=h-220,"
-                f"drawtext=text='ПОСИЛАННЯ В ШАПЦІ ПРОФІЛЮ':fontcolor=white:fontsize=38:x=(w-text_w)/2:y=h-140[v]"
+                f"[0:v]scale=1000:880:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:520+(900-h)/2[base];"
+                f"[base]{header_draw}{cta_draw}[v]"
             )
-            subprocess.run(["ffmpeg", "-y", "-i", temp_src, "-filter_complex", fc, "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-t", "40", "-c:a", "aac", out_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            cmd = ["ffmpeg", "-y", "-i", temp_src, "-filter_complex", fc, "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast", "-t", "45", "-c:a", "aac", out_path]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if os.path.exists(out_path): return out_path
 
     if image_url:
@@ -565,17 +609,12 @@ def build_short_video(headline: str, script_text: str, image_url: Optional[str] 
             with open(temp_img, "wb") as f: f.write(r.content)
             fc = (
                 f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-                f"[0:v]scale=1000:1000:force_original_aspect_ratio=decrease[fg];"
-                f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
-                f"[base]drawbox=x=0:y=80:w=1080:h=260:color=black@0.75:t=fill,"
-                f"drawtext=text='ТЕРМІНОВА НОВИНА':fontcolor=yellow:fontsize=46:x=(w-text_w)/2:y=110,"
-                f"drawtext=text='{l1}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=175"
-                + (f",drawtext=text='{l2}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=235" if l2 else "")
-                + f",drawbox=x=0:y=h-260:w=1080:h=200:color=black@0.8:t=fill,"
-                f"drawtext=text='БІЛЬШЕ В ТЕЛЕГРАМ\\: {CHANNEL_USERNAME}':fontcolor=yellow:fontsize=46:x=(w-text_w)/2:y=h-220,"
-                f"drawtext=text='ПОСИЛАННЯ В ШАПЦІ ПРОФІЛЮ':fontcolor=white:fontsize=38:x=(w-text_w)/2:y=h-140[v]"
+                f"[0:v]scale=1000:880:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:520+(900-h)/2[base];"
+                f"[base]{header_draw}{cta_draw}[v]"
             )
-            subprocess.run(["ffmpeg", "-y", "-loop", "1", "-i", temp_img, "-i", audio_path, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-t", str(dur), "-c:a", "aac", out_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            cmd = ["ffmpeg", "-y", "-loop", "1", "-i", temp_img, "-i", audio_path, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-t", str(dur), "-c:a", "aac", out_path]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if os.path.exists(out_path): return out_path
     return ""
 
@@ -713,65 +752,96 @@ def fetch_posts(channel: str) -> List[Dict]:
 
 # ==================== ГОЛОВНИЙ ЦИКЛ ====================
 def run():
-    print(f"\n{'='*55}")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Жорсткий відсів сміття та заміна вотермарок.")
+    print("="*55)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Балансування донорів, фільтр сміття та заміна вотермарок.")
     print(f"{'='*55}")
 
     recent_channel_posts = sync_channel_history(CHANNEL_USERNAME)
     published_count = 0
+    channel_posts_used = set()
 
-    for channel in DONOR_CHANNELS:
+    # 1. Збираємо свіжі пости з УСІХ 9 каналів-донорів
+    candidates_by_channel = {}
+    for ch in DONOR_CHANNELS:
+        posts = fetch_posts(ch)
+        if posts:
+            candidates_by_channel[ch] = posts
+
+    # 2. Формуємо збалансовану чергу (Round-Robin), щоб один канал не забивав ефір
+    interleaved_candidates = []
+    max_len = max((len(p) for p in candidates_by_channel.values()), default=0)
+    for idx in range(max_len):
+        for ch in DONOR_CHANNELS:
+            if ch in candidates_by_channel and idx < len(candidates_by_channel[ch]):
+                interleaved_candidates.append(candidates_by_channel[ch][idx])
+
+    print(f"[ПУЛ КАНДИДАТІВ]: Зібрано {len(interleaved_candidates)} свіжих постів з {len(candidates_by_channel)} каналів.")
+
+    for p in interleaved_candidates:
         if published_count >= MAX_POSTS_PER_RUN:
             break
 
-        posts = fetch_posts(channel)
+        channel = p["channel"]
 
-        for p in posts:
-            if published_count >= MAX_POSTS_PER_RUN:
-                break
+        # ПРАВИЛО ЧЕСНОГО БАЛАНСУ: не більше 1 поста з одного каналу за 1 запуск!
+        if channel in channel_posts_used and len(candidates_by_channel) > 1:
+            continue
 
-            text = p["text"]
-            photo = p["photo_url"]
-            video = p["video_url"]
+        text = p["text"]
+        photo = p["photo_url"]
+        video = p["video_url"]
+        post_id = p.get("post_id", "")
 
-            # 1. Відсікаємо рекламу, сарказм, побутові скарги та небойовий треш Supernova
-            if is_unwanted_content(channel, text):
-                continue
+        # 1. Відсікаємо рекламу, сарказм, локальні комунальні сповіщення та треш
+        if is_unwanted_content(channel, text):
+            register_post_id(post_id)
+            continue
 
-            # 2. Смисловий антидубль (географія та теми за 48 годин)
-            if is_topic_already_covered(text):
-                continue
+        # 2. Смисловий антидубль (географія, темник, вшитий список)
+        if is_topic_already_covered(text):
+            register_post_id(post_id)
+            continue
 
-            # 3. Медіадубль
-            if video and is_media_duplicate(b"", video):
-                continue
+        # 3. Медіадубль
+        if video and is_media_duplicate(b"", video):
+            register_post_id(post_id)
+            continue
 
-            # 4. ШІ-обробка з автозаміною суржику та звіркою з вашим каналом
-            ai = process_news_with_ai(text, recent_channel_posts)
-            if not ai:
-                continue
+        # 4. ШІ-обробка з суворою валідацією української мови та автовиправленням
+        ai = process_news_with_ai(text, recent_channel_posts)
+        if not ai:
+            register_post_id(post_id)
+            continue
 
-            post_text = ai.get("telegram_post", "")
-            if len(post_text) < 25:
-                continue
+        post_text = ai.get("telegram_post", "")
+        if len(post_text) < 25:
+            register_post_id(post_id)
+            continue
 
-            # Пауза між постами
-            if published_count > 0:
-                print(f"[ПАУЗА]: Очікуємо {DELAY_BETWEEN_POSTS} сек перед наступним постом...")
-                time.sleep(DELAY_BETWEEN_POSTS)
+        # Пауза між постами для плавного постингу
+        if published_count > 0:
+            print(f"[ПАУЗА]: Очікуємо {DELAY_BETWEEN_POSTS} сек перед наступним постом...")
+            time.sleep(DELAY_BETWEEN_POSTS)
 
-            # 5. Публікація в Telegram
-            posted = send_telegram_post(post_text, photo_url=photo, video_url=video, donor=channel)
-            if posted:
-                published_count += 1
-                head = post_text.split("\n")[0]
-                register_published_topic(head, text)
-                recent_channel_posts.insert(0, head)
-                print(f"✅ УСПІШНО ОПУБЛІКОВАНО ({published_count}/{MAX_POSTS_PER_RUN}): {head[:50]}...")
+        # 5. Публікація в Telegram
+        posted = send_telegram_post(post_text, photo_url=photo, video_url=video, donor=channel)
+        if posted:
+            published_count += 1
+            channel_posts_used.add(channel)
+            head = post_text.splitlines()[0] if post_text.splitlines() else post_text
+            register_published_topic(head, text)
+            register_post_id(post_id)
+            recent_channel_posts.insert(0, head)
+            print(f"✅ УСПІШНО ОПУБЛІКОВАНО ({published_count}/{MAX_POSTS_PER_RUN}) з @{channel}: {head[:50]}...")
 
-                # 6. ВІДЕО ДЛЯ СОЦМЕРЕЖ (якщо бойове відео або важлива подія)
-                is_mega = ai.get("is_mega_news", False) or (ai.get("news_score", 5) >= BREAKING_NEWS_THRESHOLD)
-                if (is_mega or video) and (photo or video):
+            # 6. ВІРУСНЕ ВІДЕО ДЛЯ СОЦМЕРЕЖ (ТІЛЬКИ ДЛЯ ТОПОВИХ НАДВАЖЛИВИХ ПОДІЙ)
+            try:
+                score = ai.get("news_score", 5)
+                is_mega = ai.get("is_mega_news", False)
+                has_combat = any(w in text.lower() for w in ["знищен", "удар", "збит", "дрон", "ракета", "бавовн", "вибух", "прильот"])
+                is_top_news = (is_mega and score >= 8) or (score >= 9) or (video and has_combat and score >= 8)
+
+                if is_top_news and (photo or video):
                     v_head = ai.get("video_headline", "ГОЛОВНІ НОВИНИ")
                     v_script = ai.get("video_script", "")
                     v_caption = f"{v_head}\n\nОперативні деталі в Telegram: {CHANNEL_INVITE_LINK}\n#новини #україна #shorts #reels #tiktok"
@@ -780,8 +850,12 @@ def run():
                     if created_video:
                         send_admin_social_video(created_video, v_head, v_caption)
                         print(f"🎬 Змонтовано та надіслано адміну ролик для соцмереж!")
+                else:
+                    print(f"[ВІДЕО СОЦМЕРЕЖІ]: Пропущено (новина має оцінку {score}/10, ролик створюється лише для ТОП-подій >=9 або бойових кадрів).")
+            except Exception as ve:
+                print(f"[ВІДЕО СОЦМЕРЕЖІ]: Помилка створення чи надсилання відео: {ve}")
 
-    print(f"\n[ЗАВЕРШЕННЯ]: Опубліковано свіжих якісних новин: {published_count}. Чекаємо наступного запуску.")
+    print(f"[ЗАВЕРШЕННЯ]: Опубліковано свіжих якісних новин: {published_count}. Чекаємо наступного запуску.")
 
 if __name__ == "__main__":
     run()
