@@ -2,13 +2,17 @@ name: Run Telegram News Bot
 
 on:
   schedule:
-    # Запуск кожні 15 хвилин цілодобово
-    - cron: '*/15 * * * *'
-  workflow_dispatch: # Кнопка ручного запуску
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tg-news-bot-run
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 
@@ -19,13 +23,25 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install FFmpeg and fonts
+      - name: Restore news and topics cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            news.db
+            published_topics.json
+            media_hashes.json
+            processed_ids.json
+          key: tg-bot-cache-${{ github.run_id }}
+          restore-keys: |
+            tg-bot-cache-
+
+      - name: Fast install FFmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-core
 
       - name: Install Python dependencies
         run: |
@@ -39,19 +55,17 @@ jobs:
           CHANNEL_NAME: ${{ secrets.CHANNEL_NAME }}
           CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
           CHANNEL_INVITE_LINK: ${{ secrets.CHANNEL_INVITE_LINK }}
-          AI_PROVIDER: 'groq'
+          AI_PROVIDER: "groq"
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
-          AI_MODEL: 'llama-3.3-70b-versatile'
-          BREAKING_NEWS_THRESHOLD: '8'
+          AI_MODEL: "llama-3.3-70b-versatile"
+          BREAKING_NEWS_THRESHOLD: "8"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python main.py --once
 
-      - name: Save processed news database
+      - name: Save processed news and topics to repository
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -f news.db ]; then
-            git add news.db
-            git diff-index --quiet HEAD || git commit -m "Оновлення бази новин [skip ci]"
-            git push
-          fi
+          git add news.db published_topics.json media_hashes.json processed_ids.json 2>/dev/null || true
+          git diff-index --quiet HEAD || (git commit -m "Оновлення бази новин та тем [skip ci]" && git push) || true
