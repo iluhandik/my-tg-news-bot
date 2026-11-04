@@ -337,6 +337,7 @@ def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
 
 # Завжди активний список уже опублікованих тем, щоб бот НІКОЛИ не публікував повтори:
 SEEDED_TOPICS = [
+    {"capitals": ["донец", "фенік", "адиге", "ozon"], "stems": ["донец", "фенік", "київст", "адиге", "ozon"], "headline": "Донецьк Фенікс та Адигейськ Ozon"},
     {"capitals": ["філат", "кирил"], "stems": ["філат", "кирил", "росі", "патрі"], "headline": "Філатов та Кирил"},
     {"capitals": ["борів", "андрі", "зелен"], "stems": ["борів", "андрі", "звіль", "зелен"], "headline": "Борівська Андріївка та Зелений Гай"},
     {"capitals": ["боров", "андре", "зелен"], "stems": ["боров", "андре", "звіль", "зелен"], "headline": "Боровская Андреевка"},
@@ -365,7 +366,7 @@ def is_topic_already_covered(text: str) -> bool:
     min_time = now - (48 * 3600)
 
     for t in topics:
-        if t.get("timestamp", 0) < min_time:
+        if "timestamp" in t and t["timestamp"] < min_time:
             continue
         prev_caps = set(t.get("capitals", []))
         prev_stems = set(t.get("stems", []))
@@ -427,32 +428,89 @@ def register_media(media_bytes: bytes, media_url: str = ""):
 
 # ==================== ЧИТАННЯ ВЛАСНОГО КАНАЛУ @kropivnit ====================
 def sync_channel_history(channel_username: str) -> List[str]:
-    clean_name = channel_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
-    url = f"https://t.me/s/{clean_name}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+    """
+    Зчитує історію публікацій вашого каналу через офіційне API Telegram (getUpdates + getChat)
+    та через веб-віджет, щоб ШІ на 100% знав про ВСІ пости, які ви виставили вручну!
+    """
     recent_texts = []
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html_raw = resp.read().decode("utf-8", errors="ignore")
-        blocks = html_raw.split('<div class="tgme_widget_message_wrap')
-        for b in blocks[1:][-25:]:
-            m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*<div class="tgme_widget_message_footer', b, re.DOTALL)
-            if not m:
-                continue
-            clean = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).strip()
-            if len(clean) > 20:
-                head = clean.split("\n")[0][:60]
-                register_published_topic(head, clean)
-                recent_texts.append(clean[:120])
-        print(f"[СИНХРОНІЗАЦІЯ]: Зчитано {len(recent_texts)} постів із @{clean_name}.")
-    except Exception as e:
-        print(f"[СИНХРОНІЗАЦІЯ]: Помилка читання @{clean_name}: {e}")
+    seen_texts = set()
+
+    # 1. ОФІЦІЙНЕ TELEGRAM BOT API: зчитуємо пости каналу через getUpdates
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            upd_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?limit=100"
+            resp = requests.get(upd_url, timeout=12).json()
+            if resp.get("ok"):
+                for item in resp.get("result", []):
+                    post = item.get("channel_post") or item.get("message")
+                    if post:
+                        t = (post.get("text") or post.get("caption") or "").strip()
+                        if t and len(t) > 20 and t not in seen_texts:
+                            seen_texts.add(t)
+                            head = t.splitlines()[0][:60]
+                            register_published_topic(head, t)
+                            recent_texts.append(t[:140])
+                if recent_texts:
+                    print(f"[API СИНХРОНІЗАЦІЯ]: Зчитано {len(recent_texts)} постів вашого каналу через Bot API (включаючи ручні пости)!")
+        except Exception as e:
+            print(f"[API СИНХРОНІЗАЦІЯ]: {e}")
+
+    # 2. ДИНАМІЧНЕ ВИЗНАЧЕННЯ USERNAME ЧЕРЕЗ getChat
+    actual_username = channel_username
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID:
+        try:
+            chat_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat?chat_id={TELEGRAM_CHANNEL_ID}"
+            c_resp = requests.get(chat_url, timeout=10).json()
+            if c_resp.get("ok"):
+                u = c_resp.get("result", {}).get("username")
+                if u:
+                    actual_username = f"@{u}"
+                pinned = c_resp.get("result", {}).get("pinned_message", {})
+                p_text = (pinned.get("text") or pinned.get("caption") or "").strip()
+                if p_text and p_text not in seen_texts:
+                    seen_texts.add(p_text)
+                    head = p_text.splitlines()[0][:60]
+                    register_published_topic(head, p_text)
+                    recent_texts.append(p_text[:140])
+        except Exception:
+            pass
+
+    # 3. ВЕБ-СКАНУВАННЯ через requests з браузерним User-Agent
+    clean_name = actual_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
+    if clean_name:
+        url = f"https://t.me/s/{clean_name}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"}
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code == 200:
+                html_raw = r.text
+                blocks = html_raw.split('<div class="tgme_widget_message_wrap')
+                for b in blocks[1:][-30:]:
+                    m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*<div class="tgme_widget_message_footer', b, re.DOTALL)
+                    if not m:
+                        continue
+                    clean = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).strip()
+                    if len(clean) > 20 and clean not in seen_texts:
+                        seen_texts.add(clean)
+                        head = clean.splitlines()[0][:60]
+                        register_published_topic(head, clean)
+                        recent_texts.append(clean[:140])
+                print(f"[СИНХРОНІЗАЦІЯ]: Зчитано додатково {len(blocks[1:])} постів із вебу @{clean_name}.")
+        except Exception as e:
+            print(f"[СИНХРОНІЗАЦІЯ]: Помилка веб-читання @{clean_name}: {e}")
+
     return recent_texts
 
 # ==================== ШІ-ОБРОБКА (АНТИФЕЙК + АНТИДУБЛЬ) ====================
 SYSTEM_PROMPT = """Ти — професійний український журналіст та суворий фактчекер новинного каналу.
 Твоє завдання — перекласти та відредагувати новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ строго за фактами.
+
+ТИПОВИЙ ЗРАЗОК ІДЕАЛЬНОГО ПОСТУ КАНАЛУ (орієнтуйся на цей лаконічний, живий та діловий стиль автора):
+💥 Дрони атакували телекомунікаційну інфраструктуру у Донецьку
+
+Під удар потрапив окупаційний оператор «Фенікс», який працює на вкраденому після окупації обладнанні «Київстару». Зафіксовано щонайменше три влучання.
+
+Тим часом у Адигейську горить Ozon, ймовірно, внаслідок атаки.
 
 ОСНОВНИЙ ПРІОРИТЕТ:
 - Головний акцент — на подіях в Україні (фронт, енергетика, обстріли, важливі закони).
@@ -524,7 +582,18 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
         if r.status_code == 200:
             active = [m["id"] for m in r.json().get("data", []) if not any(x in m["id"].lower() for x in ["whisper", "guard"])]
             if active:
-                models_to_try = active
+                preferred_order = [
+                    "llama-3.3-70b-versatile",
+                    "openai/gpt-oss-120b",
+                    "llama-3.1-70b-versatile",
+                    "llama-3.1-8b-instant",
+                    "gemma2-9b-it"
+                ]
+                sorted_models = [m for m in preferred_order if m in active]
+                for m in active:
+                    if m not in sorted_models:
+                        sorted_models.append(m)
+                models_to_try = sorted_models
     except Exception:
         pass
 
