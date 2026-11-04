@@ -5,13 +5,13 @@ import time
 import html
 import json
 import hashlib
-import textwrap
 import subprocess
 import urllib.request
 import urllib.parse
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Set
 import requests
+from PIL import Image, ImageFilter
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,9 +21,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-CHANNEL_NAME = "Оперативні Новини України"
+CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit"
-CHANNEL_INVITE_LINK = f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"
 
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
@@ -43,19 +42,23 @@ DONOR_CHANNELS = [
     "inslandd"
 ]
 
-MAX_POSTS_PER_RUN = 1  # СТРОГО 1 ПОСТ ЗА ЦИКЛ! Ніякого спаму по кілька штук поспіль!
-DELAY_BETWEEN_POSTS = 90
+# Канали з нав'язливими вотермарками для автоматичної заміни
+CHANNELS_WITH_HEAVY_WATERMARKS = {
+    "supernova_plus",
+    "exilenova_plus"
+}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_DIR = os.path.join(BASE_DIR, "media")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 TOPICS_FILE = os.path.join(BASE_DIR, "published_topics.json")
 MEDIA_HASH_FILE = os.path.join(BASE_DIR, "media_hashes.json")
+WATERMARK_FILE = os.path.join(BASE_DIR, "watermark.png")
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ==================== СТОП-СЛОВА ТА АНТИРЕКЛАМА ====================
+# ==================== АНТИРЕКЛАМА ====================
 COMMON_STOP_WORDS = {
     "сьогодні", "зараз", "вчора", "цього", "після", "також", "було", "проти", "може",
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
@@ -102,6 +105,75 @@ def is_advertisement(text: str) -> bool:
             return True
     return False
 
+# ==================== БРЕНДОВИЙ МЕДІА-БЕЙДЖ (ЛОГОТИП + НАЗВА КАНАЛУ) ====================
+def apply_watermark_to_image(img_path: str, output_path: str) -> str:
+    """
+    Замінює чужу вотермарку на стильний медіа-бейдж:
+    [Аватар Шевченка] + NEWS УКРАЇНА 365 + t.me/kropivnit.
+    Накладається на місце чужого тексту, розмиваючи його під собою.
+    """
+    try:
+        if not os.path.exists(WATERMARK_FILE) or not os.path.exists(img_path):
+            return img_path
+
+        base_img = Image.open(img_path).convert("RGB")
+        width, height = base_img.size
+        wm = Image.open(WATERMARK_FILE).convert("RGBA")
+
+        # Розмір плашки: приблизно 32% ширини фото для чіткої читабельності назви каналу
+        wm_w = max(180, int(width * 0.32))
+        wm_h = int(wm.height * (wm_w / wm.width))
+        wm_resized = wm.resize((wm_w, wm_h), Image.Resampling.LANCZOS)
+
+        # Координати: центр/нижня частина кадру (де зазвичай ліплять Supernova)
+        pos_x = (width - wm_w) // 2
+        pos_y = int(height * 0.65)
+
+        # Локальне розмиття саме під плашкою, щоб стерти чужий текст
+        blur_box = (
+            max(0, pos_x - 10),
+            max(0, pos_y - 8),
+            min(width, pos_x + wm_w + 10),
+            min(height, pos_y + wm_h + 8)
+        )
+        crop_area = base_img.crop(blur_box).filter(ImageFilter.GaussianBlur(14))
+        base_img.paste(crop_area, blur_box)
+
+        # Накладаємо брендовий бейдж
+        base_img.paste(wm_resized, (pos_x, pos_y), mask=wm_resized)
+        base_img.save(output_path, "JPEG", quality=92)
+        return output_path
+    except Exception as e:
+        print(f"[БРЕНДУВАННЯ ФОТО]: Помилка: {e}")
+        return img_path
+
+def apply_watermark_to_video(video_path: str, output_path: str) -> str:
+    """Замінює чужий вотермарк на відео на фірмовий медіа-бейдж каналу через FFmpeg."""
+    try:
+        if not os.path.exists(WATERMARK_FILE) or not os.path.exists(video_path):
+            return video_path
+
+        # Накладаємо медіа-бейдж у зону чужого напису (W*0.32, y=H*0.65)
+        filter_complex = f"[1:v]scale=iw*0.32:-1[wm];[0:v][wm]overlay=(W-w)/2:H*0.65[v]"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", WATERMARK_FILE,
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "copy",
+            output_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            return output_path
+        return video_path
+    except Exception as e:
+        print(f"[БРЕНДУВАННЯ ВІДЕО]: Помилка: {e}")
+        return video_path
+
 # ==================== ЗБЕРЕЖЕННЯ ТА АНТИДУБЛІКАТ ====================
 def load_json(path: str) -> list:
     if os.path.exists(path):
@@ -116,15 +188,12 @@ def save_json(path: str, data: list):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[Помилка запису {path}]: {e}")
+    except Exception:
+        pass
 
 def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
-    # 1. Власні назви, географія, техніка (Керч, Сімферополь, Боровська, Андріївка, FPV, солдат, дерево)
     capitals = set(re.findall(r"\b[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{2,}", text))
     capitals_norm = {c.lower()[:5] for c in capitals if c.lower() not in COMMON_STOP_WORDS}
-
-    # 2. Ключові корені
     clean = re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE)
     stems = set()
     for w in clean.split():
@@ -144,13 +213,13 @@ def is_topic_already_covered(text: str) -> bool:
         prev_caps = set(t.get("capitals", []))
         prev_stems = set(t.get("stems", []))
 
-        # Перевірка 1: Збіг географічних назв чи імен
+        # 1. Збіг 2 власних назв
         common_caps = cur_caps.intersection(prev_caps)
         if len(common_caps) >= 2:
             print(f"[АНТИДУБЛЬ ГЕО]: Збіг сутностей {common_caps} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
             return True
 
-        # Перевірка 2: Збіг ключових слів події
+        # 2. Збіг 3 ключових коренів
         common_stems = cur_stems.intersection(prev_stems)
         if len(common_stems) >= 3:
             print(f"[АНТИДУБЛЬ СЕНСУ]: Збіг слів {common_stems} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
@@ -181,10 +250,10 @@ def is_media_duplicate(media_bytes: bytes, media_url: str = "") -> bool:
         if item.get("timestamp", 0) < min_time:
             continue
         if c_hash and item.get("content_hash") == c_hash:
-            print("[АНТИДУБЛЬ МЕДІА]: Збіг фото/відео за цифровим хешем! ВІДХИЛЕНО!")
+            print("[АНТИДУБЛЬ МЕДІА]: Збіг фото/відео за цифровим відбитком! ВІДХИЛЕНО!")
             return True
         if u_hash and item.get("url_hash") == u_hash:
-            print("[АНТИДУБЛЬ МЕДІА]: Збіг посилання на відео/фото! ВІДХИЛЕНО!")
+            print("[АНТИДУБЛЬ МЕДІА]: Збіг посилання на медіафайл! ВІДХИЛЕНО!")
             return True
     return False
 
@@ -201,7 +270,6 @@ def register_media(media_bytes: bytes, media_url: str = ""):
 
 # ==================== ЧИТАННЯ ВЛАСНОГО КАНАЛУ @kropivnit ====================
 def sync_channel_history(channel_username: str) -> List[str]:
-    """Зчитує дописи безпосередньо з вашого каналу, щоб бот ніколи не повторив ваші ручні пости!"""
     clean_name = channel_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
     url = f"https://t.me/s/{clean_name}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -225,14 +293,14 @@ def sync_channel_history(channel_username: str) -> List[str]:
         print(f"[СИНХРОНІЗАЦІЯ]: Помилка читання @{clean_name}: {e}")
     return recent_texts
 
-# ==================== ШІ-ОБРОБКА ТА АНТИФЕЙК ====================
+# ==================== ШІ-ОБРОБКА (АНТИФЕЙК + АНТИДУБЛЬ) ====================
 SYSTEM_PROMPT = """Ти — професійний український журналіст та суворий фактчекер новинного каналу.
 Твоє завдання — відредагувати новину солов'їною мовою СУВОРО ЗА РЕАЛЬНИМИ ФАКТАМИ.
 
-СУВОРІ ПРАВИЛА (АНТИФЕЙК + АНТИДУБЛЬ):
+СУВОРІ ПРАВИЛА:
 1. ПЕРЕВІРКА НА ДУБЛІКАТ:
    - Тобі надано список останніх публікацій каналу.
-   - Якщо ця сама подія ВЖЕ висвітлена (наприклад: той самий дрон на дереві, той самий блекаут у Керчі чи Сімферополі, та сама Боровська Андріївка, навіть якщо слова інші) — встанови "is_duplicate": true!
+   - Якщо ця сама подія ВЖЕ висвітлена (наприклад: той самий дрон на дереві, той самий блекаут у Керчі чи Сімферополі, та сама Боровська Андріївка) — встанови "is_duplicate": true!
 2. КАТЕГОРИЧНА ЗАБОРОНА ВИГАДУВАТИ ЛЮДЕЙ ТА ЦИТАТИ:
    - Суворо заборонено вигадувати мерів, людей (як вигадані «Ковальчуки» чи фейкові «жителі Керчу»), посадовців чи органи влади!
    - Блок <blockquote> використовуй ТІЛЬКИ тоді, коли в тексті донора Є реальна цитата конкретної реальної особи. Якщо прямої мови в оригіналі НЕМАЄ — жодних <blockquote> НЕ СТАВ!
@@ -279,7 +347,6 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
 
     user_prompt = f"{recent_context}НОВА НОВИНА ДЛЯ ОБРОБКИ (перевір на дубль та оформи):\n{cleaned}"
 
-    # Отримуємо доступні моделі
     models_to_try = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "gemma2-9b-it"]
     try:
         r = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
@@ -299,7 +366,7 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
                     {"role": "user", "content": user_prompt}
                 ],
                 "response_format": {"type": "json_object"},
-                "temperature": 0.0  # НУЛЬОВА ТЕМПЕРАТУРА: виключає будь-які фантазії та галюцинації!
+                "temperature": 0.0
             }
             resp = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=25)
             if resp.status_code != 200:
@@ -320,21 +387,31 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
 def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_url: Optional[str] = None, donor: str = "") -> bool:
     url_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     caption = post_text[:1024]
-    has_heavy_wm = donor.lower() in {"supernova_plus", "exilenova_plus"}
+    has_heavy_wm = donor.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
 
     # 1. Якщо є відео
     if video_url:
         if is_media_duplicate(b"", video_url):
             return False
         temp_vid = os.path.join(MEDIA_DIR, "temp_vid.mp4")
+        branded_vid = os.path.join(MEDIA_DIR, "branded_vid.mp4")
         try:
-            r = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30, stream=True)
+            r = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=35, stream=True)
             if r.status_code == 200:
                 with open(temp_vid, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024*1024):
                         if chunk: f.write(chunk)
-                with open(temp_vid, "rb") as f:
-                    resp = requests.post(f"{url_base}/sendVideo", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"video": ("video.mp4", f, "video/mp4")}, timeout=60)
+
+                # Замінюємо чужу вотермарку на НАШ МЕДІА-БЕЙДЖ Тільки для supernova чи exilenova
+                if has_heavy_wm and os.path.exists(WATERMARK_FILE):
+                    final_video = apply_watermark_to_video(temp_vid, branded_vid)
+                    print(f"[Telegram]: Замінено чужий вотермарк з @{donor} на медіа-бейдж {CHANNEL_NAME}.")
+                else:
+                    final_video = temp_vid
+                    print(f"[Telegram]: Чисте відео з @{donor}, публікуємо без вотермарки.")
+
+                with open(final_video, "rb") as f:
+                    resp = requests.post(f"{url_base}/sendVideo", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"video": ("video.mp4", f, "video/mp4")}, timeout=75)
                     if resp.json().get("ok", False):
                         register_media(b"", video_url)
                         return True
@@ -349,9 +426,18 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
                 if is_media_duplicate(r.content, photo_url):
                     return False
                 temp_img = os.path.join(MEDIA_DIR, "temp_img.jpg")
+                branded_img = os.path.join(MEDIA_DIR, "branded_img.jpg")
                 with open(temp_img, "wb") as f:
                     f.write(r.content)
-                with open(temp_img, "rb") as f:
+
+                if has_heavy_wm and os.path.exists(WATERMARK_FILE):
+                    final_img = apply_watermark_to_image(temp_img, branded_img)
+                    print(f"[Telegram]: Замінено чужий вотермарк з @{donor} на медіа-бейдж {CHANNEL_NAME}.")
+                else:
+                    final_img = temp_img
+                    print(f"[Telegram]: Чисте фото з @{donor}, публікуємо без вотермарки.")
+
+                with open(final_img, "rb") as f:
                     resp = requests.post(f"{url_base}/sendPhoto", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"photo": ("photo.jpg", f, "image/jpeg")}, timeout=30)
                     if resp.json().get("ok", False):
                         register_media(r.content, photo_url)
@@ -381,11 +467,9 @@ def fetch_posts(channel: str) -> List[Dict]:
             p_id = re.search(r'data-post="([^"]+)"', b)
             if not p_id: continue
             
-            # Текст
             t_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*<div class="tgme_widget_message_footer', b, re.DOTALL)
             raw_text = html.unescape(re.sub(r"<[^>]+>", " ", t_match.group(1))).strip() if t_match else ""
 
-            # Медіа
             unescaped = html.unescape(b)
             p_match = re.search(r'background-image:\s*url\([\'"]?(https?://[^\'")\s]+)[\'"]?\)', unescaped)
             photo_url = p_match.group(1) if p_match else None
@@ -407,10 +491,9 @@ def fetch_posts(channel: str) -> List[Dict]:
 # ==================== ГОЛОВНИЙ ЦИКЛ ====================
 def run():
     print(f"\n{'='*55}")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Повний захист від дублікатів.")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ КАНАЛІВ. Повний антидублікат + медіа-бейдж.")
     print(f"{'='*55}")
 
-    # 1. Синхронізуємося з вашим каналом
     recent_channel_posts = sync_channel_history(CHANNEL_USERNAME)
 
     for channel in DONOR_CHANNELS:
@@ -421,19 +504,16 @@ def run():
             photo = p["photo_url"]
             video = p["video_url"]
 
-            # Фільтри
             if is_advertisement(text): continue
             if is_topic_already_covered(text): continue
             if video and is_media_duplicate(b"", video): continue
 
-            # ШІ-обробка з перевіркою проти вашого каналу
             ai = process_news_with_ai(text, recent_channel_posts)
             if not ai: continue
 
             post_text = ai.get("telegram_post", "")
             if len(post_text) < 25: continue
 
-            # Публікуємо рівно 1 свіжий якісний пост
             posted = send_telegram_post(post_text, photo_url=photo, video_url=video, donor=channel)
             if posted:
                 head = post_text.split("\n")[0]
