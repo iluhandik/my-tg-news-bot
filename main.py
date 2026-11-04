@@ -333,16 +333,30 @@ def save_json(path: str, data: list):
     except Exception:
         pass
 
+ACRONYMS = {
+    "сбу", "набу", "зсу", "ппо", "тес", "аес", "дбр", "сап", "вакс", "гур",
+    "рф", "сша", "оон", "єс", "fpv", "бпла", "нгу", "мвс", "огп"
+}
+
 def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
-    capitals = set(re.findall(r"\b[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{2,}", text))
-    capitals_norm = {c.lower()[:5] for c in capitals if c.lower() not in COMMON_STOP_WORDS}
+    # Захоплюємо як власні назви (Поклад), так і абревіатури (СБУ, НАБУ, ЗСУ, FPV)
+    caps_raw = set(re.findall(r"[А-ЯІЇЄҐA-Z]{2,}|[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{2,}", text))
+    capitals_norm = set()
+    for c in caps_raw:
+        cl = c.lower()
+        if cl not in COMMON_STOP_WORDS:
+            capitals_norm.add(cl[:5] if len(cl) >= 5 else cl)
+
     clean = re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE)
     stems = set()
     for w in clean.split():
-        if len(w) >= 4 and w not in COMMON_STOP_WORDS:
+        if w in ACRONYMS:
+            stems.add(w)
+            capitals_norm.add(w)
+        elif len(w) >= 3 and w not in COMMON_STOP_WORDS:
             stems.add(w[:5] if len(w) >= 5 else w)
-    return capitals_norm, stems
 
+    return capitals_norm, stems
 
 # Завжди активний список уже опублікованих тем, щоб бот НІКОЛИ не публікував повтори:
 SEEDED_TOPICS = [
@@ -442,6 +456,13 @@ def is_topic_already_covered(text: str) -> bool:
         if len(common_stems) >= 3:
             print(f"[АНТИДУБЛЬ СЕНСУ]: Збіг слів {common_stems} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
             return True
+
+        # 3. Висока лексична схожість (Jaccard >= 0.28)
+        if cur_stems and prev_stems:
+            overlap = len(common_stems) / len(cur_stems.union(prev_stems))
+            if overlap >= 0.28:
+                print(f"[АНТИДУБЛЬ JACCARD]: Схожість {overlap:.2f} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
+                return True
     return False
 
 def register_published_topic(headline: str, text: str):
