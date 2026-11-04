@@ -6,6 +6,8 @@ import html
 import json
 import hashlib
 import subprocess
+import textwrap
+import urllib
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -23,6 +25,7 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit"
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}").strip()
 
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
