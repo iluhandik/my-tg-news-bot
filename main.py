@@ -72,7 +72,7 @@ def get_working_groq_model():
                 for m in all_models:
                     if pref in m.lower() and "guard" not in m.lower():
                         ACTIVE_MODEL = m
-                        logger.info(f"Вибрано актуальну модель Groq: {ACTIVE_MODEL}")
+                        logger.info(f"Вибрано модель Groq: {ACTIVE_MODEL}")
                         return ACTIVE_MODEL
             if all_models:
                 ACTIVE_MODEL = all_models[0]
@@ -103,7 +103,7 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними"
+    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
 }
 
 STATE_FILE = "bot_state.json"
@@ -169,7 +169,7 @@ def is_text_duplicate(candidate_text, state):
             return True
     return False
 
-# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН (ДО 2 ГОДИН) -----------------
+# ----------------- ПАРСИНГ З МЕДІА -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -183,11 +183,9 @@ def scrape_donor(channel_username):
         results = []
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        # Беремо ТІЛЬКИ останні 4 повідомлення з самого низу сторінки (найновіші!)
         latest_blocks = raw_messages[-4:] if len(raw_messages) > 4 else raw_messages[1:]
 
         for msg_block in reversed(latest_blocks):
-            # 1. СУВОРИЙ ФІЛЬТР СВІЖОСТІ (МАКСИМУМ 2 ГОДИНИ)
             time_match = re.search(r'<time[^>]+datetime="([^"]+)"', msg_block)
             if not time_match:
                 continue
@@ -197,14 +195,12 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                # Якщо новина старша за 2 години (7200 сек) або з майбутнього — СУВОРИЙ ПРОПУСК!
+                # Тільки свіжі новини за останні 2 години
                 if age_seconds > 2.0 * 3600 or age_seconds < -120:
                     continue
             except Exception:
-                # Якщо дату не вдалося точно перевірити — НІКОЛИ не публікуємо!
                 continue
 
-            # 2. Витягуємо текст
             text_match = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', msg_block, re.DOTALL)
             if not text_match:
                 continue
@@ -218,23 +214,18 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            # 3. Перевірка медіа
-            has_video = ('<video' in msg_block) or ('tgme_widget_message_video_thumb' in msg_block)
-            video_src = re.search(r'<video[^>]+src="([^"]+)"', msg_block)
-            photo_style = re.search(r"background-image:url\('([^']+)'\)", msg_block)
+            video_match = re.search(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            photo_match = re.search(r"background-image:url\(["\']?(https?://[^"')]+)["\']?\)", msg_block, re.IGNORECASE) or re.search(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
 
             media_type = None
             media_url = None
 
-            if video_src and video_src.group(1).startswith('http'):
+            if video_match:
                 media_type = 'video'
-                media_url = video_src.group(1)
-            elif has_video:
-                media_type = None
-                media_url = None
-            elif photo_style:
+                media_url = video_match.group(1)
+            elif photo_match:
                 media_type = 'photo'
-                media_url = photo_style.group(1)
+                media_url = photo_match.group(1)
 
             results.append({
                 "channel": channel_username,
@@ -247,46 +238,45 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР GROQ -----------------
+# ----------------- РЕДАКТОР З ЖИРНИМ ЗАГОЛОВКОМ -----------------
 def generate_channel_post(raw_text, recent_titles):
-    prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
-Пиши ВИКЛЮЧНО так, як пишуть топові українські канали: коротко, сильно, без води, без машинних рамок.
+    prompt = f"""Ти — професійний редактор провідного всеукраїнського новинного Telegram-каналу "NEWS УКРАЇНА 365".
+Перепиши новину в солідному, авторитетному новинному стилі.
 
-ОСЬ ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ В КАНАЛІ:
+ОСЬ ОСТАННІ ТЕМИ В КАНАЛІ:
 {json.dumps(recent_titles, ensure_ascii=False)}
 
 ПРАВИЛО ДУБЛІКАТІВ ТА ШЛАКУ:
-- Якщо новина описує ТОЙ САМИЙ факт, що вже був — пиши тільки: SKIP
-- Якщо це жовта преса, плітки, шоубіз чи Гордон — пиши тільки: SKIP
-- Якщо це побутові протести в Європі без зв'язку з Україною — пиши тільки: SKIP
-- Якщо це інша важлива теза виступу або нова подія — пиши пост!
+- Якщо новина описує ТОЙ САМИЙ факт — пиши: SKIP
+- Якщо це дрібний кримінал чи шоубіз — пиши: SKIP
+
+СТРОГА СТРУКТУРА ПОСТУ:
+1. ПЕРШИЙ РЯДОК — обов'язково жирний заголовок у тегах <b>...</b> з емодзі (⚡️, 💥, 🇺🇸, 🕯, 💧, 🛑).
+2. Порожній рядок.
+3. ОСНОВНИЙ ТЕКСТ — 1-2 повноцінних інформативних речення. Це має бути якісна новина з контекстом, а не коротка відписка другу в чат!
+4. Якщо є влучна цитата спікера — додай її в кінці: «...», — Прізвище.
 
 СУВОРО ЗАБОРОНЕНО:
-❌ НІЯКИХ blockquote (ніяких рамок для цитат)!
-❌ НІЯКОГО опису того, що на картинці («Трамп стоїть», «на фото видно», «на столі кепка»)!
-❌ НІЯКИХ дивних слів на кшталт «трепетний виступ», «лафа»!
-❌ НІЯКИХ повторів (коли спочатку переказуєш цитату, а потім вставляєш її ж у лапках)!
+❌ НІЯКИХ тегів blockquote!
+❌ НІЯКИХ однорядкових відписок без заголовка!
+❌ НІЯКИХ описів того, що видно на картинці!
 
-ПРИКЛАДИ СТИЛЮ ДЛЯ НОВИН:
+ПРИКЛАДИ СТРУКТУРИ:
 
-Приклад 1 (Коротка цитата/заява):
-«Наші вибори настільки нечесні, що ви навіть не уявляєте», — Трамп
+Приклад 1:
+<b>🇺🇸 Трамп пригрозив демократам правом вето</b>
 
-Приклад 2 (Заява з акцентом):
-⚡️ Ми можемо мати менше території, менше грошей і зброї, але гідності в нас все ж більше, ніж у багатьох. Ми будемо робити все, щоб ця війна закінчилася, але закінчилася гідно для нас, — Зеленський.
+Дональд Трамп публічно продемонстрував кепку з написом «VETO», давши чітко зрозуміти опонентам у Конгресі, що він готовий блокувати будь-які небажані законодавчі ініціативи.
 
-Приклад 3 (Важлива подія/удар):
-💥 Російський обстріл логістичного центру в Київській області
+Приклад 2:
+<b>💥 Російський удар по логістичному центру на Київщині</b>
 
-У Київській області російські війська вдарили по логістичному центру, спалахнула пожежа. На місці працюють рятувальники. Наразі відомо про одного пораненого.
-
-Приклад 4 (Конкретний факт):
-рф б'є по реле-підстанціях, які треба було закопати під землю. Наразі з 84 реле закопано лише 3, — нардеп Нагорняк.
+У Київській області внаслідок ворожої атаки спалахнула масштабна пожежа на території логістичного об'єкту. На місці працюють рятувальники, зафіксовано одного постраждалого.
 
 ТЕКСТ НОВИНИ:
 {raw_text}
 
-НАПИШИ ГОТОВИЙ ПОСТ (АБО СЛОВО SKIP):"""
+ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY.strip()}",
@@ -299,10 +289,10 @@ def generate_channel_post(raw_text, recent_titles):
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
+                {"role": "system", "content": "Ти досвідчений новинний редактор. Твої пости мають чіткий жирний заголовок і виглядають як солідна новинна стрічка."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.2,
+            "temperature": 0.25,
             "max_tokens": 450
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
@@ -334,6 +324,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
             res = requests.post(f"{base_url}/sendVideo", json=payload, timeout=25)
             if res.status_code == 200:
                 return True
+            logger.warning(f"sendVideo не пройшов ({res.status_code}), пробуємо як текст...")
 
         if media_type == 'photo' and media_url:
             payload = {
@@ -345,6 +336,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
             res = requests.post(f"{base_url}/sendPhoto", json=payload, timeout=20)
             if res.status_code == 200:
                 return True
+            logger.warning(f"sendPhoto не пройшов ({res.status_code}), пробуємо як текст...")
 
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
@@ -404,7 +396,7 @@ def main_loop():
                 success = post_to_telegram(formatted_post, item.get('media_type'), item.get('media_url'))
                 if success:
                     posts_published += 1
-                    logger.info(f"Опубліковано ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
+                    logger.info(f"Опубліковано ({posts_published}/{max_posts_this_cycle}) з @{item['channel']} (Медіа: {item.get('media_type')})!")
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
