@@ -68,20 +68,17 @@ def get_working_groq_model():
         resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=12)
         if resp.status_code == 200:
             all_models = [m["id"] for m in resp.json().get("data", [])]
-            logger.info(f"Список активних моделей Groq: {all_models}")
-            
-            # Шукаємо найкращу доступну модель Llama
             for pref in ["llama-3.3", "llama-3.1", "llama-3", "llama"]:
                 for m in all_models:
                     if pref in m.lower() and "guard" not in m.lower():
                         ACTIVE_MODEL = m
-                        logger.info(f"Автоматично обрано активну модель: {ACTIVE_MODEL}")
+                        logger.info(f"Вибрано актуальну модель Groq: {ACTIVE_MODEL}")
                         return ACTIVE_MODEL
             if all_models:
                 ACTIVE_MODEL = all_models[0]
                 return ACTIVE_MODEL
     except Exception as e:
-        logger.error(f"Помилка отримання списку моделей: {e}")
+        logger.error(f"Помилка отримання моделей: {e}")
 
     ACTIVE_MODEL = os.getenv("AI_MODEL") or "llama-3.1-8b-instant"
     return ACTIVE_MODEL
@@ -172,7 +169,7 @@ def is_text_duplicate(candidate_text, state):
             return True
     return False
 
-# ----------------- ПАРСИНГ ТЕЛЕГРАМУ -----------------
+# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН (ДО 2 ГОДИН) -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -186,18 +183,28 @@ def scrape_donor(channel_username):
         results = []
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        for msg_block in raw_messages[1:]:
+        # Беремо ТІЛЬКИ останні 4 повідомлення з самого низу сторінки (найновіші!)
+        latest_blocks = raw_messages[-4:] if len(raw_messages) > 4 else raw_messages[1:]
+
+        for msg_block in reversed(latest_blocks):
+            # 1. СУВОРИЙ ФІЛЬТР СВІЖОСТІ (МАКСИМУМ 2 ГОДИНИ)
             time_match = re.search(r'<time[^>]+datetime="([^"]+)"', msg_block)
-            if time_match:
-                try:
-                    dt = datetime.datetime.fromisoformat(time_match.group(1).replace('Z', '+00:00'))
-                    if (now - dt).total_seconds() > 3.0 * 3600:
-                        continue
-                except Exception:
-                    pass
-            else:
+            if not time_match:
                 continue
 
+            try:
+                dt_str = time_match.group(1).replace('Z', '+00:00')
+                dt = datetime.datetime.fromisoformat(dt_str)
+                age_seconds = (now - dt).total_seconds()
+                
+                # Якщо новина старша за 2 години (7200 сек) або з майбутнього — СУВОРИЙ ПРОПУСК!
+                if age_seconds > 2.0 * 3600 or age_seconds < -120:
+                    continue
+            except Exception:
+                # Якщо дату не вдалося точно перевірити — НІКОЛИ не публікуємо!
+                continue
+
+            # 2. Витягуємо текст
             text_match = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', msg_block, re.DOTALL)
             if not text_match:
                 continue
@@ -211,6 +218,7 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
+            # 3. Перевірка медіа
             has_video = ('<video' in msg_block) or ('tgme_widget_message_video_thumb' in msg_block)
             video_src = re.search(r'<video[^>]+src="([^"]+)"', msg_block)
             photo_style = re.search(r"background-image:url\('([^']+)'\)", msg_block)
@@ -306,7 +314,7 @@ def generate_channel_post(raw_text, recent_titles):
             result = re.sub(r'</?blockquote[^>]*>', '', result)
             return result.strip()
         else:
-            logger.error(f"Помилка Groq API ({resp.status_code}) на моделі {model_name}: {resp.text}")
+            logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
     except Exception as e:
         logger.error(f"Збій запиту до {model_name}: {e}")
 
@@ -369,7 +377,7 @@ def main_loop():
                         all_candidates.append((h, item))
                 time.sleep(1.2)
 
-            logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
+            logger.info(f"Знайдено свіжих кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
             max_posts_this_cycle = 3 if len(all_candidates) >= 6 and not is_night else 1
             posts_published = 0
