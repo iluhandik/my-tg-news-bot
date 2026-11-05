@@ -4,12 +4,12 @@ import re
 import json
 import time
 import string
+import html
 import logging
 import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import requests
-from bs4 import BeautifulSoup
 from groq import Groq
 
 # ----------------- НАЛАШТУВАННЯ ТА ЛОГУВАННЯ -----------------
@@ -57,18 +57,13 @@ threading.Thread(target=run_health_server, daemon=True).start()
 
 # ----------------- ФІЛЬТР ШЛАКУ -----------------
 JUNK_PHRASES = [
-    # Реклама та реакції
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
     "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
     "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
-    # Жовта преса та таблоїди
     "голлівуд", "шекспірівськ", "гордон", "продюсер", "шоу-бізнес",
-    # Погода та псевдонаука
     "прогноз погоди", "синоптики попередили", "похолодання", "магнітні бурі",
     "вчені назвали", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
-    # Дрібний кримінал і ДТП
     "п'яний водій", "напідпитку", "врізався в стовп", "побив сусіда", "вкрав",
-    # Рутинні тривоги
     "повітряна тривога", "воздушная тревога", "відбій тривоги", "чисто по",
     "перевірка сирен", "18+", "шок контент"
 ]
@@ -146,7 +141,7 @@ def is_text_duplicate(candidate_text, state):
             return True
     return False
 
-# ----------------- ПАРСИНГ ТЕЛЕГРАМУ З ЧЕСНИМ МЕДІА -----------------
+# ----------------- ПАРСИНГ ТЕЛЕГРАМУ БЕЗ BS4 -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -154,21 +149,19 @@ def scrape_donor(channel_username):
         resp = requests.get(url, headers=headers, timeout=12)
         if resp.status_code != 200:
             return []
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        messages = soup.find_all('div', class_='tgme_widget_message_wrap')
+        
+        raw_html = resp.text
+        # Розбиваємо сторінку на окремі блоки повідомлень
+        raw_messages = raw_html.split('class="tgme_widget_message_wrap')
         results = []
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        for msg in messages:
-            msg_div = msg.find('div', class_='tgme_widget_message')
-            if not msg_div:
-                continue
-
-            # Фільтр свіжості (до 3 годин)
-            time_tag = msg_div.find('time', class_='time')
-            if time_tag and time_tag.get('datetime'):
+        for msg_block in raw_messages[1:]:
+            # 1. Фільтр часу (тільки новини до 3.0 годин)
+            time_match = re.search(r'<time[^>]+datetime="([^"]+)"', msg_block)
+            if time_match:
                 try:
-                    dt = datetime.datetime.fromisoformat(time_tag['datetime'].replace('Z', '+00:00'))
+                    dt = datetime.datetime.fromisoformat(time_match.group(1).replace('Z', '+00:00'))
                     if (now - dt).total_seconds() > 3.0 * 3600:
                         continue
                 except Exception:
@@ -176,37 +169,38 @@ def scrape_donor(channel_username):
             else:
                 continue
 
-            text_div = msg_div.find('div', class_='tgme_widget_message_text')
-            if not text_div:
+            # 2. Витягуємо текст
+            text_match = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', msg_block, re.DOTALL)
+            if not text_match:
                 continue
 
-            raw_text = clean_raw_text(text_div.get_text(separator="\n"))
+            raw_text = text_match.group(1)
+            raw_text = re.sub(r'<br\s*/?>', '\n', raw_text)
+            raw_text = re.sub(r'<[^>]+>', '', raw_text)
+            raw_text = html.unescape(raw_text)
+            raw_text = clean_raw_text(raw_text)
+
             if is_junk_news(raw_text):
                 continue
 
-            # ПЕРЕВІРКА МЕДІА: ЖОДНИХ СТОП-КАДРІВ ЗАМІСТЬ ВІДЕО!
-            video_tag = msg_div.find('video')
-            video_thumb = msg_div.find('i', class_='tgme_widget_message_video_thumb')
-            photo_tag = msg_div.find('a', class_='tgme_widget_message_photo_wrap')
+            # 3. Перевірка медіа: ЖОДНИХ СТОП-КАДРІВ ЗАМІСТЬ ВІДЕО!
+            has_video = ('<video' in msg_block) or ('tgme_widget_message_video_thumb' in msg_block)
+            video_src = re.search(r'<video[^>]+src="([^"]+)"', msg_block)
+            photo_style = re.search(r"background-image:url\('([^']+)'\)", msg_block)
 
             media_type = None
             media_url = None
 
-            # Якщо це реальне відео з прямим посиланням
-            if video_tag and video_tag.get('src') and video_tag.get('src').startswith('http'):
+            if video_src and video_src.group(1).startswith('http'):
                 media_type = 'video'
-                media_url = video_tag['src']
-            elif video_tag or video_thumb:
-                # Це відео, але веб-телеграм сховав пряме посилання!
-                # КАТЕГОРИЧНО НЕ СТАВИМО ФОТО-ОБКЛАДИНКУ — піде чистий текст!
+                media_url = video_src.group(1)
+            elif has_video:
+                # Це відео без прямого лінка — НЕ надсилаємо стоп-кадр як фото!
                 media_type = None
                 media_url = None
-            elif photo_tag and photo_tag.get('style'):
-                # Це справжнє фото
-                m = re.search(r"background-image:url\('([^']+)'\)", photo_tag['style'])
-                if m:
-                    media_type = 'photo'
-                    media_url = m.group(1)
+            elif photo_style:
+                media_type = 'photo'
+                media_url = photo_style.group(1)
 
             results.append({
                 "channel": channel_username,
@@ -219,7 +213,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР З ЖИВИМИ ПРИКЛАДАМИ -----------------
+# ----------------- РЕДАКТОР GROQ -----------------
 def generate_channel_post(raw_text, recent_titles):
     prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
 Пиши ВИКЛЮЧНО так, як пишуть топові українські канали: коротко, сильно, без води, без машинних рамок.
@@ -230,6 +224,7 @@ def generate_channel_post(raw_text, recent_titles):
 ПРАВИЛО ДУБЛІКАТІВ ТА ШЛАКУ:
 - Якщо новина описує ТОЙ САМИЙ факт, що вже був — пиши тільки: SKIP
 - Якщо це жовта преса, плітки, шоубіз чи Гордон — пиши тільки: SKIP
+- Якщо це побутові протести в Європі без зв'язку з Україною — пиши тільки: SKIP
 - Якщо це інша важлива теза виступу або нова подія — пиши пост!
 
 СУВОРО ЗАБОРОНЕНО:
@@ -272,7 +267,6 @@ def generate_channel_post(raw_text, recent_titles):
         result = response.choices[0].message.content.strip()
         if "SKIP" in result.upper()[:15]:
             return None
-        # Зачищаємо будь-які спроби вставити html blockquote
         result = re.sub(r'</?blockquote[^>]*>', '', result)
         return result.strip()
     except Exception as e:
@@ -319,7 +313,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Бот запущено з оновленим фільтром...")
+    logger.info("Бот запущено успішно...")
 
     while True:
         try:
