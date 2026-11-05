@@ -155,7 +155,9 @@ COMMON_STOP_WORDS = {
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
     "яка", "яке", "повідомляє", "новини", "року", "потім", "перед", "під", "над", "щоб",
     "стало", "відомо", "заявив", "словами", "джерело", "офіційно", "увага", "терміново",
-    "внаслідок", "відповідно", "разом", "перший", "другий", "можуть", "бути", "своїх"
+    "внаслідок", "відповідно", "разом", "перший", "другий", "можуть", "бути", "своїх",
+    "президент", "президента", "президентом", "сша", "україна", "україни", "український",
+    "зазначив", "підкреслив", "країни", "держави", "партії", "республіканці"
 }
 
 AD_PATTERNS = [
@@ -885,7 +887,7 @@ def fetch_posts(channel: str) -> List[Dict]:
         with urllib.request.urlopen(req, timeout=15) as resp:
             html_raw = resp.read().decode("utf-8", errors="ignore")
         blocks = html_raw.split('<div class="tgme_widget_message_wrap')
-        for b in blocks[1:][-4:]:
+        for b in blocks[1:][-10:]:
             p_id = re.search(r'data-post="([^"]+)"', b)
             if not p_id: continue
             post_id = p_id.group(1)
@@ -1045,17 +1047,19 @@ def run():
             except Exception as ve:
                 print(f"[ВІДЕО СОЦМЕРЕЖІ]: Помилка створення чи надсилання відео: {ve}")
 
-    try:
+   try:
+        raw_topics = load_json(TOPICS_FILE)[-15:]
+        compact_topics = [
+            {"headline": t.get("headline", "")[:40], "capitals": t.get("capitals", [])[:3], "stems": t.get("stems", [])[:4]}
+            for t in raw_topics
+        ]
         active_state = {
-            "topics": load_json(TOPICS_FILE)[-35:],
-            "media": load_json(MEDIA_HASH_FILE)[-35:],
-            "ids": load_json(PROCESSED_IDS_FILE)[-100:],
-            "last_sync": time.time()
+            "topics": compact_topics,
+            "ids": load_json(PROCESSED_IDS_FILE)[-40:]
         }
         save_cloud_state_to_telegram(active_state)
     except Exception as se:
         print(f"[ХМАРА ЗБЕРЕЖЕННЯ]: {se}")
-
     print(f"\n[ЗАВЕРШЕННЯ]: Опубліковано свіжих якісних новин: {published_count}. Чекаємо наступного запуску.")
 
 if __name__ == "__main__":
