@@ -136,7 +136,7 @@ def is_junk_news(text):
             return True
     return False
 
-# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ (ТІЛЬКИ ЗАГОЛОВКИ ДЛЯ ЕКОНОМІЇ ТОКЕНІВ) -----------------
+# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
 def sync_with_my_channel():
     try:
         channel_name = TELEGRAM_CHANNEL_ID.lstrip('@') if TELEGRAM_CHANNEL_ID.startswith('@') else "kropivnit"
@@ -229,7 +229,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН (ЛЕГКИЙ ПРОМПТ БЕЗ ПЕРЕВАНТАЖЕННЯ ТОКЕНАМИ) -----------------
+# ----------------- РЕДАКТОР НОВИН -----------------
 def generate_channel_post(raw_text, recent_titles):
     titles_summary = "\n".join([f"• {t}" for t in recent_titles[-15:]])
 
@@ -261,7 +261,6 @@ def generate_channel_post(raw_text, recent_titles):
 
     model_name = get_working_groq_model()
 
-    # Захист: робимо до 2 спроб із паузою, якщо Groq просить зачекати (помилка 429)
     for attempt in range(2):
         try:
             payload = {
@@ -287,45 +286,43 @@ def generate_channel_post(raw_text, recent_titles):
                 
                 return result.strip()
             elif resp.status_code == 429:
-                logger.warning("Groq ліміт (429), чекаємо 8 секунд...")
                 time.sleep(8)
             else:
-                logger.error(f"Помилка Groq API ({resp.status_code}): {resp.text}")
                 break
-        except Exception as e:
-            logger.error(f"Збій запиту: {e}")
+        except Exception:
             break
 
     return None
 
-# ----------------- ВІДПРАВКА В TELEGRAM -----------------
+# ----------------- ВІДПРАВКА В TELEGRAM З ПРЯМИМ ЗАВАНТАЖЕННЯМ ФАЙЛУ -----------------
 def post_to_telegram(text, media_type=None, media_url=None):
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    caption = text[:1020] # Захист від ліміту довжини підпису Телеграму
+    
     try:
-        if media_type == 'video' and media_url:
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL_ID,
-                "video": media_url,
-                "caption": text,
-                "parse_mode": "HTML"
-            }
-            res = requests.post(f"{base_url}/sendVideo", json=payload, timeout=25)
-            if res.status_code == 200:
-                return True
-            logger.warning(f"sendVideo не пройшов ({res.status_code}), пробуємо текстом...")
-
+        # ПРЯМЕ ЗАВАНТАЖЕННЯ ФОТО ЯК ФАЙЛУ (ГАРАНТОВАНА ВІДПРАВКА):
         if media_type == 'photo' and media_url:
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL_ID,
-                "photo": media_url,
-                "caption": text,
-                "parse_mode": "HTML"
-            }
-            res = requests.post(f"{base_url}/sendPhoto", json=payload, timeout=20)
-            if res.status_code == 200:
-                return True
-            logger.warning(f"sendPhoto не пройшов ({res.status_code}), пробуємо текстом...")
+            img_res = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+            if img_res.status_code == 200:
+                files = {"photo": ("image.jpg", img_res.content, "image/jpeg")}
+                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
+                if res.status_code == 200:
+                    return True
+                logger.warning(f"sendPhoto файл помилка ({res.status_code}): {res.text}")
 
+        # ПРЯМЕ ЗАВАНТАЖЕННЯ ВІДЕО:
+        if media_type == 'video' and media_url:
+            vid_res = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
+                files = {"video": ("video.mp4", vid_res.content, "video/mp4")}
+                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
+                if res.status_code == 200:
+                    return True
+                logger.warning(f"sendVideo файл помилка ({res.status_code}): {res.text}")
+
+        # Текстовий резерв:
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
@@ -371,7 +368,6 @@ def main_loop():
                 formatted_post = generate_channel_post(item['text'], recent_titles)
                 if not formatted_post:
                     state["posted_hashes"].append(h)
-                    # Пауза між перевірками, щоб не довбати ліміт API
                     time.sleep(2)
                     continue
 
