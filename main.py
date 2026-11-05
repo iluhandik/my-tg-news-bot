@@ -52,34 +52,6 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ----------------- ВИБІР НАЙКРАЩОЇ МОДЕЛІ LLAMA -----------------
-ACTIVE_MODEL = None
-
-def get_working_groq_model():
-    global ACTIVE_MODEL
-    if ACTIVE_MODEL:
-        return ACTIVE_MODEL
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    try:
-        resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            live_ids = [m["id"] for m in resp.json().get("data", [])]
-            for pref in ["llama-3.3-70b", "llama-3.1-70b", "llama-3.1-8b", "llama-3", "llama"]:
-                for m in live_ids:
-                    if pref in m.lower() and "guard" not in m.lower() and "whisper" not in m.lower():
-                        ACTIVE_MODEL = m
-                        logger.info(f"Вибрано модель LLAMA: {ACTIVE_MODEL}")
-                        return ACTIVE_MODEL
-    except Exception as e:
-        logger.error(f"Помилка вибору моделі: {e}")
-
-    ACTIVE_MODEL = os.getenv("AI_MODEL") or "llama-3.1-8b-instant"
-    return ACTIVE_MODEL
-
 # ----------------- ФІЛЬТР ШЛАКУ -----------------
 JUNK_PHRASES = [
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
@@ -158,7 +130,7 @@ def sync_with_my_channel():
 
 sync_with_my_channel()
 
-# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН -----------------
+# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН (ДО 2 ГОДИН) -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -184,6 +156,7 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
+                # Тільки новини за останні 2 години
                 if age_seconds > 2.0 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -226,7 +199,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН (ЧИСТІ ФАКТИ БЕЗ ВЛАСНОЇ ДУМКИ) -----------------
+# ----------------- РЕДАКТОР НОВИН -----------------
 def generate_channel_post(raw_text, recent_stories):
     stories_context = "\n---\n".join([f"• {s}" for s in recent_stories[-25:]])
 
@@ -264,35 +237,39 @@ def generate_channel_post(raw_text, recent_stories):
         "Content-Type": "application/json"
     }
 
-    model_name = get_working_groq_model()
+    # Надійні моделі в порядку пріоритету
+    MODELS_TO_TRY = ["llama-3.1-8b-instant", "llama-3.2-3b-preview", "llama-3.2-1b-preview"]
 
-    try:
-        payload = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — це чиста інформація та точні факти без повчань, сарказму чи особистих оцінок."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.15,
-            "max_tokens": 450
-        }
-        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
-        if resp.status_code == 200:
-            data = resp.json()
-            result = data['choices'][0]['message']['content'].strip()
-            if "SKIP" in result.upper()[:15]:
-                return None
-            result = re.sub(r'</?blockquote[^>]*>', '', result)
-            
-            result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
-            result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
-            result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
-            
-            return result.strip()
-        else:
-            logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
-    except Exception as e:
-        logger.error(f"Збій запиту до {model_name}: {e}")
+    for model_name in MODELS_TO_TRY:
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — це чиста інформація та точні факти без повчань, сарказму чи особистих оцінок."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.15,
+                "max_tokens": 450
+            }
+            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data['choices'][0]['message']['content'].strip()
+                if "SKIP" in result.upper()[:15]:
+                    return None
+                result = re.sub(r'</?blockquote[^>]*>', '', result)
+                
+                result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
+                result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
+                result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
+                
+                return result.strip()
+            elif resp.status_code == 404:
+                continue
+            else:
+                logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
+        except Exception as e:
+            logger.error(f"Збій запиту до {model_name}: {e}")
 
     return None
 
