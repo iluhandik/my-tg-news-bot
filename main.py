@@ -83,7 +83,7 @@ def get_working_groq_model():
     ACTIVE_MODEL = os.getenv("AI_MODEL") or "llama-3.1-8b-instant"
     return ACTIVE_MODEL
 
-# ----------------- ФІЛЬТР ШЛАКУ -----------------
+# ----------------- СТОП-СЛОВА ТА ФІЛЬТРИ -----------------
 JUNK_PHRASES = [
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
     "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
@@ -103,7 +103,7 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
+    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними"
 }
 
 STATE_FILE = "bot_state.json"
@@ -164,10 +164,38 @@ def is_text_duplicate(candidate_text, state):
         intersection = len(cand_stems & old_stems)
         union = len(cand_stems | old_stems)
         similarity = intersection / union if union > 0 else 0
-        if similarity >= 0.35:
+        if similarity >= 0.32:
             logger.info(f"Дублікат ({similarity:.2f}) з: {topic.get('title', '')}")
             return True
     return False
+
+# ----------------- СИНХРОНІЗАЦІЯ З ВАШИМ КАНАЛОМ ДЛЯ ЗАХИСТУ ВІД ПОВТОРІВ -----------------
+def sync_with_my_channel():
+    try:
+        # Читаємо публічну сторінку вашого каналу
+        url = "https://t.me/s/kropivnit"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if resp.status_code == 200:
+            raw_html = resp.text
+            matches = re.findall(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', raw_html, re.DOTALL)
+            count = 0
+            for raw in matches[-20:]:
+                clean = re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', '\n', raw))
+                clean = html.unescape(clean_raw_text(clean))
+                stems = list(get_text_stem_words(clean))
+                first_line = clean.split('\n')[0][:80]
+                h = str(hash(clean[:120]))
+                if stems and first_line not in [t.get("title") for t in state.get("recent_topics", [])]:
+                    state["recent_topics"].append({"title": first_line, "stems": stems})
+                    state["posted_hashes"].append(h)
+                    count += 1
+            save_state(state)
+            logger.info(f"Синхронізовано {count} свіжих постів з @kropivnit для блокування повторів!")
+    except Exception as e:
+        logger.error(f"Помилка синхронізації з каналом: {e}")
+
+# Виконуємо синхронізацію одразу при старті
+sync_with_my_channel()
 
 # ----------------- ПАРСИНГ З МЕДІА -----------------
 def scrape_donor(channel_username):
@@ -195,6 +223,7 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
+                # Тільки свіжі новини до 2 годин
                 if age_seconds > 2.0 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -214,7 +243,7 @@ def scrape_donor(channel_username):
                 continue
 
             video_match = re.search(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
-            photo_match = re.search(r"background-image:url\(["\']?(https?://[^"')]+)["\']?\)", msg_block, re.IGNORECASE) or re.search(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            photo_match = re.search(r'background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE) or re.search(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
 
             media_type = None
             media_url = None
@@ -237,45 +266,42 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР З ЖИРНИМ ЗАГОЛОВКОМ -----------------
+# ----------------- РЕДАКТОР З ЖИВИМ ЕМОЦІЙНИМ СТИЛЕМ -----------------
 def generate_channel_post(raw_text, recent_titles):
-    prompt = f"""Ти — професійний редактор провідного всеукраїнського новинного Telegram-каналу "NEWS УКРАЇНА 365".
-Перепиши новину в солідному, авторитетному новинному стилі.
+    prompt = f"""Ти — автор і головний редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
+Пиши ЖИВОЮ, ЛЮДСЬКОЮ, ЕМОЦІЙНОЮ українською мовою. Твої пости читають сотні тисяч людей.
 
-ОСЬ ОСТАННІ ТЕМИ В КАНАЛІ:
+ОСЬ ОСТАННІ ТЕМИ В КАНАЛІ (ЯКЩО ТАКЕ ВЖЕ БУЛО — ПИШИ SKIP):
 {json.dumps(recent_titles, ensure_ascii=False)}
 
-ПРАВИЛО ДУБЛІКАТІВ ТА ШЛАКУ:
-- Якщо новина описує ТОЙ САМИЙ факт — пиши: SKIP
-- Якщо це дрібний кримінал чи шоубіз — пиши: SKIP
+КАТЕГОРИЧНО ЗАБОРОНЕНО:
+❌ НІЯКОГО сухого протокольного стилю міліції та канцеляризмів (заборонено слова "– ГВА", "зафіксовано", "громадян", "унаслідок події")!
+❌ НІЯКОГО суцільного тексту в одне речення! Обов'язково розбивай на 2-3 короткі абзаци з порожніми рядками між ними.
+❌ НІЯКИХ рамок blockquote!
 
-СТРОГА СТРУКТУРА ПОСТУ:
-1. ПЕРШИЙ РЯДОК — обов'язково жирний заголовок у тегах <b>...</b> з емодзі (⚡️, 💥, 🇺🇸, 🕯, 💧, 🛑).
-2. Порожній рядок.
-3. ОСНОВНИЙ ТЕКСТ — 1-2 повноцінних інформативних речення. Це має бути якісна новина з контекстом, а не коротка відписка другу в чат!
-4. Якщо є влучна цитата спікера — додай її в кінці: «...», — Прізвище.
+ЯК МАЄ ВИГЛЯДАТИ СПРАВЖНІЙ ПОСТ (ДИВИСЬ ЗРАЗКИ):
 
-СУВОРО ЗАБОРОНЕНО:
-❌ НІЯКИХ тегів blockquote!
-❌ НІЯКИХ однорядкових відписок без заголовка!
-❌ НІЯКИХ описів того, що видно на картинці!
+Зразок 1 (Обстріли / Трагедія — з людяністю та повітрям):
+<b>💥 Росіяни вдарили авіабомбами по Ізюму: є поранені та руйнування</b>
 
-ПРИКЛАДИ СТРУКТУРИ:
+Ворожі удари зруйнували житлові будинки, частина міста залишилася без світла. Наразі відомо про двох постраждалих людей.
 
-Приклад 1:
-<b>🇺🇸 Трамп пригрозив демократам правом вето</b>
+На місці прильотів працюють рятувальники, ліквідація наслідків триває.
 
-Дональд Трамп публічно продемонстрував кепку з написом «VETO», давши чітко зрозуміти опонентам у Конгресі, що він готовий блокувати будь-які небажані законодавчі ініціативи.
+Зразок 2 (Енергетика):
+<b>⚡️ 78 ударів по енергетиці за три дні</b>
 
-Приклад 2:
-<b>💥 Російський удар по логістичному центру на Київщині</b>
+За останні три дні Росія здійснила 78 ударів по об'єктах енергетики України. За даними ДТЕК, це значне збільшення інтенсивності атак на енергетику країни.
 
-У Київській області внаслідок ворожої атаки спалахнула масштабна пожежа на території логістичного об'єкту. На місці працюють рятувальники, зафіксовано одного постраждалого.
+Зразок 3 (Політика / Заява — жива цитата з характером):
+«Наші вибори настільки нечесні, що ви навіть не уявляєте», — Трамп.
+
+Тільки не плач, Доні.
 
 ТЕКСТ НОВИНИ:
 {raw_text}
 
-ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
+НАПИШИ ЖИВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -288,10 +314,10 @@ def generate_channel_post(raw_text, recent_titles):
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "Ти досвідчений новинний редактор. Твої пости мають чіткий жирний заголовок і виглядають як солідна новинна стрічка."},
+                {"role": "system", "content": "Ти топовий автор українського Telegram-каналу. Твій стиль живий, динамічний, патріотичний, з красивою розбивкою на абзаци."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.25,
+            "temperature": 0.3,
             "max_tokens": 450
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
@@ -323,7 +349,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
             res = requests.post(f"{base_url}/sendVideo", json=payload, timeout=25)
             if res.status_code == 200:
                 return True
-            logger.warning(f"sendVideo не пройшов ({res.status_code}), пробуємо як текст...")
+            logger.warning(f"sendVideo не пройшов ({res.status_code}), пробуємо текстом...")
 
         if media_type == 'photo' and media_url:
             payload = {
@@ -335,7 +361,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
             res = requests.post(f"{base_url}/sendPhoto", json=payload, timeout=20)
             if res.status_code == 200:
                 return True
-            logger.warning(f"sendPhoto не пройшов ({res.status_code}), пробуємо як текст...")
+            logger.warning(f"sendPhoto не пройшов ({res.status_code}), пробуємо текстом...")
 
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
@@ -373,7 +399,7 @@ def main_loop():
             max_posts_this_cycle = 3 if len(all_candidates) >= 6 and not is_night else 1
             posts_published = 0
 
-            recent_titles = [t.get("title", "") for t in state.get("recent_topics", [])[-30:]]
+            recent_titles = [t.get("title", "") for t in state.get("recent_topics", [])[-35:]]
 
             for h, item in all_candidates:
                 if posts_published >= max_posts_this_cycle:
