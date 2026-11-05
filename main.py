@@ -21,7 +21,7 @@ logger = logging.getLogger("NewsBot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GROQ_API_KEY]):
@@ -205,7 +205,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР GROQ ЧЕРЕЗ DIRECT REQUESTS -----------------
+# ----------------- РЕДАКТОР GROQ З АВТОВИБОРОМ МОДЕЛІ -----------------
 def generate_channel_post(raw_text, recent_titles):
     prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
 Пиши ВИКЛЮЧНО так, як пишуть топові українські канали: коротко, сильно, без води, без машинних рамок.
@@ -246,34 +246,47 @@ def generate_channel_post(raw_text, recent_titles):
 
 НАПИШИ ГОТОВИЙ ПОСТ (АБО СЛОВО SKIP):"""
 
-    try:
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.2,
-            "max_tokens": 450
-        }
-        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
-        if resp.status_code != 200:
-            logger.error(f"Помилка Groq API ({resp.status_code}): {resp.text}")
-            return None
-        
-        data = resp.json()
-        result = data['choices'][0]['message']['content'].strip()
-        if "SKIP" in result.upper()[:15]:
-            return None
-        result = re.sub(r'</?blockquote[^>]*>', '', result)
-        return result.strip()
-    except Exception as e:
-        logger.error(f"Помилка виклику Groq: {e}")
-        return None
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY.strip()}",
+        "Content-Type": "application/json"
+    }
+
+    models_to_try = [
+        os.getenv("AI_MODEL"),
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama3-70b-8192"
+    ]
+    models_to_try = [m.strip() for m in models_to_try if m and m.strip()]
+
+    for model_name in models_to_try:
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 450
+            }
+            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data['choices'][0]['message']['content'].strip()
+                if "SKIP" in result.upper()[:15]:
+                    return None
+                result = re.sub(r'</?blockquote[^>]*>', '', result)
+                return result.strip()
+            elif resp.status_code == 404:
+                logger.warning(f"Модель {model_name} не знайдена, пробуємо резервну...")
+                continue
+            else:
+                logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
+        except Exception as e:
+            logger.error(f"Збій запиту до {model_name}: {e}")
+
+    return None
 
 # ----------------- ВІДПРАВКА В TELEGRAM -----------------
 def post_to_telegram(text, media_type=None, media_url=None):
