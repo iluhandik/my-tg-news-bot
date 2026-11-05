@@ -10,7 +10,6 @@ import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import requests
-from groq import Groq
 
 # ----------------- НАЛАШТУВАННЯ ТА ЛОГУВАННЯ -----------------
 logging.basicConfig(
@@ -27,8 +26,6 @@ PORT = int(os.getenv("PORT", 8080))
 
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GROQ_API_KEY]):
     logger.error("Критичні змінні оточення відсутні!")
-
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ----------------- СПИСОК ДОНОРІВ -----------------
 DONOR_CHANNELS = [
@@ -141,7 +138,7 @@ def is_text_duplicate(candidate_text, state):
             return True
     return False
 
-# ----------------- ПАРСИНГ ТЕЛЕГРАМУ БЕЗ BS4 -----------------
+# ----------------- ПАРСИНГ ТЕЛЕГРАМУ -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -151,13 +148,11 @@ def scrape_donor(channel_username):
             return []
         
         raw_html = resp.text
-        # Розбиваємо сторінку на окремі блоки повідомлень
         raw_messages = raw_html.split('class="tgme_widget_message_wrap')
         results = []
         now = datetime.datetime.now(datetime.timezone.utc)
 
         for msg_block in raw_messages[1:]:
-            # 1. Фільтр часу (тільки новини до 3.0 годин)
             time_match = re.search(r'<time[^>]+datetime="([^"]+)"', msg_block)
             if time_match:
                 try:
@@ -169,7 +164,6 @@ def scrape_donor(channel_username):
             else:
                 continue
 
-            # 2. Витягуємо текст
             text_match = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', msg_block, re.DOTALL)
             if not text_match:
                 continue
@@ -183,7 +177,6 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            # 3. Перевірка медіа: ЖОДНИХ СТОП-КАДРІВ ЗАМІСТЬ ВІДЕО!
             has_video = ('<video' in msg_block) or ('tgme_widget_message_video_thumb' in msg_block)
             video_src = re.search(r'<video[^>]+src="([^"]+)"', msg_block)
             photo_style = re.search(r"background-image:url\('([^']+)'\)", msg_block)
@@ -195,7 +188,6 @@ def scrape_donor(channel_username):
                 media_type = 'video'
                 media_url = video_src.group(1)
             elif has_video:
-                # Це відео без прямого лінка — НЕ надсилаємо стоп-кадр як фото!
                 media_type = None
                 media_url = None
             elif photo_style:
@@ -213,7 +205,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР GROQ -----------------
+# ----------------- РЕДАКТОР GROQ ЧЕРЕЗ DIRECT REQUESTS -----------------
 def generate_channel_post(raw_text, recent_titles):
     prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
 Пиши ВИКЛЮЧНО так, як пишуть топові українські канали: коротко, сильно, без води, без машинних рамок.
@@ -255,22 +247,32 @@ def generate_channel_post(raw_text, recent_titles):
 НАПИШИ ГОТОВИЙ ПОСТ (АБО СЛОВО SKIP):"""
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
                 {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2,
-            max_tokens=450
-        )
-        result = response.choices[0].message.content.strip()
+            "temperature": 0.2,
+            "max_tokens": 450
+        }
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
+        if resp.status_code != 200:
+            logger.error(f"Помилка Groq API ({resp.status_code}): {resp.text}")
+            return None
+        
+        data = resp.json()
+        result = data['choices'][0]['message']['content'].strip()
         if "SKIP" in result.upper()[:15]:
             return None
         result = re.sub(r'</?blockquote[^>]*>', '', result)
         return result.strip()
     except Exception as e:
-        logger.error(f"Помилка Groq: {e}")
+        logger.error(f"Помилка виклику Groq: {e}")
         return None
 
 # ----------------- ВІДПРАВКА В TELEGRAM -----------------
