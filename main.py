@@ -68,11 +68,8 @@ def get_working_groq_model():
         resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
         if resp.status_code == 200:
             live_ids = [m["id"] for m in resp.json().get("data", [])]
-            # Фільтруємо ТІЛЬКИ діючі текстові моделі (без аудіо Whisper та безпекових Guard)
             chat_models = [m for m in live_ids if "whisper" not in m.lower() and "guard" not in m.lower()]
-            logger.info(f"Активні текстові моделі на Groq: {chat_models}")
             if chat_models:
-                # Беремо перевірену активну модель (qwen або gpt-oss або llama)
                 for m in chat_models:
                     if "qwen" in m.lower():
                         ACTIVE_MODEL = m
@@ -107,12 +104,12 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_stories": [], "last_post_time": 0}
+    return {"posted_hashes": [], "recent_titles": [], "last_post_time": 0}
 
 def save_state(state):
     try:
         state["posted_hashes"] = state["posted_hashes"][-300:]
-        state["recent_stories"] = state["recent_stories"][-40:]
+        state["recent_titles"] = state["recent_titles"][-30:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -139,7 +136,7 @@ def is_junk_news(text):
             return True
     return False
 
-# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
+# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ (ТІЛЬКИ ЗАГОЛОВКИ ДЛЯ ЕКОНОМІЇ ТОКЕНІВ) -----------------
 def sync_with_my_channel():
     try:
         channel_name = TELEGRAM_CHANNEL_ID.lstrip('@') if TELEGRAM_CHANNEL_ID.startswith('@') else "kropivnit"
@@ -149,15 +146,16 @@ def sync_with_my_channel():
             raw_html = resp.text
             matches = re.findall(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', raw_html, re.DOTALL)
             count = 0
-            for raw in matches[-20:]:
+            for raw in matches[-15:]:
                 clean = re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', '\n', raw))
                 clean = html.unescape(clean_raw_text(clean)).strip()
-                if len(clean) > 20 and clean not in state.get("recent_stories", []):
-                    state.setdefault("recent_stories", []).append(clean[:200])
+                first_line = clean.split('\n')[0][:70]
+                if len(first_line) > 10 and first_line not in state.get("recent_titles", []):
+                    state.setdefault("recent_titles", []).append(first_line)
                     state["posted_hashes"].append(str(hash(clean[:120])))
                     count += 1
             save_state(state)
-            logger.info(f"Синхронізовано {count} історій з каналу для захисту від повторів!")
+            logger.info(f"Синхронізовано {count} тем з каналу!")
     except Exception as e:
         logger.error(f"Помилка синхронізації: {e}")
 
@@ -231,35 +229,27 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН (ЧИСТІ ФАКТИ БЕЗ ВЛАСНОЇ ДУМКИ) -----------------
-def generate_channel_post(raw_text, recent_stories):
-    stories_context = "\n---\n".join([f"• {s}" for s in recent_stories[-25:]])
+# ----------------- РЕДАКТОР НОВИН (ЛЕГКИЙ ПРОМПТ БЕЗ ПЕРЕВАНТАЖЕННЯ ТОКЕНАМИ) -----------------
+def generate_channel_post(raw_text, recent_titles):
+    titles_summary = "\n".join([f"• {t}" for t in recent_titles[-15:]])
 
     prompt = f"""Ти — професійний новинний репортер Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — подавати ЧИСТІ ФАКТИ ТА НОВИНИ В СОЛІДНОМУ ЖУРНАЛІСТСЬКОМУ СТИЛІ БЕЗ ВЛАСНОЇ ДУМКИ.
+Твоє завдання — подавати ЧИСТІ ФАКТИ В СОЛІДНОМУ СТИЛІ БЕЗ ВЛАСНОЇ ДУМКИ.
 
-ОСЬ ПУБЛІКАЦІЇ В НАШОМУ КАНАЛІ (ЯКЩО НОВИНА ОПИСУЄ ТУ САМУ ПОДІЮ — ПИШИ SKIP):
-{stories_context}
+ОСТАННІ ТЕМИ В НАШОМУ КАНАЛІ (ЯКЩО НОВИНА ОПИСУЄ ЦЮ САМУ ПОДІЮ — ПИШИ SKIP):
+{titles_summary}
 
 КАТЕГОРИЧНІ ПРАВИЛА:
-❌ СУВОРО ЗАБОРОНЕНО писати особисту суб'єктивну думку, моралізаторство та авторські роздуми («Уявіть собі цю логіку», «Це не просто подвійні стандарти»). Автор каналу коментує сам!
-❌ Твоє завдання — ЧИСТІ ФАКТИ: хто заявив, що конкретно сказав, суть події.
+❌ СУВОРО ЗАБОРОНЕНО писати особисту суб'єктивну думку та моралізаторство («Уявіть собі», «Це подвійні стандарти»). Тільки факти і пряма мова!
 ❌ ЖОДНИХ росіянізмів: "позор" (тільки "ганьба"), "толпа" (тільки "натовп"), "– ГВА".
 ❌ НІЯКИХ рамок blockquote!
 
 СТРУКТУРА:
 1. Жирний заголовок у тегах <b>...</b> з емодзі.
 2. Порожній рядок.
-3. 1-2 інформативні абзаци фактів: контекст та точна пряма мова («Цитата...», — Прізвище).
+3. 1-2 інформативні абзаци фактів та контексту з прямою мовою («...», — Прізвище).
 
-ЗРАЗОК ОФОРМЛЕННЯ:
-<b>🇺🇸 Заява Трампа щодо війни в Україні та цивільних втрат</b>
-
-Дональд Трамп прокоментував удари росії по мирних містах України, заявивши, що жертви є з обох сторін конфлікту.
-
-«Я завжди про це говорю. Але я також говорю про іншу сторону, бо там теж гинуть мирні жителі. Це кровопролиття», — заявив Трамп.
-
-ТЕКСТ НОВОЇ НОВИНИ:
+ТЕКСТ НОВИНИ:
 {raw_text}
 
 ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
@@ -271,34 +261,40 @@ def generate_channel_post(raw_text, recent_stories):
 
     model_name = get_working_groq_model()
 
-    try:
-        payload = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — це чиста інформація та точні факти українською мовою без повчань чи сарказму."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.15,
-            "max_tokens": 450
-        }
-        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            result = data['choices'][0]['message']['content'].strip()
-            if "SKIP" in result.upper()[:15]:
-                return None
-            result = re.sub(r'</?blockquote[^>]*>', '', result)
-            
-            # Автокоректор
-            result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
-            result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
-            result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
-            
-            return result.strip()
-        else:
-            logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
-    except Exception as e:
-        logger.error(f"Збій запиту до {model_name}: {e}")
+    # Захист: робимо до 2 спроб із паузою, якщо Groq просить зачекати (помилка 429)
+    for attempt in range(2):
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — чисті факти без особистих суджень українською мовою."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.15,
+                "max_tokens": 400
+            }
+            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data['choices'][0]['message']['content'].strip()
+                if "SKIP" in result.upper()[:15]:
+                    return None
+                result = re.sub(r'</?blockquote[^>]*>', '', result)
+                
+                result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
+                result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
+                result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
+                
+                return result.strip()
+            elif resp.status_code == 429:
+                logger.warning("Groq ліміт (429), чекаємо 8 секунд...")
+                time.sleep(8)
+            else:
+                logger.error(f"Помилка Groq API ({resp.status_code}): {resp.text}")
+                break
+        except Exception as e:
+            logger.error(f"Збій запиту: {e}")
+            break
 
     return None
 
@@ -366,15 +362,17 @@ def main_loop():
             max_posts_this_cycle = 3 if len(all_candidates) >= 6 and not is_night else 1
             posts_published = 0
 
-            recent_stories = state.get("recent_stories", [])
+            recent_titles = state.get("recent_titles", [])
 
             for h, item in all_candidates:
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                formatted_post = generate_channel_post(item['text'], recent_stories)
+                formatted_post = generate_channel_post(item['text'], recent_titles)
                 if not formatted_post:
                     state["posted_hashes"].append(h)
+                    # Пауза між перевірками, щоб не довбати ліміт API
+                    time.sleep(2)
                     continue
 
                 if re.search(r'[ыэъёЫЭЪЁ]', formatted_post):
@@ -388,9 +386,9 @@ def main_loop():
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
-                    summary_clean = re.sub(r'<[^>]+>', '', formatted_post)
-                    state.setdefault("recent_stories", []).append(summary_clean[:220])
-                    recent_stories.append(summary_clean[:220])
+                    first_line = re.sub(r'<[^>]+>', '', formatted_post).split('\n')[0][:70]
+                    state.setdefault("recent_titles", []).append(first_line)
+                    recent_titles.append(first_line)
 
                     save_state(state)
 
