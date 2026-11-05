@@ -52,6 +52,40 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
+# ----------------- АВТОМАТИЧНИЙ ВИБІР АКТУАЛЬНОЇ МОДЕЛІ GROQ -----------------
+ACTIVE_MODEL = None
+
+def get_working_groq_model():
+    global ACTIVE_MODEL
+    if ACTIVE_MODEL:
+        return ACTIVE_MODEL
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY.strip()}",
+        "Content-Type": "application/json"
+    }
+    try:
+        resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=12)
+        if resp.status_code == 200:
+            all_models = [m["id"] for m in resp.json().get("data", [])]
+            logger.info(f"Список активних моделей Groq: {all_models}")
+            
+            # Шукаємо найкращу доступну модель Llama
+            for pref in ["llama-3.3", "llama-3.1", "llama-3", "llama"]:
+                for m in all_models:
+                    if pref in m.lower() and "guard" not in m.lower():
+                        ACTIVE_MODEL = m
+                        logger.info(f"Автоматично обрано активну модель: {ACTIVE_MODEL}")
+                        return ACTIVE_MODEL
+            if all_models:
+                ACTIVE_MODEL = all_models[0]
+                return ACTIVE_MODEL
+    except Exception as e:
+        logger.error(f"Помилка отримання списку моделей: {e}")
+
+    ACTIVE_MODEL = os.getenv("AI_MODEL") or "llama-3.1-8b-instant"
+    return ACTIVE_MODEL
+
 # ----------------- ФІЛЬТР ШЛАКУ -----------------
 JUNK_PHRASES = [
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
@@ -205,7 +239,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР GROQ З АВТОВИБОРОМ МОДЕЛІ -----------------
+# ----------------- РЕДАКТОР GROQ -----------------
 def generate_channel_post(raw_text, recent_titles):
     prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
 Пиши ВИКЛЮЧНО так, як пишуть топові українські канали: коротко, сильно, без води, без машинних рамок.
@@ -251,40 +285,30 @@ def generate_channel_post(raw_text, recent_titles):
         "Content-Type": "application/json"
     }
 
-    models_to_try = [
-        os.getenv("AI_MODEL"),
-        "llama-3.1-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama3-70b-8192"
-    ]
-    models_to_try = [m.strip() for m in models_to_try if m and m.strip()]
+    model_name = get_working_groq_model()
 
-    for model_name in models_to_try:
-        try:
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.2,
-                "max_tokens": 450
-            }
-            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
-            if resp.status_code == 200:
-                data = resp.json()
-                result = data['choices'][0]['message']['content'].strip()
-                if "SKIP" in result.upper()[:15]:
-                    return None
-                result = re.sub(r'</?blockquote[^>]*>', '', result)
-                return result.strip()
-            elif resp.status_code == 404:
-                logger.warning(f"Модель {model_name} не знайдена, пробуємо резервну...")
-                continue
-            else:
-                logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
-        except Exception as e:
-            logger.error(f"Збій запиту до {model_name}: {e}")
+    try:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 450
+        }
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
+        if resp.status_code == 200:
+            data = resp.json()
+            result = data['choices'][0]['message']['content'].strip()
+            if "SKIP" in result.upper()[:15]:
+                return None
+            result = re.sub(r'</?blockquote[^>]*>', '', result)
+            return result.strip()
+        else:
+            logger.error(f"Помилка Groq API ({resp.status_code}) на моделі {model_name}: {resp.text}")
+    except Exception as e:
+        logger.error(f"Збій запиту до {model_name}: {e}")
 
     return None
 
