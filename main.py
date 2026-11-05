@@ -6,7 +6,6 @@ import html
 import json
 import hashlib
 import subprocess
-import textwrap
 import urllib
 import urllib.request
 import urllib.parse
@@ -20,16 +19,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 1. Миттєве виведення логів на Render
+# Миттєвий вивід логів у консоль Render
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
-# 2. Фоновий веб-сервер для статусу Live на Render
+# Фоновий веб-сервер для статусу Live
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"NEWS BOT IS RUNNING 24/7")
+        self.wfile.write(b"OK")
     def log_message(self, format, *args):
         return
 
@@ -47,13 +46,10 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip() or (TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit")
-CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}").strip()
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile").strip()
 
-# 14 оперативних джерел новин
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
@@ -76,9 +72,9 @@ CHANNELS_WITH_HEAVY_WATERMARKS = {
     "exilenova_plus"
 }
 
-MAX_POSTS_PER_RUN = 8
-DELAY_BETWEEN_POSTS = 15
-MAX_POST_AGE_HOURS = 6.0
+MAX_POSTS_PER_RUN = 5
+DELAY_BETWEEN_POSTS = 20
+MAX_POST_AGE_HOURS = 4.0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_DIR = os.path.join(BASE_DIR, "media")
@@ -116,7 +112,7 @@ def fix_ukrainian_calques(text: str) -> str:
         text = re.sub(pattern, replacement, text)
     return text
 
-# ==================== СПРАВЖНІЙ ФІЛЬТР СПАМУ (БЕЗ БЛОКУВАННЯ НОВИН) ====================
+# ==================== ФІЛЬТР СПАМУ ====================
 AD_PATTERNS = [
     r"(?i)\b(erid|реклама|спонсор|партнерський)\b",
     r"(?i)(кол-центр|колцентр|офіс|шахрайськ.*офіс|100\s*000\s*грн|винагород|зароби.*на.*викритті)",
@@ -137,11 +133,9 @@ def is_unwanted_content(channel: str, text: str) -> bool:
         if re.search(pattern, clean):
             return True
 
-    # Відсікаємо тільки побутовий сарказм із Криму та явні жарти
     if any(w in clean for w in ["родная гавань", "девочки, смотрите что прислали"]):
         return True
 
-    # Пусті сирени без фактів прильотів чи руйнувань
     if re.search(r"(?i)\b(жовта тривога|навчальна тривога|тестування систем сповіщення|перевірка сирен)\b", clean):
         if not any(m in clean for m in ["вибух", "збит", "влучан", "приліт", "пожеж", "руйнуван", "поранен"]):
             return True
@@ -177,7 +171,7 @@ def apply_watermark_to_image(img_path: str, output_path: str) -> str:
 
         base_img.save(output_path, "JPEG", quality=92)
         return output_path
-    except Exception as e:
+    except Exception:
         return img_path
 
 def apply_watermark_to_video(video_path: str, output_path: str) -> str:
@@ -207,10 +201,10 @@ def apply_watermark_to_video(video_path: str, output_path: str) -> str:
         if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             return output_path
         return video_path
-    except Exception as e:
+    except Exception:
         return video_path
 
-# ==================== ЗБЕРЕЖЕННЯ ТА М'ЯКИЙ АНТИДУБЛЬ ====================
+# ==================== ЗБЕРЕЖЕННЯ ТА ТОЧНИЙ АНТИДУБЛЬ ====================
 def load_json(path: str) -> list:
     if os.path.exists(path):
         try:
@@ -231,8 +225,7 @@ STOP_WORDS = {
     "сьогодні", "зараз", "вчора", "цього", "після", "також", "було", "проти", "може",
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
     "повідомляє", "новини", "року", "потім", "перед", "під", "над", "щоб", "стало",
-    "відомо", "заявив", "словами", "джерело", "офіційно", "увага", "терміново",
-    "президент", "президента", "сша", "україна", "україни", "зазначив", "країни"
+    "відомо", "заявив", "словами", "джерело", "офіційно", "увага", "терміново"
 }
 
 def extract_stems(text: str) -> Set[str]:
@@ -250,7 +243,7 @@ def is_topic_already_covered(text: str) -> bool:
         return False
 
     now = time.time()
-    min_time = now - (24 * 3600)
+    min_time = now - (18 * 3600)
 
     for t in topics[-40:]:
         if t.get("timestamp", 0) < min_time:
@@ -259,13 +252,13 @@ def is_topic_already_covered(text: str) -> bool:
         if not prev_stems:
             continue
 
-        # Блокуємо ТІЛЬКИ якщо збіг слів більше 50% (реальний дубль новини!)
+        # Збіг ключових слів (якщо однакових слів більше 35% — це одна й та сама новина)
         intersection = cur_stems.intersection(prev_stems)
         union = cur_stems.union(prev_stems)
         similarity = len(intersection) / len(union)
 
-        if similarity >= 0.50:
-            print(f"[АНТИДУБЛЬ]: Збіг {similarity:.2f} з попереднім постом. Відхилено!")
+        if similarity >= 0.35:
+            print(f"[АНТИДУБЛЬ]: Збіг {similarity:.2f} з темою '{t.get('headline', '')[:30]}...'. Відхилено!")
             return True
 
     return False
@@ -313,17 +306,15 @@ def register_post_id(post_id: str):
     ids = load_json(PROCESSED_IDS_FILE)
     if post_id not in ids:
         ids.append(post_id)
-        save_json(PROCESSED_IDS_FILE, ids[-400:])
+        save_json(PROCESSED_IDS_FILE, ids[-500:])
 
 # ==================== ЧИТАННЯ ВЛАСНОГО КАНАЛУ ====================
 def sync_channel_history(channel_username: str) -> List[str]:
     recent_texts = []
-    seen = set()
-
     clean_name = channel_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
     if clean_name:
         url = f"https://t.me/s/{clean_name}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         try:
             r = requests.get(url, headers=headers, timeout=10)
             if r.status_code == 200:
@@ -332,34 +323,35 @@ def sync_channel_history(channel_username: str) -> List[str]:
                     m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*<div class="tgme_widget_message_footer', b, re.DOTALL)
                     if not m: continue
                     clean = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).strip()
-                    if len(clean) > 20 and clean not in seen:
-                        seen.add(clean)
+                    if len(clean) > 20:
                         head = clean.splitlines()[0][:60]
                         register_published_topic(head, clean)
                         recent_texts.append(clean[:120])
         except Exception:
             pass
-
     return recent_texts
 
-# ==================== ШІ-ОБРОБКА ====================
-SYSTEM_PROMPT = """Ти — редактор всеукраїнського оперативного новинного Telegram-каналу.
-Твоє завдання — перетворити важливу новину на лаконічний, чіткий пост чистою українською мовою.
+# ==================== ШІ-ОБРОБКА (100% УКРАЇНСЬКА МОВА ТА ЧИТАБЕЛЬНІСТЬ) ====================
+SYSTEM_PROMPT = """Ти — головний редактор всеукраїнського Telegram-каналу новин.
+Твоє завдання — перетворити текст новини на красивий, легкочитний пост ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ.
 
-СУВОРІ ПРАВИЛА:
-1. Пиши СУТО за фактами з тексту. КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати цифри, втрати, локації чи подробиці, яких немає у вихідному тексті!
-2. 3 ОШБр, ЗСУ, ГУР — це українські захисники. Ніколи не плутай сторони бою.
-3. ОФОРМЛЕННЯ:
-   - Заголовок <b>жирним</b> з 1 емодзі. Звичайними словами, БЕЗ капсу.
-   - 1-2 стислі інформативні абзаци.
-   - Якщо в оригіналі є точна пряма мова — виділи її тегом <blockquote>...</blockquote>.
+ГОЛОВНІ ВИМОГИ:
+1. МОВА: 100% УКРАЇНСЬКА! Категорично заборонено залишати будь-які речення чи цитати російською мовою! Будь-яку пряму мову обов'язково перекладай українською!
+2. ЧИТАБЕЛЬНІСТЬ (НЕ СУЦІЛЬНИЙ ТЕКСТ):
+   - Розбивай текст на 2-3 короткі, охайні абзаци (по 2-3 речення кожен).
+   - Між абзацами ОБОВ'ЯЗКОВО порожній рядок.
+   - Використовуй жирний шрифт для ключових слів (імена, міста, головні цифри).
+3. ТОЧНІСТЬ: Пиши виключно за фактами донора, не вигадуй неіснуючі подробиці чи цифри.
+4. ОФОРМЛЕННЯ:
+   - Заголовок <b>жирним</b> з 1 емодзі. Звичайними реченнями, БЕЗ капсу.
+   - Пряму мову оформи через <blockquote>...</blockquote> українською мовою!
    - ЖОДНИХ підписів у кінці, жодного значка "💬".
 
 Формат відповіді СТРОГО JSON:
 {
   "is_duplicate": false,
   "is_ad": false,
-  "telegram_post": "Текст посту з тегами <b>, <i> та <blockquote>",
+  "telegram_post": "Текст гарного українського посту з тегами <b>, <i> та <blockquote>",
   "news_score": 7
 }
 """
@@ -387,9 +379,9 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
 
     recent_context = ""
     if recent_channel_posts:
-        recent_context = "ОСТАННІ ПОСТИ В КАНАЛІ:\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:15]]) + "\n\n"
+        recent_context = "ОСТАННІ ОПУБЛІКОВАНІ ПОСТИ В КАНАЛІ:\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:15]]) + "\n\n"
 
-    user_prompt = f"{recent_context}НОВИНА ДЛЯ ОБРОБКИ (пиши строго за фактами):\n{cleaned}"
+    user_prompt = f"{recent_context}НОВА НОВИНА (переклади 100% українською, зроби 2-3 короткі абзаци, перевір на дубль):\n{cleaned}"
 
     models = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"]
 
@@ -426,6 +418,7 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
     caption = post_text[:1024]
     has_heavy_wm = donor.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
 
+    # Якщо новина має відео — надсилаємо ВИКЛЮЧНО відео!
     if video_url:
         temp_vid = os.path.join(MEDIA_DIR, "temp_vid.mp4")
         branded_vid = os.path.join(MEDIA_DIR, "branded_vid.mp4")
@@ -448,14 +441,21 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
                     final_video = temp_vid
 
                 with open(final_video, "rb") as f:
-                    resp = requests.post(f"{url_base}/sendVideo", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"video": ("video.mp4", f, "video/mp4")}, timeout=90)
+                    resp = requests.post(
+                        f"{url_base}/sendVideo",
+                        data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
+                        files={"video": ("video.mp4", f, "video/mp4")},
+                        timeout=90
+                    )
                     if resp.json().get("ok", False):
                         register_media(video_sample, video_url)
                         return True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ПОМИЛКА ВІДЕО]: {e}")
+        # Якщо відео не надіслалося, НЕ надсилаємо стоп-кадр як фото!
         return False
 
+    # Якщо це оригінальне фото
     if photo_url:
         try:
             r = requests.get(photo_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
@@ -473,20 +473,31 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
                     final_img = temp_img
 
                 with open(final_img, "rb") as f:
-                    resp = requests.post(f"{url_base}/sendPhoto", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files={"photo": ("photo.jpg", f, "image/jpeg")}, timeout=30)
+                    resp = requests.post(
+                        f"{url_base}/sendPhoto",
+                        data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
+                        files={"photo": ("photo.jpg", f, "image/jpeg")},
+                        timeout=30
+                    )
                     if resp.json().get("ok", False):
                         register_media(r.content, photo_url)
                         return True
         except Exception:
             pass
+        return False
 
+    # Текстовий пост
     try:
-        resp = requests.post(f"{url_base}/sendMessage", data={"chat_id": TELEGRAM_CHANNEL_ID, "text": post_text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=20)
+        resp = requests.post(
+            f"{url_base}/sendMessage",
+            data={"chat_id": TELEGRAM_CHANNEL_ID, "text": post_text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=20
+        )
         return resp.json().get("ok", False)
     except Exception:
         return False
 
-# ==================== ПАРСЕР ====================
+# ==================== ПАРСЕР З ЧІТКИМ ВІДЕО-ДЕТЕКТОРОМ ====================
 def fetch_posts(channel: str) -> List[Dict]:
     url = f"https://t.me/s/{channel}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -496,7 +507,7 @@ def fetch_posts(channel: str) -> List[Dict]:
         with urllib.request.urlopen(req, timeout=12) as resp:
             html_raw = resp.read().decode("utf-8", errors="ignore")
         blocks = html_raw.split('<div class="tgme_widget_message_wrap')
-        for b in blocks[1:][-10:]:
+        for b in blocks[1:][-8:]:
             p_id = re.search(r'data-post="([^"]+)"', b)
             if not p_id: continue
             post_id = p_id.group(1)
@@ -518,13 +529,16 @@ def fetch_posts(channel: str) -> List[Dict]:
             raw_text = html.unescape(re.sub(r"<[^>]+>", " ", t_match.group(1))).strip() if t_match else ""
 
             unescaped = html.unescape(b)
-            p_match = re.search(r'background-image:\s*url\([\'"]?(https?://[^\'")\s]+)[\'"]?\)', unescaped)
-            photo_url = p_match.group(1) if p_match else None
+
+            # Визначаємо справжнє відео
             v_match = re.search(r'<video[^>]+src=[\'"](https?://[^\'"]+)[\'"]', unescaped)
             video_url = v_match.group(1) if v_match else None
 
-            if video_url:
-                photo_url = None
+            # Якщо це відео — photo_url ставимо None!
+            photo_url = None
+            if not video_url:
+                p_match = re.search(r'background-image:\s*url\([\'"]?(https?://[^\'")\s]+)[\'"]?\)', unescaped)
+                photo_url = p_match.group(1) if p_match else None
 
             if raw_text or photo_url or video_url:
                 posts.append({
@@ -540,10 +554,6 @@ def fetch_posts(channel: str) -> List[Dict]:
 
 # ==================== ГОЛОВНИЙ ЦИКЛ ====================
 def run():
-    print(f"\n{'='*55}")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] СКАНИНГ 14 КАНАЛІВ...")
-    print(f"{'='*55}")
-
     recent_channel_posts = sync_channel_history(CHANNEL_USERNAME)
     published_count = 0
     channel_posts_used = set()
@@ -561,14 +571,11 @@ def run():
             if ch in candidates_by_channel and idx < len(candidates_by_channel[ch]):
                 interleaved_candidates.append(candidates_by_channel[ch][idx])
 
-    print(f"[ПУЛ КАНДИДАТІВ]: Зібрано {len(interleaved_candidates)} свіжих постів з {len(candidates_by_channel)} каналів.")
-
     for p in interleaved_candidates:
         if published_count >= MAX_POSTS_PER_RUN:
             break
 
         channel = p["channel"]
-
         if channel in channel_posts_used and len(candidates_by_channel) > 1:
             continue
 
@@ -581,6 +588,7 @@ def run():
             register_post_id(post_id)
             continue
 
+        # Перевірка на дубль новини
         if is_topic_already_covered(text):
             register_post_id(post_id)
             continue
@@ -599,6 +607,12 @@ def run():
             register_post_id(post_id)
             continue
 
+        # Додаткова перевірка згенерованого заголовка на дублікат
+        head = post_text.splitlines()[0][:60] if post_text.splitlines() else post_text[:60]
+        if is_topic_already_covered(head):
+            register_post_id(post_id)
+            continue
+
         if published_count > 0:
             time.sleep(DELAY_BETWEEN_POSTS)
 
@@ -606,16 +620,13 @@ def run():
         if posted:
             published_count += 1
             channel_posts_used.add(channel)
-            head = post_text.splitlines()[0][:60] if post_text.splitlines() else post_text[:60]
             register_published_topic(head, text)
             register_post_id(post_id)
             recent_channel_posts.insert(0, head)
-            print(f"✅ ОПУБЛІКОВАНО ({published_count}/{MAX_POSTS_PER_RUN}) з @{channel}: {head[:50]}...")
-
-    print(f"[ЗАВЕРШЕННЯ]: Опубліковано новин: {published_count}. Наступна перевірка за хвилину.")
+            print(f"✅ ОПУБЛІКОВАНО ({published_count}/{MAX_POSTS_PER_RUN}) з @{channel}: {head[:45]}...")
 
 if __name__ == "__main__":
-    print("🚀 Бот запущено на Render у режимі 24/7!")
+    print("🚀 Бот працює в режимі швидкого оновлення 24/7!")
     while True:
         try:
             run()
