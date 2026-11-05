@@ -26,7 +26,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GROQ_API_KEY]):
-    logger.error("Критичні змінні оточення відсутні! Перевірте налаштування на Render.")
+    logger.error("Критичні змінні оточення відсутні!")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -55,24 +55,22 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ----------------- РОЗШИРЕНИЙ ФІЛЬТР ШЛАКУ ТА КЛІКБЕЙТУ -----------------
+# ----------------- ФІЛЬТР ШЛАКУ -----------------
 JUNK_PHRASES = [
-    # Реклама, підписки та реакції
+    # Реклама та реакції
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
-    "реакция пользователей", "надіслати новину", "прислать новость", "фото:", "відео:",
-    "став лайк", "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
-    # Погода, природа, здоров'я
-    "прогноз погоди", "синоптики попередили", "похолодання", "потепління", "температурний рекорд",
-    "магнітні бурі", "магнітна буря", "вчені назвали", "дієтологи", "лікарі попередили",
-    "гороскоп", "знак зодіаку", "курс валют", "долар по", "євро по", "свято сьогодні",
-    # Локальний кримінал і побутові ДТП (шлак)
-    "п'яний водій", "п'яний кермувальник", "напідпитку", "врізався в стовп", "врізався в дерево",
-    "не розминулися", "перекинувся легковик", "побив сусіда", "вкрав велосипед", "вкрав телефон",
-    "побутовий конфлікт", "підпалив траву", "знайдено труп", "затримали хабарника на",
-    # Рутинні спостереження тривог
-    "повітряна тривога", "воздушная тревога", "відбій тривоги", "отбой тревоги",
-    "чисто по", "рух бпла", "загроза застосування балістики", "перевірка сирен",
-    "18+", "шок контент"
+    "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
+    "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
+    # Жовта преса та таблоїди
+    "голлівуд", "шекспірівськ", "гордон", "продюсер", "шоу-бізнес",
+    # Погода та псевдонаука
+    "прогноз погоди", "синоптики попередили", "похолодання", "магнітні бурі",
+    "вчені назвали", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
+    # Дрібний кримінал і ДТП
+    "п'яний водій", "напідпитку", "врізався в стовп", "побив сусіда", "вкрав",
+    # Рутинні тривоги
+    "повітряна тривога", "воздушная тревога", "відбій тривоги", "чисто по",
+    "перевірка сирен", "18+", "шок контент"
 ]
 
 STOP_WORDS = {
@@ -82,7 +80,7 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними", "джерела"
+    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними"
 }
 
 STATE_FILE = "bot_state.json"
@@ -110,6 +108,7 @@ state = load_state()
 def clean_raw_text(text):
     text = re.sub(r'Реакція користувачів:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'Реакция пользователей:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'Реакції громадян:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'https?://t\.me/\S+', '', text)
     text = re.sub(r't\.me/\S+', '', text)
     text = re.sub(r'@\w+', '', text)
@@ -142,12 +141,12 @@ def is_text_duplicate(candidate_text, state):
         intersection = len(cand_stems & old_stems)
         union = len(cand_stems | old_stems)
         similarity = intersection / union if union > 0 else 0
-        if similarity >= 0.38:
+        if similarity >= 0.35:
             logger.info(f"Дублікат ({similarity:.2f}) з: {topic.get('title', '')}")
             return True
     return False
 
-# ----------------- ПАРСИНГ ТЕЛЕГРАМУ -----------------
+# ----------------- ПАРСИНГ ТЕЛЕГРАМУ З ЧЕСНИМ МЕДІА -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -165,12 +164,12 @@ def scrape_donor(channel_username):
             if not msg_div:
                 continue
 
-            # Фільтр часу: тільки свіжі новини до 3.5 годин
+            # Фільтр свіжості (до 3 годин)
             time_tag = msg_div.find('time', class_='time')
             if time_tag and time_tag.get('datetime'):
                 try:
                     dt = datetime.datetime.fromisoformat(time_tag['datetime'].replace('Z', '+00:00'))
-                    if (now - dt).total_seconds() > 3.5 * 3600:
+                    if (now - dt).total_seconds() > 3.0 * 3600:
                         continue
                 except Exception:
                     pass
@@ -185,16 +184,25 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
+            # ПЕРЕВІРКА МЕДІА: ЖОДНИХ СТОП-КАДРІВ ЗАМІСТЬ ВІДЕО!
             video_tag = msg_div.find('video')
+            video_thumb = msg_div.find('i', class_='tgme_widget_message_video_thumb')
             photo_tag = msg_div.find('a', class_='tgme_widget_message_photo_wrap')
 
             media_type = None
             media_url = None
 
-            if video_tag and video_tag.get('src'):
+            # Якщо це реальне відео з прямим посиланням
+            if video_tag and video_tag.get('src') and video_tag.get('src').startswith('http'):
                 media_type = 'video'
                 media_url = video_tag['src']
+            elif video_tag or video_thumb:
+                # Це відео, але веб-телеграм сховав пряме посилання!
+                # КАТЕГОРИЧНО НЕ СТАВИМО ФОТО-ОБКЛАДИНКУ — піде чистий текст!
+                media_type = None
+                media_url = None
             elif photo_tag and photo_tag.get('style'):
+                # Це справжнє фото
                 m = re.search(r"background-image:url\('([^']+)'\)", photo_tag['style'])
                 if m:
                     media_type = 'photo'
@@ -211,52 +219,62 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР GROQ З ФІЛЬТРОМ ЦІННОСТІ -----------------
+# ----------------- РЕДАКТОР З ЖИВИМИ ПРИКЛАДАМИ -----------------
 def generate_channel_post(raw_text, recent_titles):
-    prompt = f"""Ти — головний редактор провідного всеукраїнського Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — відібрати ТІЛЬКИ СПРАВЖНІ ТОП-НОВИНИ і переписати їх чистою, живою українською мовою.
+    prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
+Пиши ВИКЛЮЧНО так, як пишуть топові українські канали: коротко, сильно, без води, без машинних рамок.
 
-ОСТАННІ ТЕМИ В КАНАЛІ:
+ОСЬ ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ В КАНАЛІ:
 {json.dumps(recent_titles, ensure_ascii=False)}
 
-КРИТЕРІЙ ВАЖЛИВОСТІ (СУВОРО! ЖОДНОГО ШЛАКУ!):
-ПУБЛІКУЙ ТІЛЬКИ ЯКЩО ЦЕ:
-1. Фронт, бойові дії, операції ЗСУ/ГУР, втрати ворога, аналітика DeepState.
-2. Ракетні/дронові удари по Україні, прильоти, наслідки, робота ППО, загиблі, стан енергетики (ДТЕК/Укренерго/блекаути).
-3. Перші особи та топ-політика (Зеленський, Сирський, Буданов, уряд, важливі закони, гучні арешти СБУ/ДБР).
-4. Велика геополітика ЩОДО УКРАЇНИ (Трамп, США, допомога, зброя, санкції проти рф, НАТО, ЄС, мирні переговори).
+ПРАВИЛО ДУБЛІКАТІВ ТА ШЛАКУ:
+- Якщо новина описує ТОЙ САМИЙ факт, що вже був — пиши тільки: SKIP
+- Якщо це жовта преса, плітки, шоубіз чи Гордон — пиши тільки: SKIP
+- Якщо це інша важлива теза виступу або нова подія — пиши пост!
 
-СУВОРО ВІДХИЛЯЙ І ПОВЕРТАЙ "SKIP", ЯКЩО ЦЕ:
-- Дрібні побутові ДТП, локальні бійки, пограбування або кримінал одного села/міста.
-- Погода, магнітні бурі, поради лікарів, свята, гороскопи.
-- Дрібні закордонні новини, які не стосуються України (страйки в Європі, місцеві вибори без зв'язку з війною).
-- Та сама подія, що вже є в списку останніх тем (дублікат). Але якщо це інша теза з виступу — публікуй!
-- ЯКЩО СУМНІВАЄШСЯ У ЗНАЧУЩОСТІ — ОБОВ'ЯЗКОВО ПОВЕРТАЙ: SKIP
+СУВОРО ЗАБОРОНЕНО:
+❌ НІЯКИХ blockquote (ніяких рамок для цитат)!
+❌ НІЯКОГО опису того, що на картинці («Трамп стоїть», «на фото видно», «на столі кепка»)!
+❌ НІЯКИХ дивних слів на кшталт «трепетний виступ», «лафа»!
+❌ НІЯКИХ повторів (коли спочатку переказуєш цитату, а потім вставляєш її ж у лапках)!
 
-СТИЛЬ:
-- Короткий, живий, без води. Якщо цитата: ⚡️ «Текст цитати...», — Автор.
-- Якщо подія: емодзі заголовок (💥, ⚡️, 💧, 🕯) + 1-2 коротких абзаци по суті.
-- Жодних повторів слів перед лапками. 100% переклад українською без росіянізмів.
+ПРИКЛАДИ СТИЛЮ ДЛЯ НОВИН:
+
+Приклад 1 (Коротка цитата/заява):
+«Наші вибори настільки нечесні, що ви навіть не уявляєте», — Трамп
+
+Приклад 2 (Заява з акцентом):
+⚡️ Ми можемо мати менше території, менше грошей і зброї, але гідності в нас все ж більше, ніж у багатьох. Ми будемо робити все, щоб ця війна закінчилася, але закінчилася гідно для нас, — Зеленський.
+
+Приклад 3 (Важлива подія/удар):
+💥 Російський обстріл логістичного центру в Київській області
+
+У Київській області російські війська вдарили по логістичному центру, спалахнула пожежа. На місці працюють рятувальники. Наразі відомо про одного пораненого.
+
+Приклад 4 (Конкретний факт):
+рф б'є по реле-підстанціях, які треба було закопати під землю. Наразі з 84 реле закопано лише 3, — нардеп Нагорняк.
 
 ТЕКСТ НОВИНИ:
 {raw_text}
 
-НАПИШИ ПОСТ (АБО СЛОВО SKIP):"""
+НАПИШИ ГОТОВИЙ ПОСТ (АБО СЛОВО SKIP):"""
 
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "Ти топовий український новинний редактор. Ти безжально відсікаєш нецікавий шлак і пусті новини, публікуючи тільки головне."},
+                {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти лаконічні, живі, точні та позбавлені будь-якої штучності."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.25,
-            max_tokens=650
+            temperature=0.2,
+            max_tokens=450
         )
         result = response.choices[0].message.content.strip()
         if "SKIP" in result.upper()[:15]:
             return None
-        return result
+        # Зачищаємо будь-які спроби вставити html blockquote
+        result = re.sub(r'</?blockquote[^>]*>', '', result)
+        return result.strip()
     except Exception as e:
         logger.error(f"Помилка Groq: {e}")
         return None
@@ -275,7 +293,6 @@ def post_to_telegram(text, media_type=None, media_url=None):
             res = requests.post(f"{base_url}/sendVideo", json=payload, timeout=25)
             if res.status_code == 200:
                 return True
-            logger.warning(f"sendVideo не пройшов ({res.text}), пробуємо фото/текст")
 
         if media_type == 'photo' and media_url:
             payload = {
@@ -287,7 +304,6 @@ def post_to_telegram(text, media_type=None, media_url=None):
             res = requests.post(f"{base_url}/sendPhoto", json=payload, timeout=20)
             if res.status_code == 200:
                 return True
-            logger.warning(f"sendPhoto не пройшов ({res.text}), відправляємо текстом")
 
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
@@ -298,17 +314,15 @@ def post_to_telegram(text, media_type=None, media_url=None):
         res = requests.post(f"{base_url}/sendMessage", json=payload, timeout=15)
         return res.status_code == 200
     except Exception as e:
-        logger.error(f"Помилка відправки в Telegram: {e}")
+        logger.error(f"Помилка відправки: {e}")
         return False
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Бот запущено з фільтром шлаку та адаптивним темпом...")
+    logger.info("Бот запущено з оновленим фільтром...")
 
     while True:
         try:
-            # Визначаємо, чи зараз ніч за Києвом (UTC+2 / UTC+3)
-            # Вночі поріг пропуску ще суворіший
             now_utc = datetime.datetime.now(datetime.timezone.utc)
             kyiv_hour = (now_utc.hour + 2) % 24
             is_night = kyiv_hour >= 23 or kyiv_hour < 6
@@ -322,7 +336,7 @@ def main_loop():
                         all_candidates.append((h, item))
                 time.sleep(1.2)
 
-            logger.info(f"Знайдено сирих кандидатів: {len(all_candidates)} (Нічний режим: {is_night})")
+            logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
             max_posts_this_cycle = 3 if len(all_candidates) >= 6 and not is_night else 1
             posts_published = 0
@@ -339,19 +353,17 @@ def main_loop():
 
                 formatted_post = generate_channel_post(item['text'], recent_titles)
                 if not formatted_post:
-                    # Новину відхилено як шлак або дублікат
                     state["posted_hashes"].append(h)
                     continue
 
                 if re.search(r'[ыэъёЫЭЪЁ]', formatted_post):
-                    logger.warning("Знайдено російські літери, пост відхилено.")
                     state["posted_hashes"].append(h)
                     continue
 
                 success = post_to_telegram(formatted_post, item.get('media_type'), item.get('media_url'))
                 if success:
                     posts_published += 1
-                    logger.info(f"Опубліковано важливу новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
+                    logger.info(f"Опубліковано ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
@@ -365,18 +377,17 @@ def main_loop():
                     if posts_published < max_posts_this_cycle:
                         time.sleep(35)
 
-            # Адаптивна пауза:
             if posts_published > 0:
-                sleep_time = 70
+                sleep_time = 75
             elif is_night:
-                sleep_time = 180  # Вночі затишшя — перевіряємо раз на 3 хвилини
+                sleep_time = 180
             else:
-                sleep_time = 110  # Вдень без новин — пауза трохи менше 2 хвилин
+                sleep_time = 110
 
             time.sleep(sleep_time)
 
         except Exception as e:
-            logger.error(f"Помилка в головному циклі: {e}")
+            logger.error(f"Помилка циклу: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
