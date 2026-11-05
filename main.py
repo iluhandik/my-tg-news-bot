@@ -72,7 +72,7 @@ def get_working_groq_model():
                 for m in live_ids:
                     if pref in m.lower() and "guard" not in m.lower() and "whisper" not in m.lower():
                         ACTIVE_MODEL = m
-                        logger.info(f"Вибрано інтелектуальну модель LLAMA: {ACTIVE_MODEL}")
+                        logger.info(f"Вибрано модель LLAMA: {ACTIVE_MODEL}")
                         return ACTIVE_MODEL
     except Exception as e:
         logger.error(f"Помилка вибору моделі: {e}")
@@ -158,7 +158,7 @@ def sync_with_my_channel():
 
 sync_with_my_channel()
 
-# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН (ДО 2 ГОДИН) -----------------
+# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -184,7 +184,6 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                # Тільки новини за останні 2 години
                 if age_seconds > 2.0 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -227,39 +226,38 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- СЕМАНТИЧНИЙ АНАЛІЗ LLAMA НА ДУБЛІКАТИ ТА НАПИСАННЯ ПОСТУ -----------------
+# ----------------- РЕДАКТОР НОВИН (ЧИСТІ ФАКТИ БЕЗ ВЛАСНОЇ ДУМКИ) -----------------
 def generate_channel_post(raw_text, recent_stories):
-    # Формуємо список того, про що вже писав канал
     stories_context = "\n---\n".join([f"• {s}" for s in recent_stories[-25:]])
 
-    prompt = f"""Ти — головний редактор провідного українського новинного Telegram-каналу "NEWS УКРАЇНА 365".
+    prompt = f"""Ти — професійний новинний репортер Telegram-каналу "NEWS УКРАЇНА 365".
+Твоє завдання — подавати ЧИСТІ ФАКТИ ТА НОВИНИ В СОЛІДНОМУ ЖУРНАЛІСТСЬКОМУ СТИЛІ БЕЗ ВЛАСНОЇ ДУМКИ.
 
-ОСЬ ПОВНИЙ ЗМІСТ ОСТАННІХ ПУБЛІКАЦІЙ У НАШОМУ КАНАЛІ:
+ОСЬ ПУБЛІКАЦІЇ В НАШОМУ КАНАЛІ (ЯКЩО НОВИНА ОПИСУЄ ТУ САМУ ПОДІЮ — ПИШИ SKIP):
 {stories_context}
 
-ТВОЄ НАЙГОЛОВНІШЕ ЗАВДАННЯ — СУВОРИЙ СЕНСОВИЙ АНАЛІЗ НА ДУБЛІКАТ:
-Уважно порівняй сенс нової новини нижче з публікаціями нашого каналу вище.
-- ЯКЩО ця новина по суті описує ТУ САМУ ПОДІЮ, ТОЙ САМИЙ ФАКТ або ТУ САМУ ЗАЯВУ (навіть якщо слова інші, переказано інакше, або з іншого каналу) — ТИ ЗОБОВ'ЯЗАНИЙ ВІДХИЛИТИ ЇЇ!
-  У такому разі напиши ТІЛЬКИ ОДНЕ СЛОВО: SKIP
-- Публікуй ТІЛЬКИ ЯКЩО це справді НОВА подія або новий розвиток ситуації, якого ще не було в списку вище!
+КАТЕГОРИЧНІ ПРАВИЛА:
+❌ СУВОРО ЗАБОРОНЕНО писати особисту суб'єктивну думку, моралізаторство та авторські роздуми («Уявіть собі цю логіку», «Це не просто подвійні стандарти», «Поки хтось рахує жертви»). Автор каналу коментує сам, коли схоче!
+❌ Твоє завдання — ЧИСТІ ФАКТИ: хто заявив, що конкретно сказав, суть події.
+❌ ЖОДНИХ росіянізмів: "позор" (тільки "ганьба"), "толпа" (тільки "натовп"), "– ГВА".
+❌ НІЯКИХ рамок blockquote!
 
-ВИМОГИ ДО СТИЛЮ (ЖОДНОЇ СУХОСТІ ТА СУРЖИКУ):
-1. ПЕРШИЙ РЯДОК — обов'язково жирний заголовок у <b>...</b> з тематичним емодзі.
+СТРУКТУРА:
+1. Жирний заголовок у тегах <b>...</b> з емодзі.
 2. Порожній рядок.
-3. ОСНОВНИЙ ТЕКСТ — 2-3 короткі живі абзаци з відступами.
-4. КАТЕГОРИЧНО ЗАБОРОНЕНО: "толпа" (тільки "натовп"), "позор" (тільки "ганьба"), "– ГВА", дешевий сарказм, рамки blockquote.
+3. 1-2 інформативні абзаци фактів: контекст та точна пряма мова («Цитата...», — Прізвище).
 
 ЗРАЗОК ОФОРМЛЕННЯ:
-<b>💥 Росіяни вдарили по логістичному центру на Київщині</b>
+<b>🇺🇸 Заява Трампа щодо війни в Україні та цивільних втрат</b>
 
-У Київській області внаслідок ворожої атаки спалахнула масштабна пожежа на території об'єкту. На місці працюють рятувальники.
+Дональд Трамп прокоментував удари росії по мирних містах України, заявивши, що жертви є з обох сторін конфлікту.
 
-За попередніми даними, зафіксовано одного постраждалого.
+«Я завжди про це говорю. Але я також говорю про іншу сторону, бо там теж гинуть мирні жителі. Це кровопролиття», — заявив Трамп.
 
 ТЕКСТ НОВОЇ НОВИНИ:
 {raw_text}
 
-НАПИШИ ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP, ЯКЩО ЦЕ ПОВТОР):"""
+ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -272,10 +270,10 @@ def generate_channel_post(raw_text, recent_stories):
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "Ти інтелектуальний новинний редактор. Твоє першочергове завдання — не допускати повторів одних і тих самих подій у каналі під жодним соусом. Якщо подія вже була — пиши SKIP."},
+                {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — це чиста інформація та точні факти без повчань, сарказму чи особистих оцінок."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.2,
+            "temperature": 0.15,
             "max_tokens": 450
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
@@ -283,11 +281,9 @@ def generate_channel_post(raw_text, recent_stories):
             data = resp.json()
             result = data['choices'][0]['message']['content'].strip()
             if "SKIP" in result.upper()[:15]:
-                logger.info("Нейромережа визначила новину як семантичний дублікат (SKIP).")
                 return None
             result = re.sub(r'</?blockquote[^>]*>', '', result)
             
-            # Автокоректор кальок
             result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
             result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
             result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
@@ -342,7 +338,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Бот запущено зі смисловим антидублікатом Llama...")
+    logger.info("Бот запущено успішно...")
 
     while True:
         try:
@@ -370,7 +366,6 @@ def main_loop():
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                # Нейромережа сама читає контекст і вирішує, чи це повтор
                 formatted_post = generate_channel_post(item['text'], recent_stories)
                 if not formatted_post:
                     state["posted_hashes"].append(h)
@@ -383,11 +378,10 @@ def main_loop():
                 success = post_to_telegram(formatted_post, item.get('media_type'), item.get('media_url'))
                 if success:
                     posts_published += 1
-                    logger.info(f"Опубліковано свіжу подію ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
+                    logger.info(f"Опубліковано чисту новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
-                    # Зберігаємо сенс новини в історію каналу
                     summary_clean = re.sub(r'<[^>]+>', '', formatted_post)
                     state.setdefault("recent_stories", []).append(summary_clean[:220])
                     recent_stories.append(summary_clean[:220])
