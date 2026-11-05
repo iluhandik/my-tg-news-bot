@@ -52,21 +52,13 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ----------------- ВИБІР ТЕКСТОВОЇ МОДЕЛІ GROQ -----------------
+# ----------------- ВИБІР НАЙКРАЩОЇ МОДЕЛІ LLAMA -----------------
 ACTIVE_MODEL = None
 
 def get_working_groq_model():
     global ACTIVE_MODEL
     if ACTIVE_MODEL:
         return ACTIVE_MODEL
-
-    PROVEN_CHAT_MODELS = [
-        os.getenv("AI_MODEL"),
-        "llama-3.1-8b-instant",
-        "gemma2-9b-it",
-        "llama-3.3-70b-versatile"
-    ]
-    PROVEN_CHAT_MODELS = [m.strip() for m in PROVEN_CHAT_MODELS if m and m.strip()]
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -75,25 +67,20 @@ def get_working_groq_model():
     try:
         resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
         if resp.status_code == 200:
-            live_ids = {m["id"] for m in resp.json().get("data", [])}
-            # Беремо ТІЛЬКИ текстову модель (виключаємо whisper та guard)
-            for m in PROVEN_CHAT_MODELS:
-                if m in live_ids:
-                    ACTIVE_MODEL = m
-                    logger.info(f"Вибрано активну текстову модель: {ACTIVE_MODEL}")
-                    return ACTIVE_MODEL
-            for m in live_ids:
-                if "whisper" not in m.lower() and "guard" not in m.lower() and "vision" not in m.lower():
-                    ACTIVE_MODEL = m
-                    logger.info(f"Вибрано резервну текстову модель: {ACTIVE_MODEL}")
-                    return ACTIVE_MODEL
+            live_ids = [m["id"] for m in resp.json().get("data", [])]
+            for pref in ["llama-3.3-70b", "llama-3.1-70b", "llama-3.1-8b", "llama-3", "llama"]:
+                for m in live_ids:
+                    if pref in m.lower() and "guard" not in m.lower() and "whisper" not in m.lower():
+                        ACTIVE_MODEL = m
+                        logger.info(f"Вибрано інтелектуальну модель LLAMA: {ACTIVE_MODEL}")
+                        return ACTIVE_MODEL
     except Exception as e:
         logger.error(f"Помилка вибору моделі: {e}")
 
-    ACTIVE_MODEL = "llama-3.1-8b-instant"
+    ACTIVE_MODEL = os.getenv("AI_MODEL") or "llama-3.1-8b-instant"
     return ACTIVE_MODEL
 
-# ----------------- СТОП-СЛОВА ТА ФІЛЬТРИ -----------------
+# ----------------- ФІЛЬТР ШЛАКУ -----------------
 JUNK_PHRASES = [
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
     "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
@@ -106,16 +93,6 @@ JUNK_PHRASES = [
     "перевірка сирен", "18+", "шок контент"
 ]
 
-STOP_WORDS = {
-    "і", "й", "та", "в", "у", "на", "з", "із", "зі", "до", "по", "за", "про", "проти",
-    "від", "під", "над", "при", "через", "після", "для", "як", "що", "щоб", "бо", "тому",
-    "але", "проте", "однак", "це", "ця", "цей", "ці", "того", "тому", "його", "її", "їх",
-    "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
-    "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
-    "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
-}
-
 STATE_FILE = "bot_state.json"
 
 def load_state():
@@ -125,12 +102,12 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_topics": [], "last_post_time": 0}
+    return {"posted_hashes": [], "recent_stories": [], "last_post_time": 0}
 
 def save_state(state):
     try:
         state["posted_hashes"] = state["posted_hashes"][-300:]
-        state["recent_topics"] = state["recent_topics"][-50:]
+        state["recent_stories"] = state["recent_stories"][-40:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -157,32 +134,11 @@ def is_junk_news(text):
             return True
     return False
 
-def get_text_stem_words(text):
-    text_clean = text.lower().translate(str.maketrans('', '', string.punctuation + '«»—–"\''))
-    words = text_clean.split()
-    return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
-
-def is_text_duplicate(candidate_text, state):
-    cand_stems = get_text_stem_words(candidate_text)
-    if not cand_stems:
-        return True
-
-    for topic in state.get("recent_topics", []):
-        old_stems = set(topic.get("stems", []))
-        if not old_stems:
-            continue
-        intersection = len(cand_stems & old_stems)
-        union = len(cand_stems | old_stems)
-        similarity = intersection / union if union > 0 else 0
-        if similarity >= 0.32:
-            logger.info(f"Дублікат ({similarity:.2f}) з: {topic.get('title', '')}")
-            return True
-    return False
-
-# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
+# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ ПРИ СТАРТІ -----------------
 def sync_with_my_channel():
     try:
-        url = "https://t.me/s/kropivnit"
+        channel_name = TELEGRAM_CHANNEL_ID.lstrip('@') if TELEGRAM_CHANNEL_ID.startswith('@') else "kropivnit"
+        url = f"https://t.me/s/{channel_name}"
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if resp.status_code == 200:
             raw_html = resp.text
@@ -190,22 +146,19 @@ def sync_with_my_channel():
             count = 0
             for raw in matches[-20:]:
                 clean = re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', '\n', raw))
-                clean = html.unescape(clean_raw_text(clean))
-                stems = list(get_text_stem_words(clean))
-                first_line = clean.split('\n')[0][:80]
-                h = str(hash(clean[:120]))
-                if stems and first_line not in [t.get("title") for t in state.get("recent_topics", [])]:
-                    state["recent_topics"].append({"title": first_line, "stems": stems})
-                    state["posted_hashes"].append(h)
+                clean = html.unescape(clean_raw_text(clean)).strip()
+                if len(clean) > 20 and clean not in state.get("recent_stories", []):
+                    state.setdefault("recent_stories", []).append(clean[:200])
+                    state["posted_hashes"].append(str(hash(clean[:120])))
                     count += 1
             save_state(state)
-            logger.info(f"Синхронізовано {count} постів з каналу для блокування повторів!")
+            logger.info(f"Синхронізовано {count} історій з каналу для семантичного захисту від повторів!")
     except Exception as e:
         logger.error(f"Помилка синхронізації: {e}")
 
 sync_with_my_channel()
 
-# ----------------- ПАРСИНГ З МЕДІА -----------------
+# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН (ДО 2 ГОДИН) -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -231,6 +184,7 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
+                # Тільки новини за останні 2 години
                 if age_seconds > 2.0 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -273,42 +227,39 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР З ЖИВИМ ЕМОЦІЙНИМ СТИЛЕМ -----------------
-def generate_channel_post(raw_text, recent_titles):
-    prompt = f"""Ти — автор і головний редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
-Пиши ЖИВОЮ, ЛЮДСЬКОЮ, ЕМОЦІЙНОЮ українською мовою.
+# ----------------- СЕМАНТИЧНИЙ АНАЛІЗ LLAMA НА ДУБЛІКАТИ ТА НАПИСАННЯ ПОСТУ -----------------
+def generate_channel_post(raw_text, recent_stories):
+    # Формуємо список того, про що вже писав канал
+    stories_context = "\n---\n".join([f"• {s}" for s in recent_stories[-25:]])
 
-ОСЬ ОСТАННІ ТЕМИ В КАНАЛІ (ЯКЩО ТАКЕ ВЖЕ БУЛО — ПИШИ SKIP):
-{json.dumps(recent_titles, ensure_ascii=False)}
+    prompt = f"""Ти — головний редактор провідного українського новинного Telegram-каналу "NEWS УКРАЇНА 365".
 
-КАТЕГОРИЧНО ЗАБОРОНЕНО:
-❌ НІЯКОГО сухого протокольного стилю (заборонено писати "– ГВА", "зафіксовано", "громадян")!
-❌ НІЯКОГО суцільного тексту в одне речення! Обов'язково розбивай на 2-3 короткі абзаци з порожніми рядками між ними.
-❌ НІЯКИХ рамок blockquote!
+ОСЬ ПОВНИЙ ЗМІСТ ОСТАННІХ ПУБЛІКАЦІЙ У НАШОМУ КАНАЛІ:
+{stories_context}
 
-ЗРАЗКИ ТОГО, ЯК МАЄ ВИГЛЯДАТИ ПОСТ:
+ТВОЄ НАЙГОЛОВНІШЕ ЗАВДАННЯ — СУВОРИЙ СЕНСОВИЙ АНАЛІЗ НА ДУБЛІКАТ:
+Уважно порівняй сенс нової новини нижче з публікаціями нашого каналу вище.
+- ЯКЩО ця новина по суті описує ТУ САМУ ПОДІЮ, ТОЙ САМИЙ ФАКТ або ТУ САМУ ЗАЯВУ (навіть якщо слова інші, переказано інакше, або з іншого каналу) — ТИ ЗОБОВ'ЯЗАНИЙ ВІДХИЛИТИ ЇЇ!
+  У такому разі напиши ТІЛЬКИ ОДНЕ СЛОВО: SKIP
+- Публікуй ТІЛЬКИ ЯКЩО це справді НОВА подія або новий розвиток ситуації, якого ще не було в списку вище!
 
-Зразок 1 (Обстріли / Трагедія — жива мова з повітрям):
-<b>💥 Росіяни вдарили авіабомбами по Ізюму: є поранені та руйнування</b>
+ВИМОГИ ДО СТИЛЮ (ЖОДНОЇ СУХОСТІ ТА СУРЖИКУ):
+1. ПЕРШИЙ РЯДОК — обов'язково жирний заголовок у <b>...</b> з тематичним емодзі.
+2. Порожній рядок.
+3. ОСНОВНИЙ ТЕКСТ — 2-3 короткі живі абзаци з відступами.
+4. КАТЕГОРИЧНО ЗАБОРОНЕНО: "толпа" (тільки "натовп"), "позор" (тільки "ганьба"), "– ГВА", дешевий сарказм, рамки blockquote.
 
-Ворожі удари зруйнували житлові будинки, частина міста залишилася без світла. Наразі відомо про двох постраждалих людей.
+ЗРАЗОК ОФОРМЛЕННЯ:
+<b>💥 Росіяни вдарили по логістичному центру на Київщині</b>
 
-На місці прильотів працюють рятувальники, ліквідація наслідків триває.
+У Київській області внаслідок ворожої атаки спалахнула масштабна пожежа на території об'єкту. На місці працюють рятувальники.
 
-Зразок 2 (Енергетика):
-<b>⚡️ 78 ударів по енергетиці за три дні</b>
+За попередніми даними, зафіксовано одного постраждалого.
 
-За останні три дні Росія здійснила 78 ударів по об'єктах енергетики України. За даними ДТЕК, це значне збільшення інтенсивності атак на енергетику країни.
-
-Зразок 3 (Політика / Заява):
-«Наші вибори настільки нечесні, що ви навіть не уявляєте», — Трамп.
-
-Тільки не плач, Доні.
-
-ТЕКСТ НОВИНИ:
+ТЕКСТ НОВОЇ НОВИНИ:
 {raw_text}
 
-НАПИШИ ЖИВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
+НАПИШИ ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP, ЯКЩО ЦЕ ПОВТОР):"""
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -321,10 +272,10 @@ def generate_channel_post(raw_text, recent_titles):
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "Ти топовий автор українського Telegram-каналу. Твій стиль живий, динамічний, з гарними абзацами."},
+                {"role": "system", "content": "Ти інтелектуальний новинний редактор. Твоє першочергове завдання — не допускати повторів одних і тих самих подій у каналі під жодним соусом. Якщо подія вже була — пиши SKIP."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.3,
+            "temperature": 0.2,
             "max_tokens": 450
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
@@ -332,8 +283,15 @@ def generate_channel_post(raw_text, recent_titles):
             data = resp.json()
             result = data['choices'][0]['message']['content'].strip()
             if "SKIP" in result.upper()[:15]:
+                logger.info("Нейромережа визначила новину як семантичний дублікат (SKIP).")
                 return None
             result = re.sub(r'</?blockquote[^>]*>', '', result)
+            
+            # Автокоректор кальок
+            result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
+            result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
+            result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
+            
             return result.strip()
         else:
             logger.error(f"Помилка Groq API ({resp.status_code}) на {model_name}: {resp.text}")
@@ -384,7 +342,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Бот запущено успішно...")
+    logger.info("Бот запущено зі смисловим антидублікатом Llama...")
 
     while True:
         try:
@@ -401,22 +359,19 @@ def main_loop():
                         all_candidates.append((h, item))
                 time.sleep(1.2)
 
-            logger.info(f"Знайдено свіжих кандидатів: {len(all_candidates)} (Ніч: {is_night})")
+            logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
             max_posts_this_cycle = 3 if len(all_candidates) >= 6 and not is_night else 1
             posts_published = 0
 
-            recent_titles = [t.get("title", "") for t in state.get("recent_topics", [])[-35:]]
+            recent_stories = state.get("recent_stories", [])
 
             for h, item in all_candidates:
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                if is_text_duplicate(item['text'], state):
-                    state["posted_hashes"].append(h)
-                    continue
-
-                formatted_post = generate_channel_post(item['text'], recent_titles)
+                # Нейромережа сама читає контекст і вирішує, чи це повтор
+                formatted_post = generate_channel_post(item['text'], recent_stories)
                 if not formatted_post:
                     state["posted_hashes"].append(h)
                     continue
@@ -428,14 +383,14 @@ def main_loop():
                 success = post_to_telegram(formatted_post, item.get('media_type'), item.get('media_url'))
                 if success:
                     posts_published += 1
-                    logger.info(f"Опубліковано ({posts_published}/{max_posts_this_cycle}) з @{item['channel']} (Медіа: {item.get('media_type')})!")
+                    logger.info(f"Опубліковано свіжу подію ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
-                    first_line = formatted_post.split('\n')[0][:80]
-                    stems = list(get_text_stem_words(item['text']))
-                    state["recent_topics"].append({"title": first_line, "stems": stems})
-                    recent_titles.append(first_line)
+                    # Зберігаємо сенс новини в історію каналу
+                    summary_clean = re.sub(r'<[^>]+>', '', formatted_post)
+                    state.setdefault("recent_stories", []).append(summary_clean[:220])
+                    recent_stories.append(summary_clean[:220])
 
                     save_state(state)
 
