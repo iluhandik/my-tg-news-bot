@@ -23,7 +23,7 @@ load_dotenv()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
-# Фоновий веб-сервер для статусу Live
+# Фоновий веб-сервер для статусу Live на Render
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -87,8 +87,10 @@ WATERMARK_FILE = os.path.join(BASE_DIR, "watermark.png")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ==================== АВТОВИПРАВЛЕННЯ СУРЖИКУ ====================
+# ==================== АВТОВИПРАВЛЕННЯ СУРЖИКУ ТА ПОМИЛОК ====================
 CALQUE_REPLACEMENTS = [
+    (r"(?i)\bгоссекретар([а-яіїєґ]*)\b", r"держсекретар\1"),
+    (r"(?i)\bвице\s*президент([а-яіїєґ]*)\b", r"віцепрезидент\1"),
     (r"(?i)\bзапорі[зс]хсталь\b", "Запоріжсталь"),
     (r"(?i)\bзапорожсталь\b", "Запоріжсталь"),
     (r"(?i)\bбалл[іи]стич([а-яіїєґ]*)\b", r"балістич\1"),
@@ -239,9 +241,10 @@ def extract_stems(text: str) -> Set[str]:
 def is_topic_already_covered(text: str) -> bool:
     topics = load_json(TOPICS_FILE)
     cur_stems = extract_stems(text)
-    if not cur_stems or len(cur_stems) < 3:
+    if not cur_stems or len(cur_stems) < 2:
         return False
 
+    clean_lower = text.lower()
     now = time.time()
     min_time = now - (18 * 3600)
 
@@ -249,17 +252,28 @@ def is_topic_already_covered(text: str) -> bool:
         if t.get("timestamp", 0) < min_time:
             continue
         prev_stems = set(t.get("stems", []))
-        if not prev_stems:
-            continue
+        prev_head = t.get("headline", "").lower()
 
-        # Збіг ключових слів (якщо однакових слів більше 35% — це одна й та сама новина)
-        intersection = cur_stems.intersection(prev_stems)
-        union = cur_stems.union(prev_stems)
-        similarity = len(intersection) / len(union)
+        # 1. Захист за комбінаціями ключових слів (Трамп+Іран, Поклад+СБУ тощо)
+        if "іран" in clean_lower and "трамп" in clean_lower:
+            if "іран" in prev_head or "ірану" in prev_head or "іран" in prev_stems:
+                print("[АНТИДУБЛЬ]: Повтор заяви Трампа щодо Ірану відхилено!")
+                return True
 
-        if similarity >= 0.35:
-            print(f"[АНТИДУБЛЬ]: Збіг {similarity:.2f} з темою '{t.get('headline', '')[:30]}...'. Відхилено!")
-            return True
+        if "поклад" in clean_lower:
+            if "поклад" in prev_head or "поклад" in prev_stems:
+                print("[АНТИДУБЛЬ]: Повтор новини про Поклада відхилено!")
+                return True
+
+        # 2. Збіг слів від 30% (точний дублікат тієї ж події)
+        if prev_stems:
+            intersection = cur_stems.intersection(prev_stems)
+            union = cur_stems.union(prev_stems)
+            similarity = len(intersection) / len(union)
+
+            if similarity >= 0.30:
+                print(f"[АНТИДУБЛЬ]: Збіг {similarity:.2f} з темою '{t.get('headline', '')[:30]}...'. Відхилено!")
+                return True
 
     return False
 
@@ -332,19 +346,19 @@ def sync_channel_history(channel_username: str) -> List[str]:
     return recent_texts
 
 # ==================== ШІ-ОБРОБКА (100% УКРАЇНСЬКА МОВА ТА ЧИТАБЕЛЬНІСТЬ) ====================
-SYSTEM_PROMPT = """Ти — головний редактор всеукраїнського Telegram-каналу новин.
-Твоє завдання — перетворити текст новини на красивий, легкочитний пост ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ.
+SYSTEM_PROMPT = """Ти — головний редактор всеукраїнського новинного каналу.
+Твоє завдання — написати красивий, грамотний, структурований пост 100% ЧИСТОЮ УКРАЇНСЬКОЮ МОВОЮ.
 
-ГОЛОВНІ ВИМОГИ:
-1. МОВА: 100% УКРАЇНСЬКА! Категорично заборонено залишати будь-які речення чи цитати російською мовою! Будь-яку пряму мову обов'язково перекладай українською!
-2. ЧИТАБЕЛЬНІСТЬ (НЕ СУЦІЛЬНИЙ ТЕКСТ):
-   - Розбивай текст на 2-3 короткі, охайні абзаци (по 2-3 речення кожен).
-   - Між абзацами ОБОВ'ЯЗКОВО порожній рядок.
-   - Використовуй жирний шрифт для ключових слів (імена, міста, головні цифри).
-3. ТОЧНІСТЬ: Пиши виключно за фактами донора, не вигадуй неіснуючі подробиці чи цифри.
-4. ОФОРМЛЕННЯ:
+ГОЛОВНІ ПРАВИЛА:
+1. МОВА: 100% УКРАЇНСЬКА! КАТЕГОРИЧНО ЗАБОРОНЕНО залишати будь-який російський текст чи цитати російською мовою! 
+   - Будь-яку цитату в <blockquote> обов'язково ПЕРЕКЛАДАЙ солов'їною українською мовою!
+   - Не вживай російських кальок: пиши «Держсекретар» (не госсекретар!), «віцепрезидент» (не вице-президент).
+2. СТРУКТУРА ТА ЧИТАБЕЛЬНІСТЬ:
+   - Розбивай текст на 2 короткі, красиві абзаци з обов'язковим порожнім рядком між ними.
+   - Не ліпи суцільне полотно на 10 рядків!
+   - НЕ ДУБЛЮЙ те саме речення в тексті та цитаті! Якщо є пряма мова — оформи її тільки один раз у <blockquote>...</blockquote>.
+3. ОФОРМЛЕННЯ:
    - Заголовок <b>жирним</b> з 1 емодзі. Звичайними реченнями, БЕЗ капсу.
-   - Пряму мову оформи через <blockquote>...</blockquote> українською мовою!
    - ЖОДНИХ підписів у кінці, жодного значка "💬".
 
 Формат відповіді СТРОГО JSON:
@@ -381,7 +395,7 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
     if recent_channel_posts:
         recent_context = "ОСТАННІ ОПУБЛІКОВАНІ ПОСТИ В КАНАЛІ:\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:15]]) + "\n\n"
 
-    user_prompt = f"{recent_context}НОВА НОВИНА (переклади 100% українською, зроби 2-3 короткі абзаци, перевір на дубль):\n{cleaned}"
+    user_prompt = f"{recent_context}НОВА НОВИНА (переклади ВСЕ включно з цитатами українською, зроби 2 короткі абзаци):\n{cleaned}"
 
     models = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"]
 
@@ -404,8 +418,11 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
             if parsed.get("is_duplicate", False) or parsed.get("is_ad", False):
                 return None
 
-            if "telegram_post" in parsed:
-                parsed["telegram_post"] = fix_ukrainian_calques(parsed["telegram_post"])
+            post = parsed.get("telegram_post", "")
+            if post:
+                # Перевірка: якщо ШІ залишив російські літери в цитаті — замінюємо або перекладаємо кальки
+                post = fix_ukrainian_calques(post)
+                parsed["telegram_post"] = post
 
             return parsed
         except Exception:
@@ -418,7 +435,6 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
     caption = post_text[:1024]
     has_heavy_wm = donor.lower() in CHANNELS_WITH_HEAVY_WATERMARKS
 
-    # Якщо новина має відео — надсилаємо ВИКЛЮЧНО відео!
     if video_url:
         temp_vid = os.path.join(MEDIA_DIR, "temp_vid.mp4")
         branded_vid = os.path.join(MEDIA_DIR, "branded_vid.mp4")
@@ -452,10 +468,8 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
                         return True
         except Exception as e:
             print(f"[ПОМИЛКА ВІДЕО]: {e}")
-        # Якщо відео не надіслалося, НЕ надсилаємо стоп-кадр як фото!
         return False
 
-    # Якщо це оригінальне фото
     if photo_url:
         try:
             r = requests.get(photo_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
@@ -486,7 +500,6 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
             pass
         return False
 
-    # Текстовий пост
     try:
         resp = requests.post(
             f"{url_base}/sendMessage",
@@ -497,7 +510,7 @@ def send_telegram_post(post_text: str, photo_url: Optional[str] = None, video_ur
     except Exception:
         return False
 
-# ==================== ПАРСЕР З ЧІТКИМ ВІДЕО-ДЕТЕКТОРОМ ====================
+# ==================== ПАРСЕР ====================
 def fetch_posts(channel: str) -> List[Dict]:
     url = f"https://t.me/s/{channel}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -530,11 +543,9 @@ def fetch_posts(channel: str) -> List[Dict]:
 
             unescaped = html.unescape(b)
 
-            # Визначаємо справжнє відео
             v_match = re.search(r'<video[^>]+src=[\'"](https?://[^\'"]+)[\'"]', unescaped)
             video_url = v_match.group(1) if v_match else None
 
-            # Якщо це відео — photo_url ставимо None!
             photo_url = None
             if not video_url:
                 p_match = re.search(r'background-image:\s*url\([\'"]?(https?://[^\'")\s]+)[\'"]?\)', unescaped)
@@ -588,7 +599,6 @@ def run():
             register_post_id(post_id)
             continue
 
-        # Перевірка на дубль новини
         if is_topic_already_covered(text):
             register_post_id(post_id)
             continue
@@ -607,7 +617,6 @@ def run():
             register_post_id(post_id)
             continue
 
-        # Додаткова перевірка згенерованого заголовка на дублікат
         head = post_text.splitlines()[0][:60] if post_text.splitlines() else post_text[:60]
         if is_topic_already_covered(head):
             register_post_id(post_id)
