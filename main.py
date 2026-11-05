@@ -18,6 +18,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# 1. Миттєве виведення логів без затримок у консолі Render
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
+# 2. Фоновий пінґ-сервер для безкоштовного статусу Live на Render
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"NEWS BOT IS RUNNING 24/7")
+    def log_message(self, format, *args):
+        return
+
+def run_health_check():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_health_check, daemon=True).start()
+
 # ==================== НАЛАШТУВАННЯ ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
