@@ -52,7 +52,7 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ----------------- АВТОМАТИЧНИЙ ВИБІР АКТУАЛЬНОЇ МОДЕЛІ GROQ -----------------
+# ----------------- ВИБІР ТЕКСТОВОЇ МОДЕЛІ GROQ -----------------
 ACTIVE_MODEL = None
 
 def get_working_groq_model():
@@ -60,27 +60,37 @@ def get_working_groq_model():
     if ACTIVE_MODEL:
         return ACTIVE_MODEL
 
+    PROVEN_CHAT_MODELS = [
+        os.getenv("AI_MODEL"),
+        "llama-3.1-8b-instant",
+        "gemma2-9b-it",
+        "llama-3.3-70b-versatile"
+    ]
+    PROVEN_CHAT_MODELS = [m.strip() for m in PROVEN_CHAT_MODELS if m and m.strip()]
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     try:
-        resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=12)
+        resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
         if resp.status_code == 200:
-            all_models = [m["id"] for m in resp.json().get("data", [])]
-            for pref in ["llama-3.3", "llama-3.1", "llama-3", "llama"]:
-                for m in all_models:
-                    if pref in m.lower() and "guard" not in m.lower():
-                        ACTIVE_MODEL = m
-                        logger.info(f"Вибрано модель Groq: {ACTIVE_MODEL}")
-                        return ACTIVE_MODEL
-            if all_models:
-                ACTIVE_MODEL = all_models[0]
-                return ACTIVE_MODEL
+            live_ids = {m["id"] for m in resp.json().get("data", [])}
+            # Беремо ТІЛЬКИ текстову модель (виключаємо whisper та guard)
+            for m in PROVEN_CHAT_MODELS:
+                if m in live_ids:
+                    ACTIVE_MODEL = m
+                    logger.info(f"Вибрано активну текстову модель: {ACTIVE_MODEL}")
+                    return ACTIVE_MODEL
+            for m in live_ids:
+                if "whisper" not in m.lower() and "guard" not in m.lower() and "vision" not in m.lower():
+                    ACTIVE_MODEL = m
+                    logger.info(f"Вибрано резервну текстову модель: {ACTIVE_MODEL}")
+                    return ACTIVE_MODEL
     except Exception as e:
-        logger.error(f"Помилка отримання моделей: {e}")
+        logger.error(f"Помилка вибору моделі: {e}")
 
-    ACTIVE_MODEL = os.getenv("AI_MODEL") or "llama-3.1-8b-instant"
+    ACTIVE_MODEL = "llama-3.1-8b-instant"
     return ACTIVE_MODEL
 
 # ----------------- СТОП-СЛОВА ТА ФІЛЬТРИ -----------------
@@ -103,7 +113,7 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними"
+    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
 }
 
 STATE_FILE = "bot_state.json"
@@ -169,10 +179,9 @@ def is_text_duplicate(candidate_text, state):
             return True
     return False
 
-# ----------------- СИНХРОНІЗАЦІЯ З ВАШИМ КАНАЛОМ ДЛЯ ЗАХИСТУ ВІД ПОВТОРІВ -----------------
+# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
 def sync_with_my_channel():
     try:
-        # Читаємо публічну сторінку вашого каналу
         url = "https://t.me/s/kropivnit"
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if resp.status_code == 200:
@@ -190,11 +199,10 @@ def sync_with_my_channel():
                     state["posted_hashes"].append(h)
                     count += 1
             save_state(state)
-            logger.info(f"Синхронізовано {count} свіжих постів з @kropivnit для блокування повторів!")
+            logger.info(f"Синхронізовано {count} постів з каналу для блокування повторів!")
     except Exception as e:
-        logger.error(f"Помилка синхронізації з каналом: {e}")
+        logger.error(f"Помилка синхронізації: {e}")
 
-# Виконуємо синхронізацію одразу при старті
 sync_with_my_channel()
 
 # ----------------- ПАРСИНГ З МЕДІА -----------------
@@ -223,7 +231,6 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                # Тільки свіжі новини до 2 годин
                 if age_seconds > 2.0 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -269,19 +276,19 @@ def scrape_donor(channel_username):
 # ----------------- РЕДАКТОР З ЖИВИМ ЕМОЦІЙНИМ СТИЛЕМ -----------------
 def generate_channel_post(raw_text, recent_titles):
     prompt = f"""Ти — автор і головний редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365".
-Пиши ЖИВОЮ, ЛЮДСЬКОЮ, ЕМОЦІЙНОЮ українською мовою. Твої пости читають сотні тисяч людей.
+Пиши ЖИВОЮ, ЛЮДСЬКОЮ, ЕМОЦІЙНОЮ українською мовою.
 
 ОСЬ ОСТАННІ ТЕМИ В КАНАЛІ (ЯКЩО ТАКЕ ВЖЕ БУЛО — ПИШИ SKIP):
 {json.dumps(recent_titles, ensure_ascii=False)}
 
 КАТЕГОРИЧНО ЗАБОРОНЕНО:
-❌ НІЯКОГО сухого протокольного стилю міліції та канцеляризмів (заборонено слова "– ГВА", "зафіксовано", "громадян", "унаслідок події")!
+❌ НІЯКОГО сухого протокольного стилю (заборонено писати "– ГВА", "зафіксовано", "громадян")!
 ❌ НІЯКОГО суцільного тексту в одне речення! Обов'язково розбивай на 2-3 короткі абзаци з порожніми рядками між ними.
 ❌ НІЯКИХ рамок blockquote!
 
-ЯК МАЄ ВИГЛЯДАТИ СПРАВЖНІЙ ПОСТ (ДИВИСЬ ЗРАЗКИ):
+ЗРАЗКИ ТОГО, ЯК МАЄ ВИГЛЯДАТИ ПОСТ:
 
-Зразок 1 (Обстріли / Трагедія — з людяністю та повітрям):
+Зразок 1 (Обстріли / Трагедія — жива мова з повітрям):
 <b>💥 Росіяни вдарили авіабомбами по Ізюму: є поранені та руйнування</b>
 
 Ворожі удари зруйнували житлові будинки, частина міста залишилася без світла. Наразі відомо про двох постраждалих людей.
@@ -293,7 +300,7 @@ def generate_channel_post(raw_text, recent_titles):
 
 За останні три дні Росія здійснила 78 ударів по об'єктах енергетики України. За даними ДТЕК, це значне збільшення інтенсивності атак на енергетику країни.
 
-Зразок 3 (Політика / Заява — жива цитата з характером):
+Зразок 3 (Політика / Заява):
 «Наші вибори настільки нечесні, що ви навіть не уявляєте», — Трамп.
 
 Тільки не плач, Доні.
@@ -314,7 +321,7 @@ def generate_channel_post(raw_text, recent_titles):
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "Ти топовий автор українського Telegram-каналу. Твій стиль живий, динамічний, патріотичний, з красивою розбивкою на абзаци."},
+                {"role": "system", "content": "Ти топовий автор українського Telegram-каналу. Твій стиль живий, динамічний, з гарними абзацами."},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.3,
