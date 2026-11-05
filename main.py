@@ -1036,4 +1036,10 @@ def run():
     print(f"\n[ЗАВЕРШЕННЯ]: Опубліковано свіжих якісних новин: {published_count}. Чекаємо наступного запуску.")
 
 if __name__ == "__main__":
-    run()
+    print("🚀 Бот запущено на Render у режимі 24/7!")
+    while True:
+        try:
+            run()
+        except Exception as e:
+            print(f"[ЗБІЙ ЦИКЛУ]: {e}")
+        time.sleep(60)  # Перевірка кожні 60 секунд
