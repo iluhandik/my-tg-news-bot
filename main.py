@@ -68,7 +68,6 @@ def get_working_groq_model():
         resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
         if resp.status_code == 200:
             live_ids = [m["id"] for m in resp.json().get("data", [])]
-            # Шукаємо якісну текстову модель
             chat_models = [m for m in live_ids if "whisper" not in m.lower() and "guard" not in m.lower()]
             if chat_models:
                 for m in chat_models:
@@ -103,7 +102,7 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
+    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними"
 }
 
 STATE_FILE = "bot_state.json"
@@ -152,15 +151,13 @@ def get_text_stem_words(text):
     words = text_clean.split()
     return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
 
-# ----------------- РЕГУЛЯРНА СИНХРОНІЗАЦІЯ З ВАШИМ КАНАЛОМ -----------------
+# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
 def sync_with_my_channel(force=False):
     now = time.time()
-    # Синхронізуємося щоразу на старті або раз на 10 хвилин
     if not force and (now - state.get("last_sync_time", 0)) < 600:
         return
 
     try:
-        # Завжди читаємо ваш публічний канал @kropivnit
         url = "https://t.me/s/kropivnit"
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
         if resp.status_code == 200:
@@ -179,37 +176,32 @@ def sync_with_my_channel(force=False):
                 state["recent_channel_posts"] = channel_posts
                 state["last_sync_time"] = now
                 save_state(state)
-                logger.info(f"Синхронізовано {len(channel_posts)} свіжих постів прямо з каналу @kropivnit!")
+                logger.info(f"Синхронізовано {len(channel_posts)} свіжих постів з каналу @kropivnit!")
     except Exception as e:
         logger.error(f"Помилка синхронізації з каналом: {e}")
 
 sync_with_my_channel(force=True)
 
-# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР (ЧИСЛА + СУТНІСТЬ) -----------------
+# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР -----------------
 def is_duplicate_human_logic(candidate_text, past_posts):
     low_cand = candidate_text.lower()
     cand_stems = get_text_stem_words(candidate_text)
     
-    # Шукаємо всі конкретні числа (наприклад 16, 78, 42, 224 тощо)
     cand_numbers = set(re.findall(r'\b\d+\b', low_cand))
-    # Виключаємо дрібні цифри типу 1, 2, 3
     meaningful_numbers = {n for n in cand_numbers if int(n) >= 5}
 
     for past in past_posts:
         low_past = past.lower()
         past_stems = get_text_stem_words(past)
 
-        # 1. ПЕРЕВІРКА ЗА КЛЮЧОВИМИ ЦИФРАМИ ТА СУБ'ЄКТОМ (як $16 млрд від США):
         past_numbers = {n for n in re.findall(r'\b\d+\b', low_past) if int(n) >= 5}
         shared_nums = meaningful_numbers & past_numbers
         if shared_nums:
-            # Якщо збігається специфічне число (наприклад 16) і є хоч 2 спільних слова:
             shared_words = cand_stems & past_stems
             if len(shared_words) >= 2:
                 logger.info(f"Заблоковано повтор за цифрою {shared_nums} та темою: {past}")
                 return True
 
-        # 2. ПЕРЕВІРКА ЗА ЗАГАЛЬНОЮ СХОЖІСТЮ ТЕМИ (Jaccard):
         intersection = len(cand_stems & past_stems)
         union = len(cand_stems | past_stems)
         similarity = intersection / union if union > 0 else 0
@@ -219,7 +211,7 @@ def is_duplicate_human_logic(candidate_text, past_posts):
 
     return False
 
-# ----------------- ПАРСИНГ З ДОНОРІВ (БЕЗ ЧУЖИХ АВАТАРОК) -----------------
+# ----------------- ПАРСИНГ З ДОНОРІВ -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -245,7 +237,6 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                # Новини за останні 3.5 години
                 if age_seconds > 3.5 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -265,8 +256,6 @@ def scrape_donor(channel_username):
                 continue
 
             video_match = re.search(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
-            
-            # ЧІТКИЙ ПОШУК ФОТО (СУВОРО БЕЗ АВАТАРОК!):
             photo_match = re.search(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
             media_type = None
@@ -290,28 +279,38 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН З ПОВНИМ КОНТЕКСТОМ КАНАЛУ -----------------
+# ----------------- РЕДАКТОР НОВИН З ЖИРНИМИ АКЦЕНТАМИ ТА ЦИТАТАМИ -----------------
 def generate_channel_post(raw_text, past_posts):
-    # Показуємо моделі останні 15 новин з каналу
-    channel_history = "\n".join([f"• {p}" for p in past_posts[-16:]])
+    channel_history = "\n".join([f"• {p}" for p in past_posts[-15:]])
 
-    prompt = f"""Ти — випусковий редактор новинного Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє головне завдання — відсікти повтори і написати ЧИСТУ ФАКТИЧНУ НОВИНУ.
+    prompt = f"""Ти — випусковий редактор провідного українського новинного Telegram-каналу "NEWS УКРАЇНА 365".
+Твоє завдання — перетворити текст у красиву, солідну новину з акцентами та цитатами.
 
 ОСЬ НОВИНИ, ЯКІ ВЖЕ ВИЙШЛИ В НАШОМУ КАНАЛІ:
 {channel_history}
 
-СУВОРЕ ПРАВИЛО ЗВІРКИ (ДУМАТИ ЯК ЛЮДИНА!):
-Уважно порівняй суть нової новини зі стрічкою вище.
-- Якщо новина розповідає про ТУ САМУ ТЕМУ, подію чи заяву (наприклад, про $16 млрд допомоги від США, навіть якщо з'явилися нові документи чи таблиці) — це ПОВТОР! Відповідай ТІЛЬКИ ОДНИМ СЛОВОМ: SKIP
-- Публікуй тільки якщо це ДІЙСНО НОВА подія або рішення.
+СУВОРЕ ПРАВИЛО ЗВІРКИ:
+- Якщо новина розповідає про ТУ САМУ ТЕМУ або подію — пиши ТІЛЬКИ: SKIP
+- Якщо це нова подія — сформуй якісний пост.
 
-СТИЛЬ ПОСТУ:
-1. Жирний заголовок у <b>...</b> з емодзі.
+ПРАВИЛА ОФОРМЛЕННЯ (СТИЛЬ ТОП-КАНАЛІВ):
+1. ПЕРШИЙ РЯДОК — завжди жирний заголовок у <b>...</b> з тематичним емодзі.
 2. Порожній рядок.
-3. 1-2 інформативні абзаци фактів з прямою мовою («...», — Прізвище).
-❌ ЖОДНИХ особистих думок, моралізаторства чи оцінок!
-❌ ЖОДНИХ слів "– ГВА", "позор", "толпа", рамок blockquote.
+3. ОСНОВНИЙ ТЕКСТ — 1-2 повні інформативні абзаци.
+   - Виділяй тегами <b>...</b> ГОЛОВНІ СЛОВА, ключові цифри та прізвища (наприклад: <b>ЗСУ</b>, <b>$16 млрд</b>, <b>понад 100 людей</b>).
+   - Якщо є пряма мова — обов'язково оформлюй її як гарну цитату в лапках «...» з тире та автором в кінці:
+     «Текст цитати...», — <b>Прізвище/Посада</b>.
+4. КАТЕГОРИЧНО ЗАБОРОНЕНО:
+   ❌ Слово "ВСУ" — ТІЛЬКИ "ЗСУ"!
+   ❌ Росіянізми: "толпа" (тільки "натовп"), "позор" (тільки "ганьба"), "у даний момент" (наразі).
+   ❌ НІЯКИХ рамок blockquote!
+
+ЗРАЗОК ОФОРМЛЕННЯ:
+<b>🚨 Обшуки у приміщеннях «Київтеплоенерго»</b>
+
+Правоохоронці проводять масштабні обшуки в офісах та помешканнях керівництва <b>«Київтеплоенерго»</b>. Слідчі дії стосуються проектів <b>Плану енергетичної стійкості</b> столиці.
+
+«Ми співпрацюємо зі слідством та надаємо всі необхідні документи», — повідомили в <b>прес-службі підприємства</b>.
 
 ТЕКСТ НОВОЇ НОВИНИ:
 {raw_text}
@@ -330,13 +329,13 @@ def generate_channel_post(raw_text, past_posts):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти професійний український новинний редактор. Твоє першочергове завдання — не допускати повторів новин у каналі під жодним приводом."},
+                    {"role": "system", "content": "Ти топовий український новинний редактор. Твої тексти солідні, структуровані, з виділеними жирним ключовими словами та красивими цитатами."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.15,
-                "max_tokens": 380
+                "max_tokens": 700
             }
-            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
+            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=22)
             if resp.status_code == 200:
                 data = resp.json()
                 result = data['choices'][0]['message']['content'].strip()
@@ -344,11 +343,25 @@ def generate_channel_post(raw_text, past_posts):
                     return "SKIP"
                 result = re.sub(r'</?blockquote[^>]*>', '', result)
                 
+                # ЖОРСТКИЙ АВТОКОРЕКТОР (ВСУ -> ЗСУ ТА КАЛЬКИ):
+                result = re.sub(r'\bвсу\b', 'ЗСУ', result, flags=re.IGNORECASE)
+                result = re.sub(r'\bВСУ\b', 'ЗСУ', result)
                 result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
                 result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
                 result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
+                result = re.sub(r'у даний момент', 'наразі', result, flags=re.IGNORECASE)
                 
-                return result.strip()
+                # Захист від обірваних речень
+                lines = result.strip().split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    line_str = line.strip()
+                    if line_str and not line_str.startswith('<b>') and len(line_str) < 25 and not line_str.endswith(('.', '!', '?', '»', '”', '"')):
+                        continue
+                    cleaned_lines.append(line)
+                
+                final_text = "\n".join(cleaned_lines).strip()
+                return final_text
             elif resp.status_code == 429:
                 time.sleep(6)
             else:
@@ -401,11 +414,10 @@ def post_to_telegram(text, media_type=None, media_url=None):
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Бот запущено з регулярною синхронізацією каналу...")
+    logger.info("Бот запущено успішно...")
 
     while True:
         try:
-            # Оновлюємо стрічку з вашого каналу кожні 10 хвилин
             sync_with_my_channel()
 
             now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -432,12 +444,10 @@ def main_loop():
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                # 1. Швидкий людський фільтр за числами та ключовими темами каналу
                 if is_duplicate_human_logic(item['text'], past_posts):
                     state["posted_hashes"].append(h)
                     continue
 
-                # 2. Нейромережевий аналіз на повтор по суті
                 res = generate_channel_post(item['text'], past_posts)
                 
                 if res == "SKIP":
