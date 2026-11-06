@@ -96,20 +96,23 @@ def get_working_groq_model():
     ACTIVE_MODEL = "qwen/qwen3.8-27b"
     return ACTIVE_MODEL
 
-# ----------------- ФІЛЬТР СПАМУ, САМОПІАРУ ТА БРУДУ -----------------
+# ----------------- ФІЛЬТР СПАМУ ТА БРУДУ -----------------
 JUNK_PHRASES = [
     # Реклама, казино, ставки
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
     "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
     "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
-    # Самопіар політиків та мерів (джинса)
+    # Самопіар політиків
     "кличко передав", "мер повідомив, що передали", "громада передала", "київрада виділила",
     "передав допомогу бійцям", "з початку року громада надала", "бахматов", "статки на мільйони",
+    # Побутовий міський трафік
+    "південному мосту", "північний міст", "міст патона", "метро міст",
+    "смуг руху", "смугу руху", "рух транспорту з лівого", "правий берег києва", "лівий берег києва",
+    "проїзд у громадському транспорті", "вартість проїзду", "паркування в",
     # Жовта преса і погода
     "голлівуд", "шекспірівськ", "гордон назвав", "прогноз погоди", "синоптики попередили",
     "магнітні бурі", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
-    "п'яний водій", "врізався в стовп", "побив сусіда", "повітряна тривога", 
-    "відбій тривоги", "чисто по ракетах", "18+", "шок контент"
+    "повітряна тривога", "відбій тривоги", "чисто по ракетах", "18+", "шок контент"
 ]
 
 STOP_WORDS = {
@@ -158,11 +161,17 @@ def clean_raw_text(text):
 
 def is_junk_news(text):
     low = text.lower()
-    if len(text) < 55:
+    if len(text) < 45:
         return True
+    
+    # Якщо масштабна подія чи ДТП — пропускаємо
+    viral_markers = ["масштабн", "крише", "даху", "перекинувся", "трамвай", "автобус", "зіткнулися", "удар", "приліт", "ракета", "шахед", "вибух", "пожеж", "загибл", "поранен"]
+    if any(vm in low for vm in viral_markers):
+        return False
+
     for phrase in JUNK_PHRASES:
         if phrase in low:
-            logger.info(f"Відсіяно піар/сміття за фразою '{phrase}'.")
+            logger.info(f"Відсіяно шум: '{phrase}'.")
             return True
     return False
 
@@ -211,7 +220,7 @@ def is_duplicate_human_logic(candidate_text, past_posts):
 
     return False
 
-# ----------------- ПАРСИНГ З ДОНОРІВ З ФІЛЬТРАЦІЄЮ ДУБЛІКАТІВ МЕДІА -----------------
+# ----------------- ПАРСИНГ З ДОНОРІВ З ПОВНИМ ЗАХОПЛЕННЯМ ВІДЕО ТА ОБКЛАДИНОК -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -256,10 +265,13 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            raw_videos = re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
-            raw_photos = re.findall(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
+            # 1. Пошук файлів відео (mp4)
+            raw_videos = re.findall(r'<(?:video|source)[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            
+            # 2. Пошук фото ТА обкладинок відеоплеєра (video_thumb):
+            raw_photos = re.findall(r'class="[^"]*(?:tgme_widget_message_photo_wrap|tgme_widget_message_video_thumb)[^"]*"[^>]*style="[^"]*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
-            # ЗАХИСТ ВІД ОДНАКОВИХ ВІДЕО ТА ФОТО (ТІЛЬКИ УНІКАЛЬНІ URL):
+            # Формуємо список тільки унікальних медіафайлів
             media_list = []
             seen_urls = set()
 
@@ -268,6 +280,7 @@ def scrape_donor(channel_username):
                     seen_urls.add(v_url)
                     media_list.append({"type": "video", "url": v_url})
 
+            # Якщо відео-файлів не знайдено або як фото-ряд — додаємо обкладинки/фото:
             for p_url in raw_photos:
                 if p_url not in seen_urls:
                     seen_urls.add(p_url)
@@ -288,28 +301,26 @@ def generate_channel_post(raw_text, past_posts):
     channel_history = "\n".join([f"• {p[:120]}" for p in past_posts[-15:]])
 
     prompt = f"""Ти — випусковий редактор провідного всеукраїнського новинного Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — перетворити текст у ЧЕСНУ, ТОЧНУ новину БЕЗ ДОМИСЛІВ ТА ВИГАДОК.
+Твоє завдання — перетворити текст у ЧЕСНУ, ДИНАМІЧНУ українську новину.
 
 ОСЬ ОСТАННІ НОВИНИ КАНАЛУ (ЯКЩО ЦЯ Ж САМА ПОДІЯ ВЖЕ БУЛА — ПИШИ ТІЛЬКИ SKIP):
 {channel_history}
 
-ЗАЛІЗНІ ПРАВИЛА ДОСТОВІРНОСТІ:
-1. ПИШИ ВИКЛЮЧНО ТЕ, ЩО Є В ТЕКСТІ НОВИНИ!
-2. ❌ КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати бойові дії чи бої біля міст!
-   - Якщо в місті були вибухи чи обстріл — пиши ТІЛЬКИ про обстріл і вибухи!
-   - НІКОЛИ не пиши, що «тривають бойові дії в районі міста», якщо це тилове місто під обстрілом!
-3. ❌ КАТЕГОРИЧНО ЗАБОРОНЕНО писати шаблонну воду:
-   - "Ситуація залишається напруженою / складною"
-   - "Слідкуємо за розвитком подій"
-   - "Обставини з'ясовуються"
-   ПРАВИЛО: Закінчуй пост ОДРАЗУ на конкретному факті або прямій мові!
-4. ❌ Заборонено піар мерів, слова "ВСУ" (тільки ЗСУ), "толпа", "позор", рамки blockquote.
+ПРАВИЛА ВІДБОРУ:
+1. ПУБЛІКУЙ:
+   - Фронт, ЗСУ, бойові дії, удари та заяви світових лідерів (Трамп, Рютте, Зеленський).
+   - Гучні надзвичайні події в містах: масштабні ДТП (з участю транспорту, кілька авто, машини на даху), пожежі, аварії з відео.
+2. ❌ ВІДХИЛЯЙ (пиши ТІЛЬКИ SKIP):
+   - Буденний міський шум (відкриття смуги на мосту, ремонт труб КМДА, міські тарифи).
+   - Політичний самопіар мерів і партій.
 
 ПРАВИЛА ОФОРМЛЕННЯ:
-- Перший рядок: жирний заголовок у <b>...</b> з емодзі.
+- Перекладай чистою українською мовою (якщо вхідний текст російською).
+- Перший рядок: жирний заголовок у <b>...</b> з емодзі (🚗, 💥, ⚡️, 🇺🇸).
 - Порожній рядок.
-- 1-2 короткі фактичні абзаци. Виділяй жирним <b>...</b> головні цифри, ЗСУ.
-- Пряма мова: «Текст цитати...», — <b>Прізвище</b>.
+- 1-2 короткі фактичні абзаци. Виділяй жирним <b>...</b> ключові деталі, цифри.
+- Закінчуй пост одразу на фактах, без шаблонної води наприкінці!
+❌ Заборонено: "ВСУ" (тільки ЗСУ), "толпа", "позор", рамки blockquote.
 
 ТЕКСТ НОВИНИ:
 {raw_text}
@@ -328,7 +339,7 @@ def generate_channel_post(raw_text, past_posts):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти строгий новинний фактчекер. Ти ніколи не вигадуєш факти про лінію фронту чи бойові дії біля тилових міст, яких немає у вихідному тексті."},
+                    {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти виразні, динамічні, без штампів та русизмів."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.1,
@@ -342,17 +353,13 @@ def generate_channel_post(raw_text, past_posts):
                     return "SKIP"
                 result = re.sub(r'</?blockquote[^>]*>', '', result)
                 
-                # Заміна зірочок на HTML bold
                 result = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', result)
-                
-                # Автокоректор
                 result = re.sub(r'\bвсу\b', 'ЗСУ', result, flags=re.IGNORECASE)
                 result = re.sub(r'\bВСУ\b', 'ЗСУ', result)
                 result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
                 result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
                 result = re.sub(r'у даний момент', 'наразі', result, flags=re.IGNORECASE)
                 
-                # ПОВНЕ ВИДАЛЕННЯ ВИГАДАНИХ БОЇВ ТА ВОДИ:
                 cliche_patterns = [
                     r'[\.,]?\s*тривають бойові дії в районі міста[\.,]?',
                     r'[\.,]?\s*тривають бойові дії біля міста[\.,]?',
@@ -385,13 +392,13 @@ def generate_channel_post(raw_text, past_posts):
 
     return None
 
-# ----------------- ВІДПРАВКА В TELEGRAM -----------------
+# ----------------- НАДІЙНА ВІДПРАВКА МЕДІА (З АВТОФОЛБЕКОМ НА ФОТО) -----------------
 def post_to_telegram(text, media_list=[]):
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     caption = text[:1020]
     
     try:
-        # 1. АЛЬБОМ (2 ТА БІЛЬШЕ РІЗНИХ ФАЙЛІВ):
+        # 1. АЛЬБОМ (2 І БІЛЬШЕ МЕДІА)
         if len(media_list) > 1:
             media_group = []
             files = {}
@@ -419,28 +426,41 @@ def post_to_telegram(text, media_list=[]):
                 if res.status_code == 200:
                     return True
 
-        # 2. ОДИН ФАЙЛ:
+        # 2. ОДИН МЕДІАФАЙЛ (З ПОВНИМ РЕЗЕРВОМ НА ФОТО):
         if media_list:
             item = media_list[0]
-            if item["type"] == 'photo':
-                img_res = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-                if img_res.status_code == 200:
-                    files = {"photo": ("image.jpg", img_res.content, "image/jpeg")}
-                    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-                    res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
-                    if res.status_code == 200:
-                        return True
-
+            
+            # Якщо це відео
             if item["type"] == 'video':
-                vid_res = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
-                    files = {"video": ("video.mp4", vid_res.content, "video/mp4")}
-                    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-                    res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
-                    if res.status_code == 200:
-                        return True
+                # Спочатку качаємо і шлемо як відео
+                try:
+                    vid_res = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                    if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
+                        files = {"video": ("video.mp4", vid_res.content, "video/mp4")}
+                        data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                        res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
+                        if res.status_code == 200:
+                            return True
+                except Exception:
+                    pass
 
-        # 3. ТЕКСТ:
+            # Якщо це фото (або відео не пройшло, але в списку є обкладинка/фото):
+            photo_candidates = [m for m in media_list if m["type"] == 'photo']
+            p_url = photo_candidates[0]["url"] if photo_candidates else (item["url"] if item["type"] == 'photo' else None)
+
+            if p_url:
+                try:
+                    img_res = requests.get(p_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+                    if img_res.status_code == 200:
+                        files = {"photo": ("image.jpg", img_res.content, "image/jpeg")}
+                        data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                        res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
+                        if res.status_code == 200:
+                            return True
+                except Exception:
+                    pass
+
+        # 3. ТЕКСТОВИЙ РЕЗЕРВ (лише якщо взагалі не було медіа):
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
