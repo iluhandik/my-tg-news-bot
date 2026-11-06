@@ -52,19 +52,16 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ----------------- БУДИЛЬНИК ПРОТИ СНУ RENDER (KEEP-ALIVE 24/7) -----------------
+# ----------------- БУДИЛЬНИК ПРОТИ СНУ RENDER -----------------
 def keep_alive_ping():
-    # Render автоматично задає RENDER_EXTERNAL_URL, або беремо ваше посилання
     app_url = os.getenv("RENDER_EXTERNAL_URL") or "https://my-tg-news-bot-53bh.onrender.com"
-    # Перша пауза 2 хвилини після старту
     time.sleep(120)
     while True:
         try:
             resp = requests.get(app_url, timeout=15)
-            logger.info(f"Будильник спрацював ({resp.status_code}): Render не спить, бот активний 24/7!")
-        except Exception as e:
-            logger.warning(f"Будильник пінг: {e}")
-        # Стукаємо кожні 8 хвилин (Render засинає через 15 хв, тому 8 хв — ідеально)
+            logger.info(f"Будильник активний ({resp.status_code}): сервер онлайн 24/7.")
+        except Exception:
+            pass
         time.sleep(480)
 
 threading.Thread(target=keep_alive_ping, daemon=True).start()
@@ -99,18 +96,23 @@ def get_working_groq_model():
     ACTIVE_MODEL = "qwen/qwen3.8-27b"
     return ACTIVE_MODEL
 
-# ----------------- ФІЛЬТР СПАМУ ТА БРУДУ -----------------
+# ----------------- ФІЛЬТР СПАМУ, САМОПІАРУ ТА БРУДУ -----------------
 JUNK_PHRASES = [
+    # Реклама, казино, ставки
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
     "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
     "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
-    "статки на мільйони", "збагатився під час війни", "копати ями для туалетів",
+    # Самопіар політиків та мерів (джинса)
+    "кличко передав", "мер повідомив, що передали", "громада передала", "київрада виділила",
+    "передав допомогу бійцям", "з початку року громада надала", "бахматов", "статки на мільйони",
+    # Жовта преса і погода
     "голлівуд", "шекспірівськ", "гордон назвав", "прогноз погоди", "синоптики попередили",
     "магнітні бурі", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
     "п'яний водій", "врізався в стовп", "побив сусіда", "повітряна тривога", 
     "відбій тривоги", "чисто по ракетах", "18+", "шок контент"
 ]
 
+# Вилучаємо загальні слова війни з підрахунку схожості (щоб новина Рютте не блокувалася через новину Трампа!)
 STOP_WORDS = {
     "і", "й", "та", "в", "у", "на", "з", "із", "зі", "до", "по", "за", "про", "проти",
     "від", "під", "над", "при", "через", "після", "для", "як", "що", "щоб", "бо", "тому",
@@ -118,7 +120,10 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
+    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними", "сьогодні", "наразі",
+    # Загальні слова, через які блокувалися різні заяви:
+    "війна", "війни", "війні", "війною", "україна", "україни", "україні", "росія", "росії",
+    "росією", "рф", "мир", "миру", "мирний", "мирна", "угода", "угоди", "угоду", "заява"
 }
 
 STATE_FILE = "bot_state.json"
@@ -159,6 +164,7 @@ def is_junk_news(text):
         return True
     for phrase in JUNK_PHRASES:
         if phrase in low:
+            logger.info(f"Відсіяно піар/сміття за фразою '{phrase}'.")
             return True
     return False
 
@@ -167,10 +173,18 @@ def get_text_stem_words(text):
     words = text_clean.split()
     return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
 
-# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР -----------------
+# Ключові спікери — заяви РІЗНИХ спікерів ніколи не дублюють одна одну!
+SPEAKERS = ["трамп", "зеленськ", "рютт", "путін", "байден", "сирськ", "буданов", "шольц", "макрон"]
+
+def extract_speakers(text):
+    low = text.lower()
+    return {s for s in SPEAKERS if s in low}
+
+# ----------------- РОЗУМНИЙ АНАЛІЗ НА ПОВТОР -----------------
 def is_duplicate_human_logic(candidate_text, past_posts):
     low_cand = candidate_text.lower()
     cand_stems = get_text_stem_words(candidate_text)
+    cand_speakers = extract_speakers(candidate_text)
     
     cand_numbers = set(re.findall(r'\b\d+\b', low_cand))
     meaningful_numbers = {n for n in cand_numbers if int(n) >= 5}
@@ -178,7 +192,13 @@ def is_duplicate_human_logic(candidate_text, past_posts):
     for past in past_posts:
         low_past = past.lower()
         past_stems = get_text_stem_words(past)
+        past_speakers = extract_speakers(past)
 
+        # ЯКЩО СПІКЕРИ РІЗНІ (наприклад, Рютте проти Трампа) — ЦЕ НЕ ДУБЛІКАТ!
+        if cand_speakers and past_speakers and not (cand_speakers & past_speakers):
+            continue
+
+        # Збіг за конкретними унікальними числами ($16 млрд тощо)
         past_numbers = {n for n in re.findall(r'\b\d+\b', low_past) if int(n) >= 5}
         shared_nums = meaningful_numbers & past_numbers
         if shared_nums:
@@ -187,10 +207,11 @@ def is_duplicate_human_logic(candidate_text, past_posts):
                 logger.info(f"Повтор за числом {shared_nums} та темою: {past[:60]}")
                 return True
 
+        # Смислова схожість суттєвих слів (без загальних слів війни)
         intersection = len(cand_stems & past_stems)
         union = len(cand_stems | past_stems)
         similarity = intersection / union if union > 0 else 0
-        if similarity >= 0.28:
+        if similarity >= 0.35:
             logger.info(f"Смисловий повтор ({similarity:.2f}) з: {past[:60]}")
             return True
 
@@ -222,7 +243,7 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                # Свіжі новини за останні 3.5 години
+                # Новини за останні 3.5 години
                 if age_seconds > 3.5 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -241,7 +262,7 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            # Медіа (без чужих аватарок)
+            # Медіа (без аватарок)
             videos = re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
             photos = re.findall(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
@@ -261,29 +282,29 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН ВСЕУКРАЇНСЬКОГО МАСШТАБУ -----------------
+# ----------------- РЕДАКТОР НОВИН -----------------
 def generate_channel_post(raw_text, past_posts):
     channel_history = "\n".join([f"• {p[:120]}" for p in past_posts[-15:]])
 
     prompt = f"""Ти — випусковий редактор провідного всеукраїнського новинного Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — відбирати та писати новини ВИКЛЮЧНО ВСЕУКРАЇНСЬКОГО ТА ГЕОПОЛІТИЧНОГО МАСШТАБУ.
+Твоє завдання — зробити якісну, солідну новину всеукраїнського значення.
 
-ОСЬ ОСТАННІ НОВИНИ КАНАЛУ (ЯКЩО ЦЯ ТЕМА ВЖЕ БУЛА — ПИШИ ТІЛЬКИ SKIP):
+ОСЬ ОСТАННІ НОВИНИ КАНАЛУ (ЯКЩО ЦЯ Ж САМА ПОДІЯ ВЖЕ БУЛА — ПИШИ ТІЛЬКИ SKIP):
 {channel_history}
 
 СУВОРІ ПРАВИЛА ВІДБОРУ:
-1. ПУБЛІКУЙ новини, важливі для всієї України:
-   - Фронт, ЗСУ, бойові дії, ключові заяви перших осіб держави (Зеленський, командування, уряд).
-   - Ракетні та дронові удари, прильоти, наслідки по містах, загальнонаціональна ситуація в енергетиці від Укренерго.
-   - Велика міжнародна політика (США, Трамп, військова допомога, санкції, переговори).
+1. ПУБЛІКУЙ:
+   - Гучні заяви світових лідерів (Рютте/НАТО, Трамп, США, ЄС, Зеленський).
+   - Фронт, операції ЗСУ, бойові дії, наслідки атак та обстрілів.
+   - Гучні суспільно важливі резонансні події та відео в Україні (інциденти, скандали, надзвичайні події).
 2. ВІДХИЛЯЙ (пиши SKIP):
-   - Будь-який дрібний міський комунальний або побутовий шум будь-якого міста (ремонт труб, локальні відключення двох вулиць, зміна маршруту міських автобусів, дрібні протести).
-   - Замовний чорний піар, джинсу та плітки.
+   - Політичний самопіар мерів і партій (хтось передав дрони чи прозвітував про витрачені кошти мерії).
+   - Дрібний комунальний побут (ремонт труби, планове відключення двох будинків).
 
-ОФОРМЛЕННЯ:
-- Перший рядок: завжди жирний заголовок у <b>...</b> з тематичним емодзі.
+ПРАВИЛА ОФОРМЛЕННЯ (HTML):
+- Перший рядок: жирний заголовок у <b>...</b> з емодзі.
 - Порожній рядок.
-- 1-2 інформативні абзаци. Виділяй жирним <b>...</b> головні факти, ключові цифри, ЗСУ.
+- 1-2 інформативні абзаци. Виділяй жирним <b>...</b> головні факти, цифри, прізвища (НЕ використовуй зірочки **!).
 - Пряма мова: «Текст цитати...», — <b>Прізвище</b>.
 ❌ Заборонено: "ВСУ" (тільки ЗСУ), "толпа", "позор", рамки blockquote.
 
@@ -304,7 +325,7 @@ def generate_channel_post(raw_text, past_posts):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти професійний новинний редактор всеукраїнського масштабу. Твоя мова чиста, витримана, лаконічна, без дріб'язковості."},
+                    {"role": "system", "content": "Ти топовий український новинний редактор. Твоя мова чиста, витримана, без самопіару політиків і без зірочок у форматуванні."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.15,
@@ -318,12 +339,14 @@ def generate_channel_post(raw_text, past_posts):
                     return "SKIP"
                 result = re.sub(r'</?blockquote[^>]*>', '', result)
                 
-                # Жорсткий автокоректор
+                # АВТОМАТИЧНА ЗАМІНА ЗІРОЧОК НА ЖИРНИЙ HTML:
+                result = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', result)
+                
+                # Автокоректор
                 result = re.sub(r'\bвсу\b', 'ЗСУ', result, flags=re.IGNORECASE)
                 result = re.sub(r'\bВСУ\b', 'ЗСУ', result)
                 result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
                 result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
-                result = re.sub(r'картини жахливі', 'ситуація напружена', result, flags=re.IGNORECASE)
                 result = re.sub(r'у даний момент', 'наразі', result, flags=re.IGNORECASE)
                 
                 # Захист від обірваних речень
@@ -417,9 +440,8 @@ def post_to_telegram(text, media_list=[]):
 def main_loop():
     logger.info("Бот запущено успішно...")
 
-    # Захист при першому старті від старих новин
     if not state.get("initialized"):
-        logger.info("Ініціалізація: запам'ятовуємо старі повідомлення донорів...")
+        logger.info("Ініціалізація: запам'ятовуємо старі новини донорів...")
         for donor in DONOR_CHANNELS:
             items = scrape_donor(donor)
             for item in items:
@@ -445,7 +467,7 @@ def main_loop():
                         all_candidates.append((h, item))
                 time.sleep(1.2)
 
-            logger.info(f"Знайдено нових кандидатів: {len(all_candidates)} (Ніч: {is_night})")
+            logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
             max_posts_this_cycle = 3 if len(all_candidates) >= 5 and not is_night else 1
             posts_published = 0
