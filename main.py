@@ -142,23 +142,30 @@ def clean_raw_text(text):
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
-# Фільтр локальної комуналки та дрібних міських скандалів
+# ТОЧНИЙ ФІЛЬТР: відсікаємо комуналку ТІЛЬКИ якщо вона локальна для одного міста
 def is_local_communal_junk(text):
     low = text.lower()
-    # Якщо є приліт, ракетний удар чи руйнування — це НАДЗВИЧАЙНА подія
+    # Якщо надзвичайна подія (удар, приліт, ракета, жертви, пожежа) — пропускаємо обов'язково!
     emergency_markers = ["удар", "приліт", "ракета", "шахед", "вибух", "пожеж", "атака", "загибл", "поранен", "руйнуван"]
     if any(em in low for em in emergency_markers):
         return False
 
-    communal_words = [
-        "екстрені відключення", "аварійні відключення", "графіки відключень", 
-        "перебої у постачанні", "постачання світла", "водопостачан", "порив мереж",
-        "ремонтні роботи", "комунальники", "перекрили дорогу", "перекриття дороги",
-        "перекрили рух", "виноградар", "троєщин", "київтеплоенерго",
-        "раціонально використовувати електроприлади", "навантаження на мережі"
+    local_city_markers = [
+        "в столиці", "у києві", "київ:", "києві", "виноградар", "троєщин", "борщагівк",
+        "в одесі", "у львові", "в дніпрі", "київтеплоенерго", "дтек київськ"
     ]
-    if any(cw in low for cw in communal_words):
-        logger.info("Відсіяно локальну комуналку / побутовий протест.")
+    
+    communal_markers = [
+        "екстрені відключення", "аварійні відключення", "перебої у постачанні",
+        "водопостачан", "порив мереж", "комунальники", "перекрили дорогу",
+        "перекриття дороги", "перекрили рух", "раціонально використовувати"
+    ]
+
+    is_local = any(c in low for c in local_city_markers)
+    is_communal = any(m in low for m in communal_markers)
+
+    if is_local and is_communal:
+        logger.info("Відсіяно локальну міську комуналку.")
         return True
 
     return False
@@ -179,7 +186,7 @@ def get_text_stem_words(text):
     words = text_clean.split()
     return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
 
-# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР (ПОВНИЙ ТЕКСТ + ЧИСЛА) -----------------
+# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР -----------------
 def is_duplicate_human_logic(candidate_text, past_posts):
     low_cand = candidate_text.lower()
     cand_stems = get_text_stem_words(candidate_text)
@@ -191,7 +198,6 @@ def is_duplicate_human_logic(candidate_text, past_posts):
         low_past = past.lower()
         past_stems = get_text_stem_words(past)
 
-        # 1. Якщо однакове рідкісне число (наприклад 16 млрд) і схожа тема
         past_numbers = {n for n in re.findall(r'\b\d+\b', low_past) if int(n) >= 5}
         shared_nums = meaningful_numbers & past_numbers
         if shared_nums:
@@ -200,11 +206,10 @@ def is_duplicate_human_logic(candidate_text, past_posts):
                 logger.info(f"Заблоковано повтор за цифрою {shared_nums} та темою: {past[:60]}")
                 return True
 
-        # 2. Смислова схожість слів
         intersection = len(cand_stems & past_stems)
         union = len(cand_stems | past_stems)
         similarity = intersection / union if union > 0 else 0
-        if similarity >= 0.26:
+        if similarity >= 0.28:
             logger.info(f"Заблоковано смисловий повтор ({similarity:.2f}) з: {past[:60]}")
             return True
 
@@ -286,8 +291,9 @@ def generate_channel_post(raw_text, past_posts):
 {channel_history}
 
 СУВОРІ ПРАВИЛА ФІЛЬТРАЦІЇ:
-- Якщо новина розповідає про ТУ САМУ ТЕМУ або подію (наприклад, $16 млрд допомоги США чи перекриття дороги) — пиши ТІЛЬКИ: SKIP
-- КАТЕГОРИЧНО ЗАБОРОНЕНО локальну побутову комуналку та протести через світло — пиши SKIP!
+- Якщо новина розповідає про ТУ САМУ ТЕМУ або подію — пиши ТІЛЬКИ: SKIP
+- КАТЕГОРИЧНО ЗАБОРОНЕНО суто локальну міську комуналку (екстрені відключення світла в окремому районі/місті) — пиши SKIP!
+  (Виняток: загальноукраїнські графіки для всієї країни або ракетні удари — публікуй).
 - КАТЕГОРИЧНО ЗАБОРОНЕНО політичну заказуху та чорний піар — пиши: SKIP!
 
 ПРАВИЛА ОФОРМЛЕННЯ:
@@ -365,7 +371,7 @@ def post_to_telegram(text, media_list=[]):
     caption = text[:1020]
     
     try:
-        # АЛЬБОМИ (2 І БІЛЬШЕ ФОТО/ВІДЕО):
+        # АЛЬБОМИ:
         if len(media_list) > 1:
             media_group = []
             files = {}
@@ -431,11 +437,9 @@ def post_to_telegram(text, media_list=[]):
 def main_loop():
     logger.info("Бот запущено успішно...")
 
-    # ЗАХИСТ ВІД АМНЕЗІЇ (COLD-START SHIELD):
-    # При першому старті запам'ятовуємо всі наявні повідомлення донорів як вже прочитані,
-    # щоб НЕ викидати старі ранкові новини при оновленні сервера!
+    # Ініціалізація при старті:
     if not state.get("initialized"):
-        logger.info("Ініціалізація бази: скануємо донорів, щоб не постити старі новини після перезапуску...")
+        logger.info("Ініціалізація: запам'ятовуємо старі новини донорів, щоб не постити дублі при старті...")
         for donor in DONOR_CHANNELS:
             items = scrape_donor(donor)
             for item in items:
@@ -444,7 +448,7 @@ def main_loop():
             time.sleep(0.5)
         state["initialized"] = True
         save_state(state)
-        logger.info("Ініціалізація завершена! Тепер публікуватимуться ВИКЛЮЧНО НОВІ події, які з'являться відтепер.")
+        logger.info("Ініціалізація завершена. Публікуватимуться тільки свіжі події!")
 
     while True:
         try:
@@ -472,7 +476,6 @@ def main_loop():
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                # Перевірка на повтор за повним змістом та цифрами
                 if is_duplicate_human_logic(item['text'], past_posts):
                     state["posted_hashes"].append(h)
                     continue
@@ -501,7 +504,6 @@ def main_loop():
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
-                    # Зберігаємо повний текст новини (перші 250 символів), щоб бот точно пам'ятав цифри і суть
                     clean_content = re.sub(r'<[^>]+>', '', formatted_post)[:250]
                     state.setdefault("recent_channel_posts", []).append(clean_content)
                     past_posts.append(clean_content)
