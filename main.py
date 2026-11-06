@@ -211,7 +211,7 @@ def is_duplicate_human_logic(candidate_text, past_posts):
 
     return False
 
-# ----------------- ПАРСИНГ З ДОНОРІВ -----------------
+# ----------------- ПАРСИНГ З ДОНОРІВ З ФІЛЬТРАЦІЄЮ ДУБЛІКАТІВ МЕДІА -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -256,14 +256,22 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            videos = re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
-            photos = re.findall(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
+            raw_videos = re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            raw_photos = re.findall(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
+            # ЗАХИСТ ВІД ОДНАКОВИХ ВІДЕО ТА ФОТО (ТІЛЬКИ УНІКАЛЬНІ URL):
             media_list = []
-            for v_url in videos:
-                media_list.append({"type": "video", "url": v_url})
-            for p_url in photos:
-                media_list.append({"type": "photo", "url": p_url})
+            seen_urls = set()
+
+            for v_url in raw_videos:
+                if v_url not in seen_urls:
+                    seen_urls.add(v_url)
+                    media_list.append({"type": "video", "url": v_url})
+
+            for p_url in raw_photos:
+                if p_url not in seen_urls:
+                    seen_urls.add(p_url)
+                    media_list.append({"type": "photo", "url": p_url})
 
             results.append({
                 "channel": channel_username,
@@ -275,7 +283,7 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН З СУВОРИМ ФАКТЧЕКІНГОМ -----------------
+# ----------------- РЕДАКТОР НОВИН -----------------
 def generate_channel_post(raw_text, past_posts):
     channel_history = "\n".join([f"• {p[:120]}" for p in past_posts[-15:]])
 
@@ -288,10 +296,10 @@ def generate_channel_post(raw_text, past_posts):
 ЗАЛІЗНІ ПРАВИЛА ДОСТОВІРНОСТІ:
 1. ПИШИ ВИКЛЮЧНО ТЕ, ЩО Є В ТЕКСТІ НОВИНИ!
 2. ❌ КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати бойові дії чи бої біля міст!
-   - Якщо в місті були вибухи, прильоти чи ракетні удари — пиши ТІЛЬКИ про обстріл і вибухи!
+   - Якщо в місті були вибухи чи обстріл — пиши ТІЛЬКИ про обстріл і вибухи!
    - НІКОЛИ не пиши, що «тривають бойові дії в районі міста», якщо це тилове місто під обстрілом!
 3. ❌ КАТЕГОРИЧНО ЗАБОРОНЕНО писати шаблонну воду:
-   - "Ситуація залишається напруженою"
+   - "Ситуація залишається напруженою / складною"
    - "Слідкуємо за розвитком подій"
    - "Обставини з'ясовуються"
    ПРАВИЛО: Закінчуй пост ОДРАЗУ на конкретному факті або прямій мові!
@@ -323,7 +331,7 @@ def generate_channel_post(raw_text, past_posts):
                     {"role": "system", "content": "Ти строгий новинний фактчекер. Ти ніколи не вигадуєш факти про лінію фронту чи бойові дії біля тилових міст, яких немає у вихідному тексті."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.1,  # Мінімальна температура: нуль фантазій!
+                "temperature": 0.1,
                 "max_tokens": 700
             }
             resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=22)
@@ -356,7 +364,6 @@ def generate_channel_post(raw_text, past_posts):
                 for pat in cliche_patterns:
                     result = re.sub(pat, '', result, flags=re.IGNORECASE)
 
-                # Захист від обірваних речень
                 lines = result.strip().split('\n')
                 cleaned_lines = []
                 for line in lines:
@@ -384,7 +391,7 @@ def post_to_telegram(text, media_list=[]):
     caption = text[:1020]
     
     try:
-        # Альбом
+        # 1. АЛЬБОМ (2 ТА БІЛЬШЕ РІЗНИХ ФАЙЛІВ):
         if len(media_list) > 1:
             media_group = []
             files = {}
@@ -412,7 +419,7 @@ def post_to_telegram(text, media_list=[]):
                 if res.status_code == 200:
                     return True
 
-        # Одиночне медіа
+        # 2. ОДИН ФАЙЛ:
         if media_list:
             item = media_list[0]
             if item["type"] == 'photo':
@@ -433,7 +440,7 @@ def post_to_telegram(text, media_list=[]):
                     if res.status_code == 200:
                         return True
 
-        # Текст
+        # 3. ТЕКСТ:
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
