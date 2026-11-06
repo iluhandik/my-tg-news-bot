@@ -1,63 +1,134 @@
 import os
+import sys
 import re
-import html
-import time
 import json
+import time
+import string
+import html
 import logging
-import hashlib
-import threading
-import urllib.request
-import requests
+import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import requests
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+# ----------------- НАЛАШТУВАННЯ ТА ЛОГУВАННЯ -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("NewsBot")
 
-# --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
-GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY") or "").strip()
-PORT = int(os.environ.get("PORT", 10000))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or "").strip()
+PORT = int(os.getenv("PORT", 8080))
 
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GROQ_API_KEY]):
+    logger.error("Критичні змінні оточення відсутні!")
+
+# ----------------- СПИСОК ДОНОРІВ -----------------
 DONOR_CHANNELS = [
-    "insiderUKR",
-    "truexanewsua",
-    "u_now",
-    "kievreal1",
-    "nefedoov365"
+    "u_now", "uniannet", "insiderUKR", "UaOnlii", "operativnoZSU",
+    "suspilnenews", "rbc_ukraine", "ssternenko", "DeepStateUA",
+    "nefedoov365", "inslandd", "zsuwar", "supernova_plus", "chp_zahid"
 ]
 
-STATE_FILE = "bot_state.json"
-
-# --- HEALTH CHECK HTTP SERVER & KEEP-ALIVE ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
+# ----------------- HEALTH SERVER ДЛЯ RENDER -----------------
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK: News Bot is running 24/7.")
+        self.wfile.write(b"News Bot 24/7 Running OK")
 
-def run_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logger.info(f"Health-check HTTP server listening on port {PORT}")
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"Health server запущено на порту {PORT}")
     server.serve_forever()
 
-def run_keep_alive():
-    if not RENDER_EXTERNAL_URL:
-        logger.info("RENDER_EXTERNAL_URL not set. Native keep-alive disabled.")
-        return
-    url = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL.startswith("http") else f"https://{RENDER_EXTERNAL_URL}"
-    logger.info(f"Keep-alive worker activated for URL: {url}")
+threading.Thread(target=run_health_server, daemon=True).start()
+
+# ----------------- БУДИЛЬНИК ПРОТИ СНУ RENDER -----------------
+def keep_alive_ping():
+    app_url = os.getenv("RENDER_EXTERNAL_URL") or "https://my-tg-news-bot-53bh.onrender.com"
+    time.sleep(120)
     while True:
         try:
-            time.sleep(480) # 8 minutes
-            r = requests.get(url, timeout=15)
-            logger.info(f"Keep-alive ping sent to {url}, status: {r.status_code}")
-        except Exception as e:
-            logger.warning(f"Keep-alive ping error: {e}")
+            resp = requests.get(app_url, timeout=15)
+            logger.info(f"Будильник активний ({resp.status_code}): сервер онлайн 24/7.")
+        except Exception:
+            pass
+        time.sleep(480)
 
-# --- STATE MANAGEMENT ---
+threading.Thread(target=keep_alive_ping, daemon=True).start()
+
+# ----------------- АВТОМАТИЧНИЙ ВИБІР ДІЮЧОЇ МОДЕЛІ GROQ -----------------
+ACTIVE_MODEL = None
+
+def get_working_groq_model():
+    global ACTIVE_MODEL
+    if ACTIVE_MODEL:
+        return ACTIVE_MODEL
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            live_ids = [m["id"] for m in resp.json().get("data", [])]
+            chat_models = [m for m in live_ids if "whisper" not in m.lower() and "guard" not in m.lower()]
+            if chat_models:
+                for m in chat_models:
+                    if "qwen" in m.lower():
+                        ACTIVE_MODEL = m
+                        return ACTIVE_MODEL
+                ACTIVE_MODEL = chat_models[0]
+                return ACTIVE_MODEL
+    except Exception as e:
+        logger.error(f"Помилка вибору моделі: {e}")
+
+    ACTIVE_MODEL = "qwen/qwen3.8-27b"
+    return ACTIVE_MODEL
+
+# ----------------- ФІЛЬТР СПАМУ ТА БРУДУ -----------------
+JUNK_PHRASES = [
+    # Реклама, казино, ставки
+    "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
+    "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
+    "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
+    # Самопіар політиків
+    "кличко передав", "мер повідомив, що передали", "громада передала", "київрада виділила",
+    "передав допомогу бійцям", "з початку року громада надала", "бахматов", "статки на мільйони",
+    # Побутовий міський трафік
+    "південному мосту", "північний міст", "міст патона", "метро міст",
+    "смуг руху", "смугу руху", "рух транспорту з лівого", "правий берег києва", "лівий берег києва",
+    "проїзд у громадському транспорті", "вартість проїзду", "паркування в",
+    # Жовта преса і погода
+    "голлівуд", "шекспірівськ", "гордон назвав", "прогноз погоди", "синоптики попередили",
+    "магнітні бурі", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
+    "повітряна тривога", "відбій тривоги", "чисто по ракетах", "18+", "шок контент"
+]
+
+STOP_WORDS = {
+    "і", "й", "та", "в", "у", "на", "з", "із", "зі", "до", "по", "за", "про", "проти",
+    "від", "під", "над", "при", "через", "після", "для", "як", "що", "щоб", "бо", "тому",
+    "але", "проте", "однак", "це", "ця", "цей", "ці", "того", "тому", "його", "її", "їх",
+    "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
+    "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
+    "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
+    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними", "сьогодні", "наразі",
+    "війна", "війни", "війні", "війною", "україна", "україни", "україні", "росія", "росії",
+    "росією", "рф", "мир", "миру", "мирний", "мирна", "угода", "угоди", "угоду", "заява"
+}
+
+STATE_FILE = "bot_state.json"
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -65,407 +136,434 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_titles": []}
+    return {"posted_hashes": [], "recent_channel_posts": [], "initialized": False, "last_post_time": 0}
 
 def save_state(state):
     try:
+        state["posted_hashes"] = state["posted_hashes"][-400:]
+        state["recent_channel_posts"] = state["recent_channel_posts"][-40:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save state: {e}")
+        logger.error(f"Помилка збереження стану: {e}")
 
-def get_hash(text):
-    clean = re.sub(r'\W+', '', text.lower())
-    return hashlib.md5(clean.encode('utf-8')).hexdigest()
+state = load_state()
 
-def extract_keywords(text):
-    clean = re.sub(r'<[^>]+>', ' ', text)
-    words = re.findall(r'[а-яіїєґa-z0-9]{4,}', clean.lower())
-    stop_words = {
-        'який', 'яка', 'яке', 'які', 'його', 'її', 'цього', 'було', 'буде', 'коли', 
-        'також', 'після', 'через', 'про', 'для', 'новини', 'канал', 'підписатися', 
-        'фото', 'відео', 'повідомляє', 'заявив', 'каже', 'стало', 'відомо', 'повідомили', 
-        'словами', 'офіційно', 'року', 'сьогодні', 'зараз'
-    }
-    return set(w for w in words if w not in stop_words)
+def clean_raw_text(text):
+    text = re.sub(r'Реакція користувачів:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'Реакция пользователей:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'Реакції громадян:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'https?://t\.me/\S+', '', text)
+    text = re.sub(r't\.me/\S+', '', text)
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
 
-# --- SCRAPER FOR TELEGRAM CHANNELS ---
-def scrape_channel(channel_name):
-    url = f"https://t.me/s/{channel_name.lstrip('@')}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    }
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
-            html_content = response.read().decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.warning(f"Failed to fetch {url}: {e}")
-        return []
-
-    messages = []
-    blocks = re.findall(r'(<div class="tgme_widget_message_wrap\b.*?)(?=<div class="tgme_widget_message_wrap\b|$)', html_content, re.DOTALL)
+def is_junk_news(text):
+    low = text.lower()
+    if len(text) < 45:
+        return True
     
-    for block in blocks:
-        post_match = re.search(r'data-post=["\']([^"\']+)["\']', block)
-        if not post_match:
-            continue
-        data_post = post_match.group(1) # e.g. "insiderUKR/12345"
-        parts = data_post.split('/')
-        donor_user = "@" + parts[0]
-        try:
-            msg_id = int(parts[1])
-        except Exception:
-            msg_id = None
-
-        # Check timestamp
-        time_match = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', block)
-        
-        # Extract text
-        text_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
-        raw_text = ""
-        if text_match:
-            raw_text = text_match.group(1)
-            raw_text = re.sub(r'<br\s*/?>', '\n', raw_text)
-            raw_text = re.sub(r'<a\b[^>]*>.*?</a>', '', raw_text)
-            raw_text = re.sub(r'<[^>]+>', '', raw_text)
-            raw_text = html.unescape(raw_text).strip()
-
-        # Check media
-        has_video = ('tgme_widget_message_video_player' in block or '<video' in block or 'tgme_widget_message_video_thumb' in block)
-        
-        # Direct images
-        photo_matches = re.findall(r'tgme_widget_message_photo_wrap[^>]+url\((?:&quot;|\'|\")?([^&\'\"\)]+)', block)
-        media_urls = []
-        for p in photo_matches:
-            if 'user_photo' not in p and p not in media_urls:
-                media_urls.append(p)
-
-        # Direct video tag if available
-        v_matches = re.findall(r'<video[^>]+src=["\']([^"\']+)["\']', block)
-        for v in v_matches:
-            if v not in media_urls:
-                media_urls.append(v)
-
-        if raw_text or media_urls or has_video:
-            messages.append({
-                "donor_user": donor_user,
-                "msg_id": msg_id,
-                "text": raw_text,
-                "media": media_urls,
-                "has_video": has_video,
-                "hash": get_hash(raw_text) if raw_text else None
-            })
-
-    return messages
-
-# --- CHECK TARGET CHANNEL FOR MANUAL / PRIOR POSTS ---
-def get_channel_recent_posts(target_channel):
-    posts = []
-    clean_target = target_channel.lstrip('@')
-    url = f"https://t.me/s/{clean_target}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            content = resp.read().decode('utf-8', errors='ignore')
-        blocks = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', content, re.DOTALL)
-        for b in blocks[-25:]:
-            clean = re.sub(r'<br\s*/?>', ' ', b)
-            clean = re.sub(r'<[^>]+>', '', clean)
-            clean = html.unescape(clean).strip()
-            if clean:
-                posts.append(clean)
-    except Exception as e:
-        logger.warning(f"Could not read recent posts from {target_channel}: {e}")
-    return posts
-
-def is_already_on_channel(candidate_text, channel_posts):
-    cand_kw = extract_keywords(candidate_text)
-    if len(cand_kw) < 2:
+    # Якщо масштабна подія чи ДТП — пропускаємо
+    viral_markers = ["масштабн", "крише", "даху", "перекинувся", "трамвай", "автобус", "зіткнулися", "удар", "приліт", "ракета", "шахед", "вибух", "пожеж", "загибл", "поранен"]
+    if any(vm in low for vm in viral_markers):
         return False
-    for p_text in channel_posts:
-        p_kw = extract_keywords(p_text)
-        common = cand_kw & p_kw
-        # If 3 or more significant keywords match or 50%+ overlap
-        if len(common) >= 3 or (len(common) >= 2 and len(common) / len(cand_kw) >= 0.5):
-            logger.info(f"Duplicate detected in channel! Common keywords: {common}")
+
+    for phrase in JUNK_PHRASES:
+        if phrase in low:
+            logger.info(f"Відсіяно шум: '{phrase}'.")
             return True
     return False
 
-# --- DYNAMIC GROQ MODEL DISCOVERY ---
-def get_working_groq_model():
-    if not GROQ_API_KEY:
-        return "llama-3.1-8b-instant"
-    url = "https://api.groq.com/openai/v1/models"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+def get_text_stem_words(text):
+    text_clean = text.lower().translate(str.maketrans('', '', string.punctuation + '«»—–"\'$'))
+    words = text_clean.split()
+    return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
+
+SPEAKERS = ["трамп", "зеленськ", "рютт", "путін", "байден", "сирськ", "буданов", "шольц", "макрон"]
+
+def extract_speakers(text):
+    low = text.lower()
+    return {s for s in SPEAKERS if s in low}
+
+# ----------------- АНАЛІЗ НА ПОВТОР -----------------
+def is_duplicate_human_logic(candidate_text, past_posts):
+    low_cand = candidate_text.lower()
+    cand_stems = get_text_stem_words(candidate_text)
+    cand_speakers = extract_speakers(candidate_text)
+    
+    cand_numbers = set(re.findall(r'\b\d+\b', low_cand))
+    meaningful_numbers = {n for n in cand_numbers if int(n) >= 5}
+
+    for past in past_posts:
+        low_past = past.lower()
+        past_stems = get_text_stem_words(past)
+        past_speakers = extract_speakers(past)
+
+        if cand_speakers and past_speakers and not (cand_speakers & past_speakers):
+            continue
+
+        past_numbers = {n for n in re.findall(r'\b\d+\b', low_past) if int(n) >= 5}
+        shared_nums = meaningful_numbers & past_numbers
+        if shared_nums:
+            shared_words = cand_stems & past_stems
+            if len(shared_words) >= 2:
+                logger.info(f"Повтор за числом {shared_nums} та темою: {past[:60]}")
+                return True
+
+        intersection = len(cand_stems & past_stems)
+        union = len(cand_stems | past_stems)
+        similarity = intersection / union if union > 0 else 0
+        if similarity >= 0.35:
+            logger.info(f"Смисловий повтор ({similarity:.2f}) з: {past[:60]}")
+            return True
+
+    return False
+
+# ----------------- ПАРСИНГ З ДОНОРІВ З ПОВНИМ ЗАХОПЛЕННЯМ ВІДЕО ТА ОБКЛАДИНОК -----------------
+def scrape_donor(channel_username):
+    url = f"https://t.me/s/{channel_username}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        r = requests.get(url, headers=headers, timeout=8)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            valid_ids = [
-                m["id"] for m in data 
-                if m.get("active", True) 
-                and not any(x in m["id"].lower() for x in ["whisper", "guard", "embed", "vision", "audio"])
-            ]
-            for pref in ["qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-                if pref in valid_ids:
-                    return pref
-            if valid_ids:
-                return valid_ids[0]
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code != 200:
+            return []
+        
+        raw_html = resp.text
+        raw_messages = raw_html.split('class="tgme_widget_message_wrap')
+        results = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        latest_blocks = raw_messages[-5:] if len(raw_messages) > 5 else raw_messages[1:]
+
+        for msg_block in reversed(latest_blocks):
+            time_match = re.search(r'<time[^>]+datetime="([^"]+)"', msg_block)
+            if not time_match:
+                continue
+
+            try:
+                dt_str = time_match.group(1).replace('Z', '+00:00')
+                dt = datetime.datetime.fromisoformat(dt_str)
+                age_seconds = (now - dt).total_seconds()
+                
+                # Новини за останні 3.5 години
+                if age_seconds > 3.5 * 3600 or age_seconds < -120:
+                    continue
+            except Exception:
+                continue
+
+            text_match = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', msg_block, re.DOTALL)
+            if not text_match:
+                continue
+
+            raw_text = text_match.group(1)
+            raw_text = re.sub(r'<br\s*/?>', '\n', raw_text)
+            raw_text = re.sub(r'<[^>]+>', '', raw_text)
+            raw_text = html.unescape(raw_text)
+            raw_text = clean_raw_text(raw_text)
+
+            if is_junk_news(raw_text):
+                continue
+
+            # 1. Пошук файлів відео (mp4)
+            raw_videos = re.findall(r'<(?:video|source)[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            
+            # 2. Пошук фото ТА обкладинок відеоплеєра (video_thumb):
+            raw_photos = re.findall(r'class="[^"]*(?:tgme_widget_message_photo_wrap|tgme_widget_message_video_thumb)[^"]*"[^>]*style="[^"]*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
+
+            # Формуємо список тільки унікальних медіафайлів
+            media_list = []
+            seen_urls = set()
+
+            for v_url in raw_videos:
+                if v_url not in seen_urls:
+                    seen_urls.add(v_url)
+                    media_list.append({"type": "video", "url": v_url})
+
+            # Якщо відео-файлів не знайдено або як фото-ряд — додаємо обкладинки/фото:
+            for p_url in raw_photos:
+                if p_url not in seen_urls:
+                    seen_urls.add(p_url)
+                    media_list.append({"type": "photo", "url": p_url})
+
+            results.append({
+                "channel": channel_username,
+                "text": raw_text,
+                "media_list": media_list
+            })
+        return results
     except Exception as e:
-        logger.warning(f"Model lookup failed: {e}")
-    return "llama-3.1-8b-instant"
+        logger.error(f"Помилка парсингу @{channel_username}: {e}")
+        return []
 
-# --- AI REWRITE & VALIDATION ---
-def rewrite_news_with_groq(text, model_name):
-    if not GROQ_API_KEY or not text or len(text.strip()) < 30:
-        return None
+# ----------------- РЕДАКТОР НОВИН -----------------
+def generate_channel_post(raw_text, past_posts):
+    channel_history = "\n".join([f"• {p[:120]}" for p in past_posts[-15:]])
 
-    system_prompt = (
-        "ТИ — РОБОТ-РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
-        "СУВОРІ ПРАВИЛА:\n"
-        "1. КАТЕГОРИЧНО ЗАБОРОНЕНО писати БУДЬ-ЯКІ примітки, роздуми чи коментарі вголос! "
-        "Ніяких слів від першої особи: «я», «ми», «примітка:», «у контексті», «перевіряю», «виправлю», «давайте припустимо».\n"
-        "2. Якщо у вхідному тексті є нестиковка або протиріччя в іменах/посадах — пиши тільки сухий очевидний факт або поверни слово SKIP.\n"
-        "3. Відкидай рекламу, розіграші, казино, крипту, джинсу політиків та дрібні міські ремонти/мости. Для них пиши SKIP.\n"
-        "4. Мова — виключно чиста, грамотна українська (жодних русизмів: «натовп» замість «толпа», «ЗСУ» замість «ВСУ»).\n"
-        "5. ФОРМАТ ПОСТА:\n"
-        "⚡ <b>Короткий влучний заголовок</b>\n\n"
-        "1-2 фактичні абзаци по суті. Ключові деталі виділяй <b>жирним</b>.\n"
-        "Цитати оформлюй як: «Текст прямої мови», — <b>Прізвище</b>.\n\n"
-        "ВІДПОВІДЬ МАЄ МІСТИТИ ТІЛЬКИ ТЕКСТ ПОСТА АБО ОДНЕ СЛОВО SKIP."
-    )
+    prompt = f"""Ти — випусковий редактор провідного всеукраїнського новинного Telegram-каналу "NEWS УКРАЇНА 365".
+Твоє завдання — перетворити текст у ЧЕСНУ, ДИНАМІЧНУ українську новину.
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
+ОСЬ ОСТАННІ НОВИНИ КАНАЛУ (ЯКЩО ЦЯ Ж САМА ПОДІЯ ВЖЕ БУЛА — ПИШИ ТІЛЬКИ SKIP):
+{channel_history}
+
+ПРАВИЛА ВІДБОРУ:
+1. ПУБЛІКУЙ:
+   - Фронт, ЗСУ, бойові дії, удари та заяви світових лідерів (Трамп, Рютте, Зеленський).
+   - Гучні надзвичайні події в містах: масштабні ДТП (з участю транспорту, кілька авто, машини на даху), пожежі, аварії з відео.
+2. ❌ ВІДХИЛЯЙ (пиши ТІЛЬКИ SKIP):
+   - Буденний міський шум (відкриття смуги на мосту, ремонт труб КМДА, міські тарифи).
+   - Політичний самопіар мерів і партій.
+
+ПРАВИЛА ОФОРМЛЕННЯ:
+- Перекладай чистою українською мовою (якщо вхідний текст російською).
+- Перший рядок: жирний заголовок у <b>...</b> з емодзі (🚗, 💥, ⚡️, 🇺🇸).
+- Порожній рядок.
+- 1-2 короткі фактичні абзаци. Виділяй жирним <b>...</b> ключові деталі, цифри.
+- Закінчуй пост одразу на фактах, без шаблонної води наприкінці!
+❌ Заборонено: "ВСУ" (тільки ЗСУ), "толпа", "позор", рамки blockquote.
+
+ТЕКСТ НОВИНИ:
+{raw_text}
+
+ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Ось новина-донор:\n\n{text}"}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 800
-    }
 
+    model_name = get_working_groq_model()
+
+    for attempt in range(2):
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "Ти професійний український новинний редактор. Твої тексти виразні, динамічні, без штампів та русизмів."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 700
+            }
+            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=22)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data['choices'][0]['message']['content'].strip()
+                if "SKIP" in result.upper()[:15]:
+                    return "SKIP"
+                result = re.sub(r'</?blockquote[^>]*>', '', result)
+                
+                result = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', result)
+                result = re.sub(r'\bвсу\b', 'ЗСУ', result, flags=re.IGNORECASE)
+                result = re.sub(r'\bВСУ\b', 'ЗСУ', result)
+                result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
+                result = re.sub(r'\bпозор[а-яіїє]*\b', 'ганьба', result, flags=re.IGNORECASE)
+                result = re.sub(r'у даний момент', 'наразі', result, flags=re.IGNORECASE)
+                
+                cliche_patterns = [
+                    r'[\.,]?\s*тривають бойові дії в районі міста[\.,]?',
+                    r'[\.,]?\s*тривають бойові дії біля міста[\.,]?',
+                    r'\n+Ситуація залишається[^\n]*',
+                    r'\n+Обставини з[\'ʼ]?ясовуються[^\n]*',
+                    r'\n+Слідкуємо за розвитком[^\n]*',
+                    r'\n+Бережіть себе[^\n]*'
+                ]
+                for pat in cliche_patterns:
+                    result = re.sub(pat, '', result, flags=re.IGNORECASE)
+
+                lines = result.strip().split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    line_str = line.strip()
+                    if line_str and not line_str.startswith('<b>') and len(line_str) < 25 and not line_str.endswith(('.', '!', '?', '»', '”', '"')):
+                        continue
+                    cleaned_lines.append(line)
+                
+                final_res = "\n".join(cleaned_lines).strip()
+                if not final_res.endswith(('.', '!', '?', '»', '”', '"')):
+                    final_res += '.'
+                return final_res
+            elif resp.status_code == 429:
+                time.sleep(6)
+            else:
+                break
+        except Exception:
+            break
+
+    return None
+
+# ----------------- НАДІЙНА ВІДПРАВКА МЕДІА (З АВТОФОЛБЕКОМ НА ФОТО) -----------------
+def post_to_telegram(text, media_list=[]):
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    caption = text[:1020]
+    
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=25)
-        if resp.status_code != 200:
-            logger.error(f"Groq API returned error {resp.status_code}: {resp.text}")
-            return None
-        res_json = resp.json()
-        raw_out = res_json["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error(f"Groq call exception: {e}")
-        return None
+        # 1. АЛЬБОМ (2 І БІЛЬШЕ МЕДІА)
+        if len(media_list) > 1:
+            media_group = []
+            files = {}
+            for idx, item in enumerate(media_list[:6]):
+                try:
+                    r = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+                    if r.status_code == 200:
+                        field_name = f"media_{idx}"
+                        m_type = item["type"]
+                        ext = "mp4" if m_type == "video" else "jpg"
+                        mime = "video/mp4" if m_type == "video" else "image/jpeg"
+                        files[field_name] = (f"file_{idx}.{ext}", r.content, mime)
+                        
+                        obj = {"type": m_type, "media": f"attach://{field_name}"}
+                        if idx == 0:
+                            obj["caption"] = caption
+                            obj["parse_mode"] = "HTML"
+                        media_group.append(obj)
+                except Exception:
+                    continue
+            
+            if len(media_group) > 1:
+                data = {"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media_group)}
+                res = requests.post(f"{base_url}/sendMediaGroup", data=data, files=files, timeout=40)
+                if res.status_code == 200:
+                    return True
 
-    # Strip thinking tags if present
-    raw_out = re.sub(r'<think>.*?</think>', '', raw_out, flags=re.DOTALL).strip()
+        # 2. ОДИН МЕДІАФАЙЛ (З ПОВНИМ РЕЗЕРВОМ НА ФОТО):
+        if media_list:
+            item = media_list[0]
+            
+            # Якщо це відео
+            if item["type"] == 'video':
+                # Спочатку качаємо і шлемо як відео
+                try:
+                    vid_res = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                    if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
+                        files = {"video": ("video.mp4", vid_res.content, "video/mp4")}
+                        data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                        res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
+                        if res.status_code == 200:
+                            return True
+                except Exception:
+                    pass
 
-    if raw_out.upper() == "SKIP" or "SKIP" in raw_out[:10]:
-        return "SKIP"
+            # Якщо це фото (або відео не пройшло, але в списку є обкладинка/фото):
+            photo_candidates = [m for m in media_list if m["type"] == 'photo']
+            p_url = photo_candidates[0]["url"] if photo_candidates else (item["url"] if item["type"] == 'photo' else None)
 
-    # Sanitize markdown formatting into HTML
-    out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
-    out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
-    out = out.replace("<blockquote>", "").replace("</blockquote>", "")
+            if p_url:
+                try:
+                    img_res = requests.get(p_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+                    if img_res.status_code == 200:
+                        files = {"photo": ("image.jpg", img_res.content, "image/jpeg")}
+                        data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                        res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
+                        if res.status_code == 200:
+                            return True
+                except Exception:
+                    pass
 
-    # Strict check: ban internal reasoning / reflections leakage
-    forbidden_meta = [
-        r'\(у контексті',
-        r'\*?примітка:?',
-        r'я виправлю',
-        r'я не можу',
-        r'давайте припустимо',
-        r'перевіряю',
-        r'за інструкцією',
-        r'вхідний текст',
-        r'фактична хибність',
-        r'суперечність',
-        r'дотримаємось',
-        r'якщо я напишу'
-    ]
-    for pattern in forbidden_meta:
-        if re.search(pattern, out, re.IGNORECASE):
-            logger.warning(f"AI reasoning leak detected ({pattern})! Dropping post.")
-            return None
-
-    # Check for abrupt cutoff at the end
-    valid_endings = ('.', '!', '?', '»', '"', '</b>', '</i>', ')')
-    if not out.rstrip().endswith(valid_endings):
-        last_punct = max(out.rfind('.'), out.rfind('!'), out.rfind('?'), out.rfind('»'))
-        if last_punct > 120:
-            out = out[:last_punct+1].strip()
-        else:
-            logger.warning("Post was cut off mid-sentence, dropping.")
-            return None
-
-    # Fix common Russian words
-    ru_fixes = {
-        r'\bтолп[а-я]*': 'натовп',
-        r'\bпозор[а-я]*': 'ганьба',
-        r'\bу даний момент\b': 'наразі',
-        r'\bВСУ\b': 'ЗСУ',
-        r'\bв даний час\b': 'наразі'
-    }
-    for r_pattern, replacement in ru_fixes.items():
-        out = re.sub(r_pattern, replacement, out, flags=re.IGNORECASE)
-
-    return out
-
-# --- POSTING TO TELEGRAM ---
-def try_copy_message(from_channel, message_id, caption):
-    """Copies native video/photo directly via Telegram API, preserving 100% video quality."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/copyMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHANNEL_ID,
-        "from_chat_id": from_channel,
-        "message_id": message_id,
-        "caption": caption,
-        "parse_mode": "HTML"
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        res = r.json()
-        if res.get("ok"):
-            logger.info(f"Successfully copied native media from {from_channel}/{message_id}")
-            return True
-        logger.warning(f"copyMessage failed: {res.get('description')}")
-    except Exception as e:
-        logger.warning(f"copyMessage exception: {e}")
-    return False
-
-def send_fallback_media(text, media_urls):
-    """Fallback if copyMessage cannot be used."""
-    if not media_urls:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        # 3. ТЕКСТОВИЙ РЕЗЕРВ (лише якщо взагалі не було медіа):
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False
+            "disable_web_page_preview": True
         }
-        r = requests.post(url, json=payload, timeout=20)
-        return r.json().get("ok", False)
-
-    first_media = media_urls[0]
-    if first_media.endswith('.mp4'):
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "video": first_media, "caption": text, "parse_mode": "HTML"}
-    else:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "photo": first_media, "caption": text, "parse_mode": "HTML"}
-    
-    try:
-        r = requests.post(url, json=payload, timeout=25)
-        res = r.json()
-        if res.get("ok"):
-            return True
-        logger.warning(f"Direct media send failed: {res.get('description')}")
+        res = requests.post(f"{base_url}/sendMessage", json=payload, timeout=15)
+        return res.status_code == 200
     except Exception as e:
-        logger.warning(f"send_fallback_media exception: {e}")
-    
-    # Ultimate text fallback
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
-    r = requests.post(url, json=payload, timeout=15)
-    return r.json().get("ok", False)
+        logger.error(f"Помилка відправки: {e}")
+        return False
 
-# --- MAIN AUTOMATION LOOP ---
+# ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Initializing news bot...")
-    state = load_state()
+    logger.info("Бот запущено успішно...")
 
-    # Cold start: seed existing donor messages so old posts aren't blasted
-    if not state.get("posted_hashes"):
-        logger.info("Cold start: seeding existing messages into seen cache...")
-        for ch in DONOR_CHANNELS:
-            msgs = scrape_channel(ch)
-            for m in msgs:
-                if m["hash"]:
-                    state["posted_hashes"].append(m["hash"])
+    if not state.get("initialized"):
+        logger.info("Ініціалізація: запам'ятовуємо старі новини донорів...")
+        for donor in DONOR_CHANNELS:
+            items = scrape_donor(donor)
+            for item in items:
+                h = str(hash(item['text'][:120]))
+                state["posted_hashes"].append(h)
+            time.sleep(0.4)
+        state["initialized"] = True
         save_state(state)
+        logger.info("Ініціалізація завершена. Публікуватимуться тільки свіжі події!")
 
     while True:
         try:
-            model_name = get_working_groq_model()
-            logger.info(f"Checking donor channels using model: {model_name}...")
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            kyiv_hour = (now_utc.hour + 2) % 24
+            is_night = kyiv_hour >= 23 or kyiv_hour < 6
 
-            # Get recent posts from target channel to prevent duplicating manual admin posts
-            channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
+            all_candidates = []
+            for donor in DONOR_CHANNELS:
+                items = scrape_donor(donor)
+                for item in items:
+                    h = str(hash(item['text'][:120]))
+                    if h not in state.get("posted_hashes", []):
+                        all_candidates.append((h, item))
+                time.sleep(1.2)
 
-            for channel in DONOR_CHANNELS:
-                items = scrape_channel(channel)
-                # Only check the latest 4 messages
-                for item in items[-4:]:
-                    item_hash = item["hash"]
-                    if not item_hash or item_hash in state["posted_hashes"]:
-                        continue
+            logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
-                    raw_text = item["text"]
-                    if not raw_text or len(raw_text) < 30:
-                        continue
+            max_posts_this_cycle = 3 if len(all_candidates) >= 5 and not is_night else 1
+            posts_published = 0
 
-                    # 1. Check if already posted on our channel manually
-                    if is_already_on_channel(raw_text, channel_posts):
-                        logger.info("Skipping news: already published on channel.")
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
-                        continue
+            past_posts = state.get("recent_channel_posts", [])
 
-                    # 2. Rewrite with AI
-                    rewritten = rewrite_news_with_groq(raw_text, model_name)
-                    if rewritten == "SKIP":
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
-                        continue
+            for h, item in all_candidates:
+                if posts_published >= max_posts_this_cycle:
+                    break
 
-                    if not rewritten:
-                        continue # Retry later
+                if is_duplicate_human_logic(item['text'], past_posts):
+                    state["posted_hashes"].append(h)
+                    continue
 
-                    # Double check rewritten text against channel
-                    if is_already_on_channel(rewritten, channel_posts):
-                        logger.info("Skipping rewritten news: already present on channel.")
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
-                        continue
+                res = generate_channel_post(item['text'], past_posts)
+                
+                if res == "SKIP":
+                    state["posted_hashes"].append(h)
+                    time.sleep(2)
+                    continue
 
-                    # 3. Publish to Telegram
-                    success = False
-                    # If donor message has media (video/photo) and valid ID, copy natively
-                    if (item["has_video"] or item["media"]) and item["msg_id"]:
-                        success = try_copy_message(item["donor_user"], item["msg_id"], rewritten)
+                if not res:
+                    time.sleep(3)
+                    continue
 
-                    # If not copied or text-only, use fallback
-                    if not success:
-                        success = send_fallback_media(rewritten, item["media"] if not item["has_video"] else [])
+                formatted_post = res
 
-                    if success:
-                        logger.info("Successfully published new post!")
-                        state["posted_hashes"].append(item_hash)
-                        # Keep list manageable
-                        if len(state["posted_hashes"]) > 1000:
-                            state["posted_hashes"] = state["posted_hashes"][-800:]
-                        save_state(state)
-                        channel_posts.append(rewritten)
-                        time.sleep(15) # Spacing between posts
+                if re.search(r'[ыэъёЫЭЪЁ]', formatted_post):
+                    state["posted_hashes"].append(h)
+                    continue
 
-                time.sleep(3)
+                success = post_to_telegram(formatted_post, item.get('media_list', []))
+                if success:
+                    posts_published += 1
+                    logger.info(f"Опубліковано чисту новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']} (Медіа: {len(item.get('media_list', []))})!")
+                    state["posted_hashes"].append(h)
+                    state["last_post_time"] = time.time()
+
+                    clean_content = re.sub(r'<[^>]+>', '', formatted_post)[:250]
+                    state.setdefault("recent_channel_posts", []).append(clean_content)
+                    past_posts.append(clean_content)
+
+                    save_state(state)
+
+                    if posts_published < max_posts_this_cycle:
+                        time.sleep(35)
+
+            if posts_published > 0:
+                sleep_time = 75
+            elif is_night:
+                sleep_time = 180
+            else:
+                sleep_time = 110
+
+            time.sleep(sleep_time)
 
         except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
-
-        time.sleep(90) # Check every 1.5 minutes
+            logger.error(f"Помилка циклу: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
-    t_http = threading.Thread(target=run_http_server, daemon=True)
-    t_http.start()
-
-    t_ping = threading.Thread(target=run_keep_alive, daemon=True)
-    t_ping.start()
-
     main_loop()
