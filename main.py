@@ -52,7 +52,7 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ----------------- АВТОМАТИЧНИЙ ВИБІР АКТИВНОЇ МОДЕЛІ GROQ -----------------
+# ----------------- АВТОМАТИЧНИЙ ВИБІР ДІЮЧОЇ МОДЕЛІ GROQ -----------------
 ACTIVE_MODEL = None
 
 def get_working_groq_model():
@@ -68,20 +68,13 @@ def get_working_groq_model():
         resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
         if resp.status_code == 200:
             live_ids = [m["id"] for m in resp.json().get("data", [])]
-            # Шукаємо моделі з високим лімітом (openai/gpt-oss або qwen)
-            for m in live_ids:
-                if "gpt-oss" in m.lower():
-                    ACTIVE_MODEL = m
-                    logger.info(f"Обрано модель з високим лімітом токенів: {ACTIVE_MODEL}")
-                    return ACTIVE_MODEL
-            for m in live_ids:
-                if "qwen" in m.lower():
-                    ACTIVE_MODEL = m
-                    logger.info(f"Обрано діючу модель Groq: {ACTIVE_MODEL}")
-                    return ACTIVE_MODEL
-            # Резерв
+            # Шукаємо якісну текстову модель
             chat_models = [m for m in live_ids if "whisper" not in m.lower() and "guard" not in m.lower()]
             if chat_models:
+                for m in chat_models:
+                    if "qwen" in m.lower():
+                        ACTIVE_MODEL = m
+                        return ACTIVE_MODEL
                 ACTIVE_MODEL = chat_models[0]
                 return ACTIVE_MODEL
     except Exception as e:
@@ -103,6 +96,16 @@ JUNK_PHRASES = [
     "перевірка сирен", "18+", "шок контент"
 ]
 
+STOP_WORDS = {
+    "і", "й", "та", "в", "у", "на", "з", "із", "зі", "до", "по", "за", "про", "проти",
+    "від", "під", "над", "при", "через", "після", "для", "як", "що", "щоб", "бо", "тому",
+    "але", "проте", "однак", "це", "ця", "цей", "ці", "того", "тому", "його", "її", "їх",
+    "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
+    "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
+    "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
+    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
+}
+
 STATE_FILE = "bot_state.json"
 
 def load_state():
@@ -112,12 +115,12 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_titles": [], "last_post_time": 0}
+    return {"posted_hashes": [], "recent_channel_posts": [], "last_sync_time": 0, "last_post_time": 0}
 
 def save_state(state):
     try:
-        state["posted_hashes"] = state["posted_hashes"][-300:]
-        state["recent_titles"] = state["recent_titles"][-25:]
+        state["posted_hashes"] = state["posted_hashes"][-350:]
+        state["recent_channel_posts"] = state["recent_channel_posts"][-40:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -144,32 +147,79 @@ def is_junk_news(text):
             return True
     return False
 
-# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
-def sync_with_my_channel():
+def get_text_stem_words(text):
+    text_clean = text.lower().translate(str.maketrans('', '', string.punctuation + '«»—–"\'$'))
+    words = text_clean.split()
+    return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
+
+# ----------------- РЕГУЛЯРНА СИНХРОНІЗАЦІЯ З ВАШИМ КАНАЛОМ -----------------
+def sync_with_my_channel(force=False):
+    now = time.time()
+    # Синхронізуємося щоразу на старті або раз на 10 хвилин
+    if not force and (now - state.get("last_sync_time", 0)) < 600:
+        return
+
     try:
-        channel_name = TELEGRAM_CHANNEL_ID.lstrip('@') if TELEGRAM_CHANNEL_ID.startswith('@') else "kropivnit"
-        url = f"https://t.me/s/{channel_name}"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        # Завжди читаємо ваш публічний канал @kropivnit
+        url = "https://t.me/s/kropivnit"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
         if resp.status_code == 200:
             raw_html = resp.text
             matches = re.findall(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', raw_html, re.DOTALL)
-            count = 0
-            for raw in matches[-12:]:
+            channel_posts = []
+            for raw in matches[-30:]:
                 clean = re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', '\n', raw))
                 clean = html.unescape(clean_raw_text(clean)).strip()
-                first_line = clean.split('\n')[0][:70]
-                if len(first_line) > 10 and first_line not in state.get("recent_titles", []):
-                    state.setdefault("recent_titles", []).append(first_line)
+                if len(clean) > 20:
+                    first_line = clean.split('\n')[0][:80]
+                    channel_posts.append(first_line)
                     state["posted_hashes"].append(str(hash(clean[:120])))
-                    count += 1
-            save_state(state)
-            logger.info(f"Синхронізовано {count} тем з каналу!")
+
+            if channel_posts:
+                state["recent_channel_posts"] = channel_posts
+                state["last_sync_time"] = now
+                save_state(state)
+                logger.info(f"Синхронізовано {len(channel_posts)} свіжих постів прямо з каналу @kropivnit!")
     except Exception as e:
-        logger.error(f"Помилка синхронізації: {e}")
+        logger.error(f"Помилка синхронізації з каналом: {e}")
 
-sync_with_my_channel()
+sync_with_my_channel(force=True)
 
-# ----------------- ПАРСИНГ З ТОЧНИМ ВІДБІРОМ ФОТО (БЕЗ АВАТАРОК) -----------------
+# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР (ЧИСЛА + СУТНІСТЬ) -----------------
+def is_duplicate_human_logic(candidate_text, past_posts):
+    low_cand = candidate_text.lower()
+    cand_stems = get_text_stem_words(candidate_text)
+    
+    # Шукаємо всі конкретні числа (наприклад 16, 78, 42, 224 тощо)
+    cand_numbers = set(re.findall(r'\b\d+\b', low_cand))
+    # Виключаємо дрібні цифри типу 1, 2, 3
+    meaningful_numbers = {n for n in cand_numbers if int(n) >= 5}
+
+    for past in past_posts:
+        low_past = past.lower()
+        past_stems = get_text_stem_words(past)
+
+        # 1. ПЕРЕВІРКА ЗА КЛЮЧОВИМИ ЦИФРАМИ ТА СУБ'ЄКТОМ (як $16 млрд від США):
+        past_numbers = {n for n in re.findall(r'\b\d+\b', low_past) if int(n) >= 5}
+        shared_nums = meaningful_numbers & past_numbers
+        if shared_nums:
+            # Якщо збігається специфічне число (наприклад 16) і є хоч 2 спільних слова:
+            shared_words = cand_stems & past_stems
+            if len(shared_words) >= 2:
+                logger.info(f"Заблоковано повтор за цифрою {shared_nums} та темою: {past}")
+                return True
+
+        # 2. ПЕРЕВІРКА ЗА ЗАГАЛЬНОЮ СХОЖІСТЮ ТЕМИ (Jaccard):
+        intersection = len(cand_stems & past_stems)
+        union = len(cand_stems | past_stems)
+        similarity = intersection / union if union > 0 else 0
+        if similarity >= 0.28:
+            logger.info(f"Заблоковано смисловий повтор ({similarity:.2f}) з: {past}")
+            return True
+
+    return False
+
+# ----------------- ПАРСИНГ З ДОНОРІВ (БЕЗ ЧУЖИХ АВАТАРОК) -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -195,7 +245,7 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                # Свіжі новини за останні 3.5 години
+                # Новини за останні 3.5 години
                 if age_seconds > 3.5 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -214,10 +264,9 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            # ТОЧНИЙ ПОШУК МЕДІА (КАТЕГОРИЧНО БЕЗ АВАТАРОК!):
             video_match = re.search(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
             
-            # Шукаємо фото ВИКЛЮЧНО всередині photo_wrap, повністю ігноруючи аватарки користувачів:
+            # ЧІТКИЙ ПОШУК ФОТО (СУВОРО БЕЗ АВАТАРОК!):
             photo_match = re.search(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
             media_type = None
@@ -241,28 +290,30 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН З ЛЕГКИМ ЗАПИТОМ (БЕЗ 429) -----------------
-def generate_channel_post(raw_text, recent_titles):
-    # Беремо тільки останні 5 тем для перевірки (економить 80% токенів!)
-    titles_summary = "\n".join([f"• {t}" for t in recent_titles[-6:]])
+# ----------------- РЕДАКТОР НОВИН З ПОВНИМ КОНТЕКСТОМ КАНАЛУ -----------------
+def generate_channel_post(raw_text, past_posts):
+    # Показуємо моделі останні 15 новин з каналу
+    channel_history = "\n".join([f"• {p}" for p in past_posts[-16:]])
 
-    prompt = f"""Ти — професійний новинний репортер Telegram-каналу "NEWS УКРАЇНА 365".
-Подавай ЧИСТІ ФАКТИ В СОЛІДНОМУ ЖУРНАЛІСТСЬКОМУ СТИЛІ БЕЗ ВЛАСНОЇ ДУМКИ.
+    prompt = f"""Ти — випусковий редактор новинного Telegram-каналу "NEWS УКРАЇНА 365".
+Твоє головне завдання — відсікти повтори і написати ЧИСТУ ФАКТИЧНУ НОВИНУ.
 
-ОСТАННІ ТЕМИ В НАШОМУ КАНАЛІ (ЯКЩО НОВИНА ОПИСУЄ ЦЮ САМУ ПОДІЮ — ПИШИ ТІЛЬКИ SKIP):
-{titles_summary}
+ОСЬ НОВИНИ, ЯКІ ВЖЕ ВИЙШЛИ В НАШОМУ КАНАЛІ:
+{channel_history}
 
-ПРАВИЛА:
-❌ СУВОРО ЗАБОРОНЕНО писати особисту суб'єктивну думку, коментарі («Уявіть собі», «Це подвійні стандарти»). Тільки факти і пряма мова!
-❌ ЖОДНИХ росіянізмів: "позор" (тільки "ганьба"), "толпа" (тільки "натовп"), "– ГВА".
-❌ НІЯКИХ рамок blockquote!
+СУВОРЕ ПРАВИЛО ЗВІРКИ (ДУМАТИ ЯК ЛЮДИНА!):
+Уважно порівняй суть нової новини зі стрічкою вище.
+- Якщо новина розповідає про ТУ САМУ ТЕМУ, подію чи заяву (наприклад, про $16 млрд допомоги від США, навіть якщо з'явилися нові документи чи таблиці) — це ПОВТОР! Відповідай ТІЛЬКИ ОДНИМ СЛОВОМ: SKIP
+- Публікуй тільки якщо це ДІЙСНО НОВА подія або рішення.
 
-СТРУКТУРА:
-1. Жирний заголовок у тегах <b>...</b> з емодзі.
+СТИЛЬ ПОСТУ:
+1. Жирний заголовок у <b>...</b> з емодзі.
 2. Порожній рядок.
-3. 1-2 інформативні абзаци фактів та контексту з прямою мовою («...», — Прізвище).
+3. 1-2 інформативні абзаци фактів з прямою мовою («...», — Прізвище).
+❌ ЖОДНИХ особистих думок, моралізаторства чи оцінок!
+❌ ЖОДНИХ слів "– ГВА", "позор", "толпа", рамок blockquote.
 
-ТЕКСТ НОВИНИ:
+ТЕКСТ НОВОЇ НОВИНИ:
 {raw_text}
 
 ГОТОВИЙ ПОСТ У ФОРМАТІ HTML (АБО СЛОВО SKIP):"""
@@ -279,7 +330,7 @@ def generate_channel_post(raw_text, recent_titles):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — суто факти без особистих суджень українською мовою."},
+                    {"role": "system", "content": "Ти професійний український новинний редактор. Твоє першочергове завдання — не допускати повторів новин у каналі під жодним приводом."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.15,
@@ -299,13 +350,10 @@ def generate_channel_post(raw_text, recent_titles):
                 
                 return result.strip()
             elif resp.status_code == 429:
-                logger.warning("Groq ліміт (429), чекаємо 6 секунд...")
                 time.sleep(6)
             else:
-                logger.error(f"Помилка Groq ({resp.status_code}): {resp.text}")
                 break
-        except Exception as e:
-            logger.error(f"Збій запиту до Groq: {e}")
+        except Exception:
             break
 
     return None
@@ -325,7 +373,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
                 res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
                 if res.status_code == 200:
                     return True
-                logger.warning(f"sendPhoto файл помилка ({res.status_code}): {res.text}")
+                logger.warning(f"sendPhoto помилка ({res.status_code}): {res.text}")
 
         # Відправка відео файлом:
         if media_type == 'video' and media_url:
@@ -336,9 +384,9 @@ def post_to_telegram(text, media_type=None, media_url=None):
                 res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
                 if res.status_code == 200:
                     return True
-                logger.warning(f"sendVideo файл помилка ({res.status_code}): {res.text}")
+                logger.warning(f"sendVideo помилка ({res.status_code}): {res.text}")
 
-        # Якщо без медіа або медіа не скачалося:
+        # Текстове повідомлення:
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
@@ -348,15 +396,18 @@ def post_to_telegram(text, media_type=None, media_url=None):
         res = requests.post(f"{base_url}/sendMessage", json=payload, timeout=15)
         return res.status_code == 200
     except Exception as e:
-        logger.error(f"Помилка відправки в Telegram: {e}")
+        logger.error(f"Помилка відправки: {e}")
         return False
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
 def main_loop():
-    logger.info("Бот запущено успішно...")
+    logger.info("Бот запущено з регулярною синхронізацією каналу...")
 
     while True:
         try:
+            # Оновлюємо стрічку з вашого каналу кожні 10 хвилин
+            sync_with_my_channel()
+
             now_utc = datetime.datetime.now(datetime.timezone.utc)
             kyiv_hour = (now_utc.hour + 2) % 24
             is_night = kyiv_hour >= 23 or kyiv_hour < 6
@@ -375,21 +426,25 @@ def main_loop():
             max_posts_this_cycle = 3 if len(all_candidates) >= 5 and not is_night else 1
             posts_published = 0
 
-            recent_titles = state.get("recent_titles", [])
+            past_posts = state.get("recent_channel_posts", [])
 
             for h, item in all_candidates:
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                res = generate_channel_post(item['text'], recent_titles)
+                # 1. Швидкий людський фільтр за числами та ключовими темами каналу
+                if is_duplicate_human_logic(item['text'], past_posts):
+                    state["posted_hashes"].append(h)
+                    continue
+
+                # 2. Нейромережевий аналіз на повтор по суті
+                res = generate_channel_post(item['text'], past_posts)
                 
-                # Якщо модель повернула SKIP — це усвідомлений повтор, запам'ятовуємо хеш
                 if res == "SKIP":
                     state["posted_hashes"].append(h)
                     time.sleep(2)
                     continue
 
-                # Якщо був збій мережі чи API — НЕ викидаємо новину, спробуємо пізніше!
                 if not res:
                     time.sleep(3)
                     continue
@@ -407,16 +462,15 @@ def main_loop():
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
-                    first_line = re.sub(r'<[^>]+>', '', formatted_post).split('\n')[0][:70]
-                    state.setdefault("recent_titles", []).append(first_line)
-                    recent_titles.append(first_line)
+                    first_line = re.sub(r'<[^>]+>', '', formatted_post).split('\n')[0][:80]
+                    state.setdefault("recent_channel_posts", []).append(first_line)
+                    past_posts.append(first_line)
 
                     save_state(state)
 
                     if posts_published < max_posts_this_cycle:
                         time.sleep(35)
 
-            # Адаптивний сон:
             if posts_published > 0:
                 sleep_time = 75
             elif is_night:
