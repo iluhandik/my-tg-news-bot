@@ -82,7 +82,7 @@ def get_working_groq_model():
     ACTIVE_MODEL = "qwen/qwen3.8-27b"
     return ACTIVE_MODEL
 
-# ----------------- ФІЛЬТР ШЛАКУ ТА ЗАКАЗУХИ -----------------
+# ----------------- ФІЛЬТР ШЛАКУ, ЗАКАЗУХИ ТА ЛОКАЛЬНИХ СКАНДАЛІВ -----------------
 JUNK_PHRASES = [
     # Реклама, казино, підписки
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
@@ -92,7 +92,7 @@ JUNK_PHRASES = [
     "бахматов", "статки на мільйони", "збагатився", "копати ями", "ями для туалетів",
     # Жовта преса
     "голлівуд", "шекспірівськ", "гордон", "продюсер", "шоу-бізнес",
-    # Погода і побут
+    # Погода і дрібний кримінал
     "прогноз погоди", "синоптики попередили", "похолодання", "магнітні бурі",
     "вчені назвали", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
     "п'яний водій", "напідпитку", "врізався в стовп", "побив сусіда", "вкрав",
@@ -119,11 +119,11 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_channel_posts": [], "last_sync_time": 0, "last_post_time": 0}
+    return {"posted_hashes": [], "recent_channel_posts": [], "initialized": False, "last_post_time": 0}
 
 def save_state(state):
     try:
-        state["posted_hashes"] = state["posted_hashes"][-350:]
+        state["posted_hashes"] = state["posted_hashes"][-400:]
         state["recent_channel_posts"] = state["recent_channel_posts"][-40:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -142,6 +142,27 @@ def clean_raw_text(text):
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
+# Фільтр локальної комуналки та дрібних міських скандалів
+def is_local_communal_junk(text):
+    low = text.lower()
+    # Якщо є приліт, ракетний удар чи руйнування — це НАДЗВИЧАЙНА подія
+    emergency_markers = ["удар", "приліт", "ракета", "шахед", "вибух", "пожеж", "атака", "загибл", "поранен", "руйнуван"]
+    if any(em in low for em in emergency_markers):
+        return False
+
+    communal_words = [
+        "екстрені відключення", "аварійні відключення", "графіки відключень", 
+        "перебої у постачанні", "постачання світла", "водопостачан", "порив мереж",
+        "ремонтні роботи", "комунальники", "перекрили дорогу", "перекриття дороги",
+        "перекрили рух", "виноградар", "троєщин", "київтеплоенерго",
+        "раціонально використовувати електроприлади", "навантаження на мережі"
+    ]
+    if any(cw in low for cw in communal_words):
+        logger.info("Відсіяно локальну комуналку / побутовий протест.")
+        return True
+
+    return False
+
 def is_junk_news(text):
     low = text.lower()
     if len(text) < 65:
@@ -149,6 +170,8 @@ def is_junk_news(text):
     for phrase in JUNK_PHRASES:
         if phrase in low:
             return True
+    if is_local_communal_junk(text):
+        return True
     return False
 
 def get_text_stem_words(text):
@@ -156,38 +179,7 @@ def get_text_stem_words(text):
     words = text_clean.split()
     return {w[:5] for w in words if len(w) > 3 and w not in STOP_WORDS}
 
-# ----------------- СИНХРОНІЗАЦІЯ З КАНАЛОМ -----------------
-def sync_with_my_channel(force=False):
-    now = time.time()
-    if not force and (now - state.get("last_sync_time", 0)) < 600:
-        return
-
-    try:
-        url = "https://t.me/s/kropivnit"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-        if resp.status_code == 200:
-            raw_html = resp.text
-            matches = re.findall(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', raw_html, re.DOTALL)
-            channel_posts = []
-            for raw in matches[-30:]:
-                clean = re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', '\n', raw))
-                clean = html.unescape(clean_raw_text(clean)).strip()
-                if len(clean) > 20:
-                    first_line = clean.split('\n')[0][:80]
-                    channel_posts.append(first_line)
-                    state["posted_hashes"].append(str(hash(clean[:120])))
-
-            if channel_posts:
-                state["recent_channel_posts"] = channel_posts
-                state["last_sync_time"] = now
-                save_state(state)
-                logger.info(f"Синхронізовано {len(channel_posts)} свіжих постів з каналу @kropivnit!")
-    except Exception as e:
-        logger.error(f"Помилка синхронізації з каналом: {e}")
-
-sync_with_my_channel(force=True)
-
-# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР -----------------
+# ----------------- ЛЮДСЬКИЙ АНАЛІЗ НА ПОВТОР (ПОВНИЙ ТЕКСТ + ЧИСЛА) -----------------
 def is_duplicate_human_logic(candidate_text, past_posts):
     low_cand = candidate_text.lower()
     cand_stems = get_text_stem_words(candidate_text)
@@ -199,19 +191,21 @@ def is_duplicate_human_logic(candidate_text, past_posts):
         low_past = past.lower()
         past_stems = get_text_stem_words(past)
 
+        # 1. Якщо однакове рідкісне число (наприклад 16 млрд) і схожа тема
         past_numbers = {n for n in re.findall(r'\b\d+\b', low_past) if int(n) >= 5}
         shared_nums = meaningful_numbers & past_numbers
         if shared_nums:
             shared_words = cand_stems & past_stems
             if len(shared_words) >= 2:
-                logger.info(f"Заблоковано повтор за цифрою {shared_nums} та темою: {past}")
+                logger.info(f"Заблоковано повтор за цифрою {shared_nums} та темою: {past[:60]}")
                 return True
 
+        # 2. Смислова схожість слів
         intersection = len(cand_stems & past_stems)
         union = len(cand_stems | past_stems)
         similarity = intersection / union if union > 0 else 0
-        if similarity >= 0.28:
-            logger.info(f"Заблоковано смисловий повтор ({similarity:.2f}) з: {past}")
+        if similarity >= 0.26:
+            logger.info(f"Заблоковано смисловий повтор ({similarity:.2f}) з: {past[:60]}")
             return True
 
     return False
@@ -261,11 +255,10 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            # ЗБИРАЄМО ВСІ МЕДІА (ДЛЯ АЛЬБОМІВ), СУВОРО БЕЗ АВАТАРОК:
+            # ЗБИРАЄМО МЕДІА (СУВОРО БЕЗ АВАТАРОК):
             videos = re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
             photos = re.findall(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
-            # Формуємо список медіа
             media_list = []
             for v_url in videos:
                 media_list.append({"type": "video", "url": v_url})
@@ -284,23 +277,24 @@ def scrape_donor(channel_username):
 
 # ----------------- РЕДАКТОР НОВИН -----------------
 def generate_channel_post(raw_text, past_posts):
-    channel_history = "\n".join([f"• {p}" for p in past_posts[-15:]])
+    channel_history = "\n".join([f"• {p[:120]}" for p in past_posts[-15:]])
 
-    prompt = f"""Ти — випусковий редактор провідного українського новинного Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — перетворити текст у красиву, солідну новину з акцентами та цитатами БЕЗ ЗАКАЗУХИ.
+    prompt = f"""Ти — випусковий редактор провідного всеукраїнського новинного Telegram-каналу "NEWS УКРАЇНА 365".
+Твоє завдання — перетворити текст у красиву, солідну новину з акцентами та цитатами БЕЗ СПАМУ ТА ЗАКАЗУХИ.
 
 ОСЬ НОВИНИ, ЯКІ ВЖЕ ВИЙШЛИ В НАШОМУ КАНАЛІ:
 {channel_history}
 
-СУВОРІ ПРАВИЛА ЗВІРКИ ТА ФІЛЬТРАЦІЇ:
-- Якщо новина розповідає про ТУ САМУ ТЕМУ або подію — пиши ТІЛЬКИ: SKIP
-- КАТЕГОРИЧНО ЗАБОРОНЕНО публікувати політичну заказуху, джинсу, зведення особистих рахунків та чорний піар (звинувачення без вироку суду, плітки про премії та майно родичів чиновників/активістів). Якщо новина схожа на замовний наїзд — пиши: SKIP!
+СУВОРІ ПРАВИЛА ФІЛЬТРАЦІЇ:
+- Якщо новина розповідає про ТУ САМУ ТЕМУ або подію (наприклад, $16 млрд допомоги США чи перекриття дороги) — пиши ТІЛЬКИ: SKIP
+- КАТЕГОРИЧНО ЗАБОРОНЕНО локальну побутову комуналку та протести через світло — пиши SKIP!
+- КАТЕГОРИЧНО ЗАБОРОНЕНО політичну заказуху та чорний піар — пиши: SKIP!
 
 ПРАВИЛА ОФОРМЛЕННЯ:
 1. ПЕРШИЙ РЯДОК — завжди жирний заголовок у <b>...</b> з тематичним емодзі.
 2. Порожній рядок.
 3. ОСНОВНИЙ ТЕКСТ — 1-2 повні інформативні абзаци.
-   - Виділяй тегами <b>...</b> ГОЛОВНІ СЛОВА, ключові цифри та прізвища (наприклад: <b>ЗСУ</b>, <b>$16 млрд</b>, <b>понад 100 людей</b>).
+   - Виділяй тегами <b>...</b> ГОЛОВНІ СЛОВА, ключові цифри та прізвища (наприклад: <b>ЗСУ</b>, <b>$16 млрд</b>).
    - Пряму мову оформлюй як красиву цитату в лапках: «Текст цитати...», — <b>Прізвище</b>.
 4. КАТЕГОРИЧНО ЗАБОРОНЕНО:
    ❌ Слово "ВСУ" — ТІЛЬКИ "ЗСУ"!
@@ -324,7 +318,7 @@ def generate_channel_post(raw_text, past_posts):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти топовий український новинний редактор. Твої тексти солідні, структуровані, без чорного піару та джинси."},
+                    {"role": "system", "content": "Ти топовий український новинний редактор. Твої тексти солідні, структуровані, без джинси та повторів."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.15,
@@ -365,17 +359,17 @@ def generate_channel_post(raw_text, past_posts):
 
     return None
 
-# ----------------- ВІДПРАВКА В TELEGRAM З ПІДТРИМКОЮ АЛЬБОМІВ -----------------
+# ----------------- ВІДПРАВКА В TELEGRAM -----------------
 def post_to_telegram(text, media_list=[]):
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     caption = text[:1020]
     
     try:
-        # 1. ЯКЩО ЦЕ АЛЬБОМ (2 ТА БІЛЬШЕ ФОТО/ВІДЕО) -> sendMediaGroup:
+        # АЛЬБОМИ (2 І БІЛЬШЕ ФОТО/ВІДЕО):
         if len(media_list) > 1:
             media_group = []
             files = {}
-            for idx, item in enumerate(media_list[:6]): # До 6 медіафайлів в один альбом
+            for idx, item in enumerate(media_list[:6]):
                 try:
                     r = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
                     if r.status_code == 200:
@@ -398,9 +392,8 @@ def post_to_telegram(text, media_list=[]):
                 res = requests.post(f"{base_url}/sendMediaGroup", data=data, files=files, timeout=40)
                 if res.status_code == 200:
                     return True
-                logger.warning(f"sendMediaGroup помилка ({res.status_code}), пробуємо як одиночне фото...")
 
-        # 2. ЯКЩО ОДНЕ ФОТО АБО ВІДЕО:
+        # ОДИН ФАЙЛ:
         if media_list:
             item = media_list[0]
             if item["type"] == 'photo':
@@ -421,7 +414,7 @@ def post_to_telegram(text, media_list=[]):
                     if res.status_code == 200:
                         return True
 
-        # 3. ТЕКСТОВИЙ РЕЗЕРВ:
+        # ТЕКСТ:
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
@@ -434,14 +427,27 @@ def post_to_telegram(text, media_list=[]):
         logger.error(f"Помилка відправки: {e}")
         return False
 
-# ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
+# ----------------- ГОЛОВНИЙ ЦИКЛ З ЗАХИСТОМ ПРИ ПЕРЕЗАПУСКУ -----------------
 def main_loop():
     logger.info("Бот запущено успішно...")
 
+    # ЗАХИСТ ВІД АМНЕЗІЇ (COLD-START SHIELD):
+    # При першому старті запам'ятовуємо всі наявні повідомлення донорів як вже прочитані,
+    # щоб НЕ викидати старі ранкові новини при оновленні сервера!
+    if not state.get("initialized"):
+        logger.info("Ініціалізація бази: скануємо донорів, щоб не постити старі новини після перезапуску...")
+        for donor in DONOR_CHANNELS:
+            items = scrape_donor(donor)
+            for item in items:
+                h = str(hash(item['text'][:120]))
+                state["posted_hashes"].append(h)
+            time.sleep(0.5)
+        state["initialized"] = True
+        save_state(state)
+        logger.info("Ініціалізація завершена! Тепер публікуватимуться ВИКЛЮЧНО НОВІ події, які з'являться відтепер.")
+
     while True:
         try:
-            sync_with_my_channel()
-
             now_utc = datetime.datetime.now(datetime.timezone.utc)
             kyiv_hour = (now_utc.hour + 2) % 24
             is_night = kyiv_hour >= 23 or kyiv_hour < 6
@@ -455,7 +461,7 @@ def main_loop():
                         all_candidates.append((h, item))
                 time.sleep(1.2)
 
-            logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
+            logger.info(f"Знайдено нових кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
             max_posts_this_cycle = 3 if len(all_candidates) >= 5 and not is_night else 1
             posts_published = 0
@@ -466,6 +472,7 @@ def main_loop():
                 if posts_published >= max_posts_this_cycle:
                     break
 
+                # Перевірка на повтор за повним змістом та цифрами
                 if is_duplicate_human_logic(item['text'], past_posts):
                     state["posted_hashes"].append(h)
                     continue
@@ -494,9 +501,10 @@ def main_loop():
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
-                    first_line = re.sub(r'<[^>]+>', '', formatted_post).split('\n')[0][:80]
-                    state.setdefault("recent_channel_posts", []).append(first_line)
-                    past_posts.append(first_line)
+                    # Зберігаємо повний текст новини (перші 250 символів), щоб бот точно пам'ятав цифри і суть
+                    clean_content = re.sub(r'<[^>]+>', '', formatted_post)[:250]
+                    state.setdefault("recent_channel_posts", []).append(clean_content)
+                    past_posts.append(clean_content)
 
                     save_state(state)
 
