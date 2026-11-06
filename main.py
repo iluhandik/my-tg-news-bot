@@ -68,12 +68,20 @@ def get_working_groq_model():
         resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
         if resp.status_code == 200:
             live_ids = [m["id"] for m in resp.json().get("data", [])]
+            # Шукаємо моделі з високим лімітом (openai/gpt-oss або qwen)
+            for m in live_ids:
+                if "gpt-oss" in m.lower():
+                    ACTIVE_MODEL = m
+                    logger.info(f"Обрано модель з високим лімітом токенів: {ACTIVE_MODEL}")
+                    return ACTIVE_MODEL
+            for m in live_ids:
+                if "qwen" in m.lower():
+                    ACTIVE_MODEL = m
+                    logger.info(f"Обрано діючу модель Groq: {ACTIVE_MODEL}")
+                    return ACTIVE_MODEL
+            # Резерв
             chat_models = [m for m in live_ids if "whisper" not in m.lower() and "guard" not in m.lower()]
             if chat_models:
-                for m in chat_models:
-                    if "qwen" in m.lower():
-                        ACTIVE_MODEL = m
-                        return ACTIVE_MODEL
                 ACTIVE_MODEL = chat_models[0]
                 return ACTIVE_MODEL
     except Exception as e:
@@ -109,7 +117,7 @@ def load_state():
 def save_state(state):
     try:
         state["posted_hashes"] = state["posted_hashes"][-300:]
-        state["recent_titles"] = state["recent_titles"][-30:]
+        state["recent_titles"] = state["recent_titles"][-25:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -146,7 +154,7 @@ def sync_with_my_channel():
             raw_html = resp.text
             matches = re.findall(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', raw_html, re.DOTALL)
             count = 0
-            for raw in matches[-15:]:
+            for raw in matches[-12:]:
                 clean = re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', '\n', raw))
                 clean = html.unescape(clean_raw_text(clean)).strip()
                 first_line = clean.split('\n')[0][:70]
@@ -161,7 +169,7 @@ def sync_with_my_channel():
 
 sync_with_my_channel()
 
-# ----------------- ПАРСИНГ ТІЛЬКИ СВІЖИХ НОВИН -----------------
+# ----------------- ПАРСИНГ З ТОЧНИМ ВІДБІРОМ ФОТО (БЕЗ АВАТАРОК) -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -175,7 +183,7 @@ def scrape_donor(channel_username):
         results = []
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        latest_blocks = raw_messages[-4:] if len(raw_messages) > 4 else raw_messages[1:]
+        latest_blocks = raw_messages[-5:] if len(raw_messages) > 5 else raw_messages[1:]
 
         for msg_block in reversed(latest_blocks):
             time_match = re.search(r'<time[^>]+datetime="([^"]+)"', msg_block)
@@ -187,7 +195,8 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
-                if age_seconds > 2.0 * 3600 or age_seconds < -120:
+                # Свіжі новини за останні 3.5 години
+                if age_seconds > 3.5 * 3600 or age_seconds < -120:
                     continue
             except Exception:
                 continue
@@ -205,8 +214,11 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
+            # ТОЧНИЙ ПОШУК МЕДІА (КАТЕГОРИЧНО БЕЗ АВАТАРОК!):
             video_match = re.search(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
-            photo_match = re.search(r'background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE) or re.search(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            
+            # Шукаємо фото ВИКЛЮЧНО всередині photo_wrap, повністю ігноруючи аватарки користувачів:
+            photo_match = re.search(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
             media_type = None
             media_url = None
@@ -229,18 +241,19 @@ def scrape_donor(channel_username):
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН -----------------
+# ----------------- РЕДАКТОР НОВИН З ЛЕГКИМ ЗАПИТОМ (БЕЗ 429) -----------------
 def generate_channel_post(raw_text, recent_titles):
-    titles_summary = "\n".join([f"• {t}" for t in recent_titles[-15:]])
+    # Беремо тільки останні 5 тем для перевірки (економить 80% токенів!)
+    titles_summary = "\n".join([f"• {t}" for t in recent_titles[-6:]])
 
     prompt = f"""Ти — професійний новинний репортер Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — подавати ЧИСТІ ФАКТИ В СОЛІДНОМУ СТИЛІ БЕЗ ВЛАСНОЇ ДУМКИ.
+Подавай ЧИСТІ ФАКТИ В СОЛІДНОМУ ЖУРНАЛІСТСЬКОМУ СТИЛІ БЕЗ ВЛАСНОЇ ДУМКИ.
 
-ОСТАННІ ТЕМИ В НАШОМУ КАНАЛІ (ЯКЩО НОВИНА ОПИСУЄ ЦЮ САМУ ПОДІЮ — ПИШИ SKIP):
+ОСТАННІ ТЕМИ В НАШОМУ КАНАЛІ (ЯКЩО НОВИНА ОПИСУЄ ЦЮ САМУ ПОДІЮ — ПИШИ ТІЛЬКИ SKIP):
 {titles_summary}
 
-КАТЕГОРИЧНІ ПРАВИЛА:
-❌ СУВОРО ЗАБОРОНЕНО писати особисту суб'єктивну думку та моралізаторство («Уявіть собі», «Це подвійні стандарти»). Тільки факти і пряма мова!
+ПРАВИЛА:
+❌ СУВОРО ЗАБОРОНЕНО писати особисту суб'єктивну думку, коментарі («Уявіть собі», «Це подвійні стандарти»). Тільки факти і пряма мова!
 ❌ ЖОДНИХ росіянізмів: "позор" (тільки "ганьба"), "толпа" (тільки "натовп"), "– ГВА".
 ❌ НІЯКИХ рамок blockquote!
 
@@ -266,18 +279,18 @@ def generate_channel_post(raw_text, recent_titles):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — чисті факти без особистих суджень українською мовою."},
+                    {"role": "system", "content": "Ти об'єктивний новинний редактор. Твої тексти — суто факти без особистих суджень українською мовою."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.15,
-                "max_tokens": 400
+                "max_tokens": 380
             }
             resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
             if resp.status_code == 200:
                 data = resp.json()
                 result = data['choices'][0]['message']['content'].strip()
                 if "SKIP" in result.upper()[:15]:
-                    return None
+                    return "SKIP"
                 result = re.sub(r'</?blockquote[^>]*>', '', result)
                 
                 result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
@@ -286,21 +299,24 @@ def generate_channel_post(raw_text, recent_titles):
                 
                 return result.strip()
             elif resp.status_code == 429:
-                time.sleep(8)
+                logger.warning("Groq ліміт (429), чекаємо 6 секунд...")
+                time.sleep(6)
             else:
+                logger.error(f"Помилка Groq ({resp.status_code}): {resp.text}")
                 break
-        except Exception:
+        except Exception as e:
+            logger.error(f"Збій запиту до Groq: {e}")
             break
 
     return None
 
-# ----------------- ВІДПРАВКА В TELEGRAM З ПРЯМИМ ЗАВАНТАЖЕННЯМ ФАЙЛУ -----------------
+# ----------------- ВІДПРАВКА В TELEGRAM -----------------
 def post_to_telegram(text, media_type=None, media_url=None):
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    caption = text[:1020] # Захист від ліміту довжини підпису Телеграму
+    caption = text[:1020]
     
     try:
-        # ПРЯМЕ ЗАВАНТАЖЕННЯ ФОТО ЯК ФАЙЛУ (ГАРАНТОВАНА ВІДПРАВКА):
+        # Відправка фото файлом:
         if media_type == 'photo' and media_url:
             img_res = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
             if img_res.status_code == 200:
@@ -311,7 +327,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
                     return True
                 logger.warning(f"sendPhoto файл помилка ({res.status_code}): {res.text}")
 
-        # ПРЯМЕ ЗАВАНТАЖЕННЯ ВІДЕО:
+        # Відправка відео файлом:
         if media_type == 'video' and media_url:
             vid_res = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
@@ -322,7 +338,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
                     return True
                 logger.warning(f"sendVideo файл помилка ({res.status_code}): {res.text}")
 
-        # Текстовий резерв:
+        # Якщо без медіа або медіа не скачалося:
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
@@ -332,7 +348,7 @@ def post_to_telegram(text, media_type=None, media_url=None):
         res = requests.post(f"{base_url}/sendMessage", json=payload, timeout=15)
         return res.status_code == 200
     except Exception as e:
-        logger.error(f"Помилка відправки: {e}")
+        logger.error(f"Помилка відправки в Telegram: {e}")
         return False
 
 # ----------------- ГОЛОВНИЙ ЦИКЛ -----------------
@@ -356,7 +372,7 @@ def main_loop():
 
             logger.info(f"Знайдено кандидатів: {len(all_candidates)} (Ніч: {is_night})")
 
-            max_posts_this_cycle = 3 if len(all_candidates) >= 6 and not is_night else 1
+            max_posts_this_cycle = 3 if len(all_candidates) >= 5 and not is_night else 1
             posts_published = 0
 
             recent_titles = state.get("recent_titles", [])
@@ -365,11 +381,20 @@ def main_loop():
                 if posts_published >= max_posts_this_cycle:
                     break
 
-                formatted_post = generate_channel_post(item['text'], recent_titles)
-                if not formatted_post:
+                res = generate_channel_post(item['text'], recent_titles)
+                
+                # Якщо модель повернула SKIP — це усвідомлений повтор, запам'ятовуємо хеш
+                if res == "SKIP":
                     state["posted_hashes"].append(h)
                     time.sleep(2)
                     continue
+
+                # Якщо був збій мережі чи API — НЕ викидаємо новину, спробуємо пізніше!
+                if not res:
+                    time.sleep(3)
+                    continue
+
+                formatted_post = res
 
                 if re.search(r'[ыэъёЫЭЪЁ]', formatted_post):
                     state["posted_hashes"].append(h)
@@ -378,7 +403,7 @@ def main_loop():
                 success = post_to_telegram(formatted_post, item.get('media_type'), item.get('media_url'))
                 if success:
                     posts_published += 1
-                    logger.info(f"Опубліковано чисту новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']}!")
+                    logger.info(f"Опубліковано чисту новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']} (Медіа: {item.get('media_type')})!")
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
@@ -391,6 +416,7 @@ def main_loop():
                     if posts_published < max_posts_this_cycle:
                         time.sleep(35)
 
+            # Адаптивний сон:
             if posts_published > 0:
                 sleep_time = 75
             elif is_night:
