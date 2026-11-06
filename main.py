@@ -82,12 +82,17 @@ def get_working_groq_model():
     ACTIVE_MODEL = "qwen/qwen3.8-27b"
     return ACTIVE_MODEL
 
-# ----------------- ФІЛЬТР ШЛАКУ -----------------
+# ----------------- ФІЛЬТР ШЛАКУ ТА ЗАКАЗУХИ -----------------
 JUNK_PHRASES = [
+    # Реклама, казино, підписки
     "підписатися", "подписаться", "джерело:", "источник:", "реакція користувачів",
     "реакция пользователей", "реакції громадян", "надіслати новину", "став лайк",
     "розіграш", "казино", "онлайн-казино", "патріарх кирил", "філатов",
+    # Заказуха і чорний піар
+    "бахматов", "статки на мільйони", "збагатився", "копати ями", "ями для туалетів",
+    # Жовта преса
     "голлівуд", "шекспірівськ", "гордон", "продюсер", "шоу-бізнес",
+    # Погода і побут
     "прогноз погоди", "синоптики попередили", "похолодання", "магнітні бурі",
     "вчені назвали", "дієтологи", "гороскоп", "знак зодіаку", "курс валют",
     "п'яний водій", "напідпитку", "врізався в стовп", "побив сусіда", "вкрав",
@@ -102,7 +107,7 @@ STOP_WORDS = {
     "ми", "ви", "вони", "він", "вона", "воно", "я", "ти", "себе", "свій", "своя", "свої",
     "був", "була", "було", "були", "буде", "будуть", "є", "не", "ні", "так", "вже", "ще",
     "теж", "також", "лише", "тільки", "навіть", "дуже", "може", "можуть", "заявив", "повідомив",
-    "сказав", "зазначив", "йдеться", "відомо", "словами", "даними"
+    "сказав", "зазначив", "йдеється", "відомо", "словами", "даними"
 }
 
 STATE_FILE = "bot_state.json"
@@ -211,7 +216,7 @@ def is_duplicate_human_logic(candidate_text, past_posts):
 
     return False
 
-# ----------------- ПАРСИНГ З ДОНОРІВ -----------------
+# ----------------- ПАРСИНГ З ДОНОРІВ З ПІДТРИМКОЮ АЛЬБОМІВ -----------------
 def scrape_donor(channel_username):
     url = f"https://t.me/s/{channel_username}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -237,6 +242,7 @@ def scrape_donor(channel_username):
                 dt = datetime.datetime.fromisoformat(dt_str)
                 age_seconds = (now - dt).total_seconds()
                 
+                # Новини за останні 3.5 години
                 if age_seconds > 3.5 * 3600 or age_seconds < -120:
                     continue
             except Exception:
@@ -255,62 +261,51 @@ def scrape_donor(channel_username):
             if is_junk_news(raw_text):
                 continue
 
-            video_match = re.search(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
-            photo_match = re.search(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
+            # ЗБИРАЄМО ВСІ МЕДІА (ДЛЯ АЛЬБОМІВ), СУВОРО БЕЗ АВАТАРОК:
+            videos = re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)["\']', msg_block, re.IGNORECASE)
+            photos = re.findall(r'tgme_widget_message_photo_wrap[^>]+style=["\'][^"\']*background-image:url\([\'"]?(https?://[^\'")]+)', msg_block, re.IGNORECASE)
 
-            media_type = None
-            media_url = None
-
-            if video_match:
-                media_type = 'video'
-                media_url = video_match.group(1)
-            elif photo_match:
-                media_type = 'photo'
-                media_url = photo_match.group(1)
+            # Формуємо список медіа
+            media_list = []
+            for v_url in videos:
+                media_list.append({"type": "video", "url": v_url})
+            for p_url in photos:
+                media_list.append({"type": "photo", "url": p_url})
 
             results.append({
                 "channel": channel_username,
                 "text": raw_text,
-                "media_type": media_type,
-                "media_url": media_url
+                "media_list": media_list
             })
         return results
     except Exception as e:
         logger.error(f"Помилка парсингу @{channel_username}: {e}")
         return []
 
-# ----------------- РЕДАКТОР НОВИН З ЖИРНИМИ АКЦЕНТАМИ ТА ЦИТАТАМИ -----------------
+# ----------------- РЕДАКТОР НОВИН -----------------
 def generate_channel_post(raw_text, past_posts):
     channel_history = "\n".join([f"• {p}" for p in past_posts[-15:]])
 
     prompt = f"""Ти — випусковий редактор провідного українського новинного Telegram-каналу "NEWS УКРАЇНА 365".
-Твоє завдання — перетворити текст у красиву, солідну новину з акцентами та цитатами.
+Твоє завдання — перетворити текст у красиву, солідну новину з акцентами та цитатами БЕЗ ЗАКАЗУХИ.
 
 ОСЬ НОВИНИ, ЯКІ ВЖЕ ВИЙШЛИ В НАШОМУ КАНАЛІ:
 {channel_history}
 
-СУВОРЕ ПРАВИЛО ЗВІРКИ:
+СУВОРІ ПРАВИЛА ЗВІРКИ ТА ФІЛЬТРАЦІЇ:
 - Якщо новина розповідає про ТУ САМУ ТЕМУ або подію — пиши ТІЛЬКИ: SKIP
-- Якщо це нова подія — сформуй якісний пост.
+- КАТЕГОРИЧНО ЗАБОРОНЕНО публікувати політичну заказуху, джинсу, зведення особистих рахунків та чорний піар (звинувачення без вироку суду, плітки про премії та майно родичів чиновників/активістів). Якщо новина схожа на замовний наїзд — пиши: SKIP!
 
-ПРАВИЛА ОФОРМЛЕННЯ (СТИЛЬ ТОП-КАНАЛІВ):
+ПРАВИЛА ОФОРМЛЕННЯ:
 1. ПЕРШИЙ РЯДОК — завжди жирний заголовок у <b>...</b> з тематичним емодзі.
 2. Порожній рядок.
 3. ОСНОВНИЙ ТЕКСТ — 1-2 повні інформативні абзаци.
    - Виділяй тегами <b>...</b> ГОЛОВНІ СЛОВА, ключові цифри та прізвища (наприклад: <b>ЗСУ</b>, <b>$16 млрд</b>, <b>понад 100 людей</b>).
-   - Якщо є пряма мова — обов'язково оформлюй її як гарну цитату в лапках «...» з тире та автором в кінці:
-     «Текст цитати...», — <b>Прізвище/Посада</b>.
+   - Пряму мову оформлюй як красиву цитату в лапках: «Текст цитати...», — <b>Прізвище</b>.
 4. КАТЕГОРИЧНО ЗАБОРОНЕНО:
    ❌ Слово "ВСУ" — ТІЛЬКИ "ЗСУ"!
    ❌ Росіянізми: "толпа" (тільки "натовп"), "позор" (тільки "ганьба"), "у даний момент" (наразі).
    ❌ НІЯКИХ рамок blockquote!
-
-ЗРАЗОК ОФОРМЛЕННЯ:
-<b>🚨 Обшуки у приміщеннях «Київтеплоенерго»</b>
-
-Правоохоронці проводять масштабні обшуки в офісах та помешканнях керівництва <b>«Київтеплоенерго»</b>. Слідчі дії стосуються проектів <b>Плану енергетичної стійкості</b> столиці.
-
-«Ми співпрацюємо зі слідством та надаємо всі необхідні документи», — повідомили в <b>прес-службі підприємства</b>.
 
 ТЕКСТ НОВОЇ НОВИНИ:
 {raw_text}
@@ -329,7 +324,7 @@ def generate_channel_post(raw_text, past_posts):
             payload = {
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "Ти топовий український новинний редактор. Твої тексти солідні, структуровані, з виділеними жирним ключовими словами та красивими цитатами."},
+                    {"role": "system", "content": "Ти топовий український новинний редактор. Твої тексти солідні, структуровані, без чорного піару та джинси."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.15,
@@ -343,7 +338,7 @@ def generate_channel_post(raw_text, past_posts):
                     return "SKIP"
                 result = re.sub(r'</?blockquote[^>]*>', '', result)
                 
-                # ЖОРСТКИЙ АВТОКОРЕКТОР (ВСУ -> ЗСУ ТА КАЛЬКИ):
+                # Жорсткий автокоректор
                 result = re.sub(r'\bвсу\b', 'ЗСУ', result, flags=re.IGNORECASE)
                 result = re.sub(r'\bВСУ\b', 'ЗСУ', result)
                 result = re.sub(r'\bтолп[а-яіїє]*\b', 'натовп', result, flags=re.IGNORECASE)
@@ -360,8 +355,7 @@ def generate_channel_post(raw_text, past_posts):
                         continue
                     cleaned_lines.append(line)
                 
-                final_text = "\n".join(cleaned_lines).strip()
-                return final_text
+                return "\n".join(cleaned_lines).strip()
             elif resp.status_code == 429:
                 time.sleep(6)
             else:
@@ -371,35 +365,63 @@ def generate_channel_post(raw_text, past_posts):
 
     return None
 
-# ----------------- ВІДПРАВКА В TELEGRAM -----------------
-def post_to_telegram(text, media_type=None, media_url=None):
+# ----------------- ВІДПРАВКА В TELEGRAM З ПІДТРИМКОЮ АЛЬБОМІВ -----------------
+def post_to_telegram(text, media_list=[]):
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     caption = text[:1020]
     
     try:
-        # Відправка фото файлом:
-        if media_type == 'photo' and media_url:
-            img_res = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-            if img_res.status_code == 200:
-                files = {"photo": ("image.jpg", img_res.content, "image/jpeg")}
-                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-                res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
+        # 1. ЯКЩО ЦЕ АЛЬБОМ (2 ТА БІЛЬШЕ ФОТО/ВІДЕО) -> sendMediaGroup:
+        if len(media_list) > 1:
+            media_group = []
+            files = {}
+            for idx, item in enumerate(media_list[:6]): # До 6 медіафайлів в один альбом
+                try:
+                    r = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+                    if r.status_code == 200:
+                        field_name = f"media_{idx}"
+                        m_type = item["type"]
+                        ext = "mp4" if m_type == "video" else "jpg"
+                        mime = "video/mp4" if m_type == "video" else "image/jpeg"
+                        files[field_name] = (f"file_{idx}.{ext}", r.content, mime)
+                        
+                        obj = {"type": m_type, "media": f"attach://{field_name}"}
+                        if idx == 0:
+                            obj["caption"] = caption
+                            obj["parse_mode"] = "HTML"
+                        media_group.append(obj)
+                except Exception:
+                    continue
+            
+            if len(media_group) > 1:
+                data = {"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media_group)}
+                res = requests.post(f"{base_url}/sendMediaGroup", data=data, files=files, timeout=40)
                 if res.status_code == 200:
                     return True
-                logger.warning(f"sendPhoto помилка ({res.status_code}): {res.text}")
+                logger.warning(f"sendMediaGroup помилка ({res.status_code}), пробуємо як одиночне фото...")
 
-        # Відправка відео файлом:
-        if media_type == 'video' and media_url:
-            vid_res = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
-                files = {"video": ("video.mp4", vid_res.content, "video/mp4")}
-                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-                res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
-                if res.status_code == 200:
-                    return True
-                logger.warning(f"sendVideo помилка ({res.status_code}): {res.text}")
+        # 2. ЯКЩО ОДНЕ ФОТО АБО ВІДЕО:
+        if media_list:
+            item = media_list[0]
+            if item["type"] == 'photo':
+                img_res = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+                if img_res.status_code == 200:
+                    files = {"photo": ("image.jpg", img_res.content, "image/jpeg")}
+                    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                    res = requests.post(f"{base_url}/sendPhoto", data=data, files=files, timeout=25)
+                    if res.status_code == 200:
+                        return True
 
-        # Текстове повідомлення:
+            if item["type"] == 'video':
+                vid_res = requests.get(item["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if vid_res.status_code == 200 and len(vid_res.content) < 45 * 1024 * 1024:
+                    files = {"video": ("video.mp4", vid_res.content, "video/mp4")}
+                    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                    res = requests.post(f"{base_url}/sendVideo", data=data, files=files, timeout=35)
+                    if res.status_code == 200:
+                        return True
+
+        # 3. ТЕКСТОВИЙ РЕЗЕРВ:
         payload = {
             "chat_id": TELEGRAM_CHANNEL_ID,
             "text": text,
@@ -465,10 +487,10 @@ def main_loop():
                     state["posted_hashes"].append(h)
                     continue
 
-                success = post_to_telegram(formatted_post, item.get('media_type'), item.get('media_url'))
+                success = post_to_telegram(formatted_post, item.get('media_list', []))
                 if success:
                     posts_published += 1
-                    logger.info(f"Опубліковано чисту новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']} (Медіа: {item.get('media_type')})!")
+                    logger.info(f"Опубліковано чисту новину ({posts_published}/{max_posts_this_cycle}) з @{item['channel']} (Медіа: {len(item.get('media_list', []))})!")
                     state["posted_hashes"].append(h)
                     state["last_post_time"] = time.time()
 
