@@ -20,18 +20,35 @@ GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY") o
 PORT = int(os.environ.get("PORT", 10000))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
+# РОЗШИРЕНИЙ ТОП-СПИСОК ДОНОРІВ УКРАЇНИ
 DONOR_CHANNELS = [
+    # Оперативні мас-медіа та агрегатори
     "insiderUKR",
     "truexanewsua",
     "u_now",
     "kievreal1",
-    "nefedoov365"
+    "nefedoov365",
+    "RBC_ua_news",
+    "uniannet",
+    "lachentyt",
+    # Верифіковані офіційні ЗМІ
+    "suspilnenews",
+    "ukrpravda_news",
+    # Військові ексклюзиви та ППО
+    "operativnoZSU",
+    "Tsaplienko"
 ]
 
 STATE_FILE = "bot_state.json"
 
 # --- HEALTH CHECK HTTP SERVER & KEEP-ALIVE ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        # Відповідаємо 200 OK на системні пінги Render/UptimeRobot
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
@@ -108,11 +125,10 @@ def scrape_channel(channel_name):
     blocks = re.findall(r'(<div class="tgme_widget_message\b.*?)(?=<div class="tgme_widget_message\b|$)', html_content, re.DOTALL)
     
     for block in blocks:
-        # Extract donor username and message ID
         post_match = re.search(r'data-post=["\']([^"\']+)["\']', block)
         if not post_match:
             continue
-        data_post = post_match.group(1) # e.g. "insiderUKR/12345"
+        data_post = post_match.group(1)
         parts = data_post.split('/')
         donor_username = "@" + parts[0]
         try:
@@ -120,7 +136,6 @@ def scrape_channel(channel_name):
         except Exception:
             continue
 
-        # Extract text
         text_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
         raw_text = ""
         if text_match:
@@ -130,11 +145,9 @@ def scrape_channel(channel_name):
             raw_text = re.sub(r'<[^>]+>', '', raw_text)
             raw_text = html.unescape(raw_text).strip()
 
-        # Check if message contains media
         has_video = ('tgme_widget_message_video_player' in block or '<video' in block or 'tgme_widget_message_video_thumb' in block)
         has_photo = ('tgme_widget_message_photo_wrap' in block)
 
-        # Fallback photos if needed (strictly deduplicated)
         photos = []
         bg_urls = re.findall(r'background-image:\s*url\((?:&quot;|\'|")?([^&\'"\)\s]+)', block)
         for u in bg_urls:
@@ -289,7 +302,6 @@ def rewrite_news_with_groq(text, model_name):
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
     out = out.replace("<blockquote>", "").replace("</blockquote>", "")
 
-    # Meta-leak ban
     forbidden_meta = [
         r'\(у контексті', r'\*?примітка:?', r'я виправлю', r'я не можу', 
         r'давайте припустимо', r'перевіряю', r'за інструкцією', r'вхідний текст', 
@@ -309,7 +321,6 @@ def rewrite_news_with_groq(text, model_name):
             logger.warning("Post was cut off mid-sentence, dropping.")
             return None
 
-    # Exhaustive dictionary: Russian words & grammatical errors auto-fix
     ru_fixes = {
         r'\bГСЧС\b': 'ДСНС',
         r'\bгсчс\b': 'ДСНС',
@@ -331,15 +342,11 @@ def rewrite_news_with_groq(text, model_name):
 
 # --- POSTING TO TELEGRAM (NATIVE MEDIA COPYING) ---
 def publish_native_post(donor_channel, msg_id, text, has_media, photos):
-    """
-    Копіює оригінальне відео або фото напряму через сервери Telegram.
-    Зберігає 100% якість відео, звук, тривалість та нативний відеоплеєр.
-    """
     caption = text.strip()
     if len(caption) > 1020:
         caption = caption[:1015].rsplit(' ', 1)[0] + '...'
 
-    # 1. Якщо у донора було медіа (відео чи фото), використовуємо copyMessage
+    # 1. Якщо у донора є відео/фото — копіюємо оригінал нативно
     if has_media and donor_channel and msg_id:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/copyMessage"
         payload = {
@@ -362,7 +369,7 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
     # 2. Якщо це чисте фото (і copyMessage не спрацював)
     if photos:
         unique_photos = list(dict.fromkeys(photos))
-        for p_url in unique_photos[:1]: # беремо тільки одне головне фото, без дублів
+        for p_url in unique_photos[:1]:
             try:
                 headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://t.me/"}
                 resp = requests.get(p_url, headers=headers, timeout=15)
@@ -385,7 +392,7 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
 
 # --- MAIN AUTOMATION LOOP ---
 def main_loop():
-    logger.info("Initializing news bot with Native Media Cloner...")
+    logger.info("Initializing news bot with expanded donor pool...")
     state = load_state()
 
     # Cold start: populate hashes and key entities from donors
@@ -403,7 +410,7 @@ def main_loop():
     while True:
         try:
             model_name = get_working_groq_model()
-            logger.info(f"Checking donor channels using model: {model_name}...")
+            logger.info(f"Checking {len(DONOR_CHANNELS)} donor channels using model: {model_name}...")
 
             cutoff_time = time.time() - (36 * 3600)
             state["recent_entities"] = [
@@ -414,7 +421,8 @@ def main_loop():
 
             for channel in DONOR_CHANNELS:
                 items = scrape_channel(channel)
-                for item in items[-4:]:
+                # Скануємо останні 3 повідомлення з кожного каналу
+                for item in items[-3:]:
                     item_hash = item["hash"]
                     if not item_hash or item_hash in state["posted_hashes"]:
                         continue
@@ -423,14 +431,13 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # 1. Entity-based duplicate check
+                    # 1. Перевірка на дублі за сутностями
                     if is_duplicate_post(item["entities"], channel_posts, state["recent_entities"]):
-                        logger.info(f"Skipping duplicate event: {item['entities'][:3]}")
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # 2. Rewrite with journalistic rules
+                    # 2. Рерайтинг AI за журналістськими стандартами
                     rewritten = rewrite_news_with_groq(raw_text, model_name)
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
@@ -440,15 +447,14 @@ def main_loop():
                     if not rewritten:
                         continue
 
-                    # 3. Double-check rewritten text against channel
+                    # 3. Повторна перевірка згенерованого тексту проти історії
                     rewritten_entities = extract_key_entities(rewritten)
                     if is_duplicate_post(rewritten_entities, channel_posts, state["recent_entities"]):
-                        logger.info("Skipping rewritten duplicate.")
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # 4. Publish to Telegram natively
+                    # 4. Публікація в Telegram
                     has_media = item["has_video"] or item["has_photo"]
                     success = publish_native_post(
                         item["donor_channel"], 
@@ -459,7 +465,7 @@ def main_loop():
                     )
 
                     if success:
-                        logger.info("Successfully published post!")
+                        logger.info(f"Successfully published post from {item['donor_channel']}!")
                         state["posted_hashes"].append(item_hash)
                         state["recent_entities"].append({
                             "entities": item["entities"],
@@ -471,12 +477,12 @@ def main_loop():
                         channel_posts.append(rewritten)
                         time.sleep(15)
 
-                time.sleep(3)
+                time.sleep(1.5) # Пауза між донорами для захисту від блокувань
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
 
-        time.sleep(90)
+        time.sleep(60) # Швидка перевірка щохвилини для максимальної оперативності
 
 if __name__ == "__main__":
     t_http = threading.Thread(target=run_http_server, daemon=True)
