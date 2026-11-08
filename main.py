@@ -79,7 +79,7 @@ def run_keep_alive():
         except Exception as e:
             logger.warning(f"Keep-alive ping error: {e}")
 
-# --- DEDUPLICATION & STATE ---
+# --- STATE MANAGEMENT ---
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -87,7 +87,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_entities": []}
+    return {"posted_hashes": [], "recent_posts_context": []}
 
 def save_state(state):
     try:
@@ -99,18 +99,6 @@ def save_state(state):
 def get_hash(text):
     clean = re.sub(r'\W+', '', text.lower())
     return hashlib.md5(clean.encode('utf-8')).hexdigest()
-
-def extract_key_entities(text):
-    clean = re.sub(r'<[^>]+>', ' ', text).lower()
-    words = re.findall(r'[а-яіїєґa-z0-9]{4,}', clean)
-    stop_words = {
-        'який', 'яка', 'яке', 'які', 'його', 'її', 'цього', 'було', 'буде', 'коли', 
-        'також', 'після', 'через', 'про', 'для', 'новини', 'канал', 'підписатися', 
-        'фото', 'відео', 'повідомляє', 'заявив', 'каже', 'стало', 'відомо', 'повідомили', 
-        'словами', 'офіційно', 'року', 'сьогодні', 'зараз', 'україни', 'росії', 'російських',
-        'українських', 'період', 'області', 'районі', 'місті', 'внаслідок', 'людей'
-    }
-    return sorted(list(set(w for w in words if w not in stop_words)))
 
 # --- SCRAPER FOR TELEGRAM DONORS ---
 def scrape_channel(channel_name):
@@ -153,7 +141,6 @@ def scrape_channel(channel_name):
         has_video = ('tgme_widget_message_video_player' in block or '<video' in block)
         has_photo = ('tgme_widget_message_photo_wrap' in block)
 
-        # Збираємо ТІЛЬКИ повнорозмірні фотографії (відкидаємо video_thumb та link_preview)
         photos = []
         if not has_video:
             photo_matches = re.findall(r'class="[^"]*tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:\s*url\((?:&quot;|\'|")?([^&\'"\)\s]+)', block)
@@ -172,19 +159,17 @@ def scrape_channel(channel_name):
                 "has_video": has_video,
                 "has_photo": has_photo,
                 "photos": photos,
-                "hash": get_hash(raw_text) if raw_text else None,
-                "entities": extract_key_entities(raw_text)
+                "hash": get_hash(raw_text) if raw_text else None
             })
 
     return messages
 
-# --- ГЛИБОКЕ СКАНУВАННЯ ІСТОРІЇ КАНАЛУ (60-80 ПОСТІВ) ---
+# --- ГЛИБОКЕ ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ ---
 def get_channel_recent_posts(target_channel):
     posts = []
     clean_target = target_channel.lstrip('@')
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # Скануємо 3 сторінки назад через параметр before
     current_url = f"https://t.me/s/{clean_target}"
     for _ in range(3):
         try:
@@ -200,7 +185,6 @@ def get_channel_recent_posts(target_channel):
                 if clean and clean not in posts:
                     posts.append(clean)
 
-            # Шукаємо найстаріший ID для пагінації назад
             post_ids = re.findall(r'data-post=["\'][^/]+/(\d+)["\']', content)
             if post_ids:
                 oldest_id = min(int(x) for x in post_ids)
@@ -208,34 +192,10 @@ def get_channel_recent_posts(target_channel):
             else:
                 break
         except Exception as e:
-            logger.warning(f"Error reading channel history page: {e}")
+            logger.warning(f"Error reading channel history: {e}")
             break
 
-    logger.info(f"Loaded {len(posts)} historical posts from @{clean_target} for deep anti-duplicate check.")
     return posts
-
-def is_duplicate_post(candidate_entities, channel_posts, recent_state_entities):
-    if len(candidate_entities) < 2:
-        return False
-    cand_set = set(candidate_entities)
-
-    # 1. Перевірка кешу стану
-    for past_item in recent_state_entities:
-        past_set = set(past_item.get("entities", []))
-        common = cand_set & past_set
-        if len(common) >= 2 and len(common) / len(cand_set) >= 0.4:
-            logger.info(f"Duplicate blocked by state cache! Overlap: {common}")
-            return True
-
-    # 2. Глибока перевірка 60-80 постів каналу
-    for post_text in channel_posts:
-        p_entities = set(extract_key_entities(post_text))
-        common = cand_set & p_entities
-        # Якщо збігаються 2 важливих маркери (наприклад, 'кличко' + 'міст' або 'загиблих' + 'комишуваха')
-        if len(common) >= 2 and len(common) / len(cand_set) >= 0.4:
-            logger.info(f"Duplicate blocked by channel history! Overlap: {common}")
-            return True
-    return False
 
 # --- DYNAMIC GROQ MODEL DISCOVERY ---
 def get_working_groq_model():
@@ -261,8 +221,8 @@ def get_working_groq_model():
         logger.warning(f"Model lookup failed: {e}")
     return "llama-3.1-8b-instant"
 
-# --- AI REWRITE & JOURNALISTIC FACT GUARD ---
-def rewrite_news_with_groq(text, model_name):
+# --- AI РЕДАКТУРА ТА РОЗУМНЕ ВІДСІЮВАННЯ ДУБЛІВ ---
+def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
     if not GROQ_API_KEY or not text or len(text.strip()) < 30:
         return None
 
@@ -275,10 +235,10 @@ def rewrite_news_with_groq(text, model_name):
         "загинув 2024", "загинула в 2022", "загинула в 2023", "поховали на кладовищі"
     ]
     if any(m in lower_raw for m in memorial_words):
-        logger.info("Skipping past years memorial/obituary.")
+        logger.info("Skipping past years memorial.")
         return "SKIP"
 
-    # 2. Відсікаємо радарний нічний спам
+    # 2. Відсікаємо нічний радарний спам
     radar_words = [
         "летять на захід", "летять на схід", "курсом на", "вектор руху",
         "повітряна тривога в області", "загроза балістики", "ракета в напрямку",
@@ -288,24 +248,25 @@ def rewrite_news_with_groq(text, model_name):
         logger.info("Skipping transient flight radar alert.")
         return "SKIP"
 
-    # 3. Відсікаємо комуналку
-    local_fluff_keywords = [
-        "дтек ввів", "дтек запровадив", "екстрені відключення", "стабілізаційні відключення",
-        "графіки відключень", "ремонт водопроводу", "ремонт мосту", "перекрили рух",
-        "на південному мосту"
-    ]
-    if any(k in lower_raw for k in local_fluff_keywords) and "масований обстріл" not in lower_raw:
-        logger.info("Skipping local municipal/utility fluff.")
-        return "SKIP"
+    # 3. Формуємо стислий контекст останніх 15 публікацій на каналі
+    recent_context_lines = []
+    for i, p in enumerate(recent_channel_posts[:15], 1):
+        # беремо заголовок і перші 100 символів
+        snippet = p.replace('\n', ' ')[:120]
+        recent_context_lines.append(f"{i}. {snippet}")
+    context_str = "\n".join(recent_context_lines)
 
     system_prompt = (
-        "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
-        "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
-        "1. ПРАВДА ПРО УДАРИ ПО РФ: Якщо ЗСУ або дрони уразили ціль у РФ — новина ТІЛЬКИ про успішний удар ЗСУ! Заборонено цитувати версії ворога як факт.\n"
-        "2. ТОЧНІСТЬ МІСЦЯ: Місто в заголовку зобов'язане збігатися з місцем безпосередньої події.\n"
-        "3. НЕКРОЛОГИ МИНУЛИХ РОКІВ І РАДАРНИЙ СПАМ: Якщо новина — це стара згадка про загибель воїна у 2022-2024 рр. або хвилинне попередження про проліт дрона — пиши SKIP.\n"
-        "4. КАТЕГОРИЧНО ЗАБОРОНЕНО писати коментарі, примітки чи від першої особи.\n"
-        "5. Чиста українська: «ДСНС» (не «ГСЧС»), «вирва» (не «воронка»), «величезна» (не «огромна»).\n\n"
+        "ТИ — ДОСВІДЧЕНИЙ ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
+        f"ОСЬ ОСТАННІ НОВИНИ, ЯКІ ВЖЕ ВИЙШЛИ В КАНАЛІ:\n{context_str}\n\n"
+        "РОЗУМНИЙ РЕДАКТОРСЬКИЙ КОНТРОЛЬ ДУБЛІВ ТА АПДЕЙТІВ:\n"
+        "1. ЯКЩО ЦЕ ДУБЛЬ: Якщо вхідна новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (наприклад, той самий нічний удар по мосту на річці Міус, той самий міст Кличка, те саме число загиблих), "
+        "і НЕ МІСТИТЬ принципово нової інформації — ПОВЕРНИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
+        "2. ЯКЩО ЦЕ НОВИЙ ФАКТ / РОЗВИТОК ПОДІЙ: Якщо стався ПОВТОРНИЙ УДАР по тому ж об'єкту, міст повністю обвалився, з'явилися нові офіційні подробиці або нові підтверджені дані — "
+        "ЦЕ НЕ ДУБЛЬ! Напиши новий пост, чітко підкресливши оновлення (наприклад: «Повторний удар...», «З'явилися нові подробиці...»).\n"
+        "3. ПРАВДА ПРО УДАРИ ПО РФ: Якщо ЗСУ уразили об'єкт у РФ — новина ТІЛЬКИ про успішний удар ЗСУ!\n"
+        "4. КАТЕГОРИЧНО ЗАБОРОНЕНО писати примітки, міркування чи текст від першої особи.\n"
+        "5. Чиста українська мова: «ДСНС» (не «ГСЧС»), «вирва» (не «воронка»), «величезна» (не «огромна»).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -322,9 +283,9 @@ def rewrite_news_with_groq(text, model_name):
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Ось вихідна новина:\n\n{text}"}
+            {"role": "user", "content": f"Вхідна новина для аналізу:\n\n{text}"}
         ],
-        "temperature": 0.15,
+        "temperature": 0.1,
         "max_tokens": 800
     }
 
@@ -373,13 +334,12 @@ def rewrite_news_with_groq(text, model_name):
 
     return out
 
-# --- POSTING TO TELEGRAM (ANTI-BLUR MEDIA GUARD) ---
+# --- POSTING TO TELEGRAM (ANTI-BLUR GUARD) ---
 def publish_native_post(donor_channel, msg_id, text, has_media, photos):
     caption = text.strip()
     if len(caption) > 1020:
         caption = caption[:1015].rsplit(' ', 1)[0] + '...'
 
-    # 1. Спроба скопіювати нативно
     if has_media and donor_channel and msg_id:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/copyMessage"
         payload = {
@@ -398,14 +358,13 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
         except Exception as e:
             logger.warning(f"copyMessage exception: {e}")
 
-    # 2. Якщо це справжнє фото — перевіряємо його розмір на якість (Anti-Blur Guard)
+    # Захист від розмитих фото менше 30 Кб
     if photos:
         unique_photos = list(dict.fromkeys(photos))
         for p_url in unique_photos[:1]:
             try:
                 headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://t.me/"}
                 resp = requests.get(p_url, headers=headers, timeout=15)
-                # ЖОРСТКИЙ ФІЛЬТР: якщо картинка важить менше 30 Кб — це розмите мікро-прев'ю, відкидаємо!
                 if resp.status_code == 200 and len(resp.content) >= 30000:
                     files = {"photo": ("image.jpg", resp.content, "image/jpeg")}
                     data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
@@ -414,23 +373,21 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
                         logger.info(f"Published HIGH-RES photo ({len(resp.content)} bytes)!")
                         return True
                 else:
-                    logger.warning(f"Rejected low-res/blurry image ({len(resp.content)} bytes). Will post clean text.")
+                    logger.warning(f"Rejected blurry image ({len(resp.content)} bytes). Posting clean text.")
             except Exception as e:
                 logger.warning(f"Fallback photo upload failed: {e}")
 
-    # 3. Чистий текстовий пост (без розмитого піксельного мотлоху)
     logger.info("Publishing as clean text post...")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
     r = requests.post(url, json=payload, timeout=15)
     return r.json().get("ok", False)
 
-# --- MAIN AUTOMATION LOOP ---
+# --- MAIN LOOP ---
 def main_loop():
-    logger.info("Initializing news bot with Deep Memory & Anti-Blur Guard...")
+    logger.info("Initializing news bot with Semantic Intelligence...")
     state = load_state()
 
-    # Завантажуємо глибоку історію каналу (60-80 постів) одразу на старті
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
 
     if not state.get("posted_hashes"):
@@ -440,8 +397,6 @@ def main_loop():
             for m in msgs:
                 if m["hash"]:
                     state["posted_hashes"].append(m["hash"])
-                if m["entities"]:
-                    state["recent_entities"].append({"entities": m["entities"], "time": time.time()})
         save_state(state)
 
     loop_count = 0
@@ -450,14 +405,7 @@ def main_loop():
             model_name = get_working_groq_model()
             logger.info(f"Scanning {len(DONOR_CHANNELS)} channels using model: {model_name}...")
 
-            # Очищуємо застарілі сутності з кешу (старші 48 годин)
-            cutoff_time = time.time() - (48 * 3600)
-            state["recent_entities"] = [
-                e for e in state.get("recent_entities", []) if e.get("time", 0) > cutoff_time
-            ]
-
-            # Раз на 10 циклів оновлюємо глибоку історію каналу
-            if loop_count % 10 == 0:
+            if loop_count % 8 == 0:
                 channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
             loop_count += 1
 
@@ -472,15 +420,9 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # 1. Глибока перевірка на дублі проти 80 попередніх постів
-                    if is_duplicate_post(item["entities"], channel_posts, state["recent_entities"]):
-                        logger.info(f"Skipping duplicate: {item['entities'][:3]}")
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
-                        continue
-
-                    # 2. Редакторська обробка AI
-                    rewritten = rewrite_news_with_groq(raw_text, model_name)
+                    # РОЗУМНА ОБРОБКА: Модель сама аналізує контекст каналу і вирішує:
+                    # дубль це чи новий розвиток подій
+                    rewritten = process_news_with_smart_editorial(raw_text, model_name, channel_posts)
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
@@ -489,15 +431,7 @@ def main_loop():
                     if not rewritten:
                         continue
 
-                    # 3. Перевірка згенерованого тексту проти глибокої історії
-                    rewritten_entities = extract_key_entities(rewritten)
-                    if is_duplicate_post(rewritten_entities, channel_posts, state["recent_entities"]):
-                        logger.info("Skipping rewritten duplicate.")
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
-                        continue
-
-                    # 4. Публікація з фільтрацією якості зображень
+                    # Публікація в Telegram
                     has_media = item["has_video"] or item["has_photo"]
                     success = publish_native_post(
                         item["donor_channel"], 
@@ -508,12 +442,9 @@ def main_loop():
                     )
 
                     if success:
-                        logger.info(f"Published verified news from {item['donor_channel']}!")
+                        headline = rewritten.split('\n')[0]
+                        logger.info(f"Published: {headline}")
                         state["posted_hashes"].append(item_hash)
-                        state["recent_entities"].append({
-                            "entities": item["entities"],
-                            "time": time.time()
-                        })
                         if len(state["posted_hashes"]) > 2000:
                             state["posted_hashes"] = state["posted_hashes"][-1500:]
                         save_state(state)
