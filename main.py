@@ -20,23 +20,34 @@ GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY") o
 PORT = int(os.environ.get("PORT", 10000))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
-# РОЗШИРЕНИЙ ТОП-СПИСОК ДОНОРІВ УКРАЇНИ
+# ПОТУЖНИЙ ПУЛ ДОНОРІВ УКРАЇНИ (23 КАНАЛИ)
 DONOR_CHANNELS = [
-    # Оперативні мас-медіа та агрегатори
+    # Оперативні агрегатори-мільйонники
     "insiderUKR",
     "truexanewsua",
     "u_now",
     "kievreal1",
     "nefedoov365",
-    "RBC_ua_news",
-    "uniannet",
     "lachentyt",
-    # Верифіковані офіційні ЗМІ
+    "voynareal",
+    # Топові офіційні медіа та агентства
+    "RBC_ua_news",
     "suspilnenews",
+    "uniannet",
     "ukrpravda_news",
-    # Військові ексклюзиви та ППО
+    "babel",
+    "hromadske_ua",
+    "nvua_official",
+    "tsnua",
+    "znua_live",
+    "gruntmedia",
+    # Військовий блок, ППО та удари по тилу ворога
     "operativnoZSU",
-    "Tsaplienko"
+    "Tsaplienko",
+    "DeepStateUA",
+    "kpszsu",
+    "supernova_plus",
+    "mysiagin"
 ]
 
 STATE_FILE = "bot_state.json"
@@ -44,7 +55,6 @@ STATE_FILE = "bot_state.json"
 # --- HEALTH CHECK HTTP SERVER & KEEP-ALIVE ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
-        # Відповідаємо 200 OK на системні пінги Render/UptimeRobot
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -115,7 +125,7 @@ def scrape_channel(channel_name):
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             html_content = response.read().decode('utf-8', errors='ignore')
     except Exception as e:
         logger.warning(f"Failed to fetch {url}: {e}")
@@ -346,7 +356,6 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
     if len(caption) > 1020:
         caption = caption[:1015].rsplit(' ', 1)[0] + '...'
 
-    # 1. Якщо у донора є відео/фото — копіюємо оригінал нативно
     if has_media and donor_channel and msg_id:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/copyMessage"
         payload = {
@@ -366,7 +375,6 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
         except Exception as e:
             logger.warning(f"copyMessage exception: {e}")
 
-    # 2. Якщо це чисте фото (і copyMessage не спрацював)
     if photos:
         unique_photos = list(dict.fromkeys(photos))
         for p_url in unique_photos[:1]:
@@ -383,7 +391,6 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
             except Exception as e:
                 logger.warning(f"Fallback photo upload failed: {e}")
 
-    # 3. Текстовий пост
     logger.info("Publishing as text post...")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
@@ -392,10 +399,9 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
 
 # --- MAIN AUTOMATION LOOP ---
 def main_loop():
-    logger.info("Initializing news bot with expanded donor pool...")
+    logger.info(f"Initializing news bot with {len(DONOR_CHANNELS)} top donors...")
     state = load_state()
 
-    # Cold start: populate hashes and key entities from donors
     if not state.get("posted_hashes"):
         logger.info("Cold start: seeding existing messages into cache...")
         for ch in DONOR_CHANNELS:
@@ -410,7 +416,7 @@ def main_loop():
     while True:
         try:
             model_name = get_working_groq_model()
-            logger.info(f"Checking {len(DONOR_CHANNELS)} donor channels using model: {model_name}...")
+            logger.info(f"Scanning {len(DONOR_CHANNELS)} channels using model: {model_name}...")
 
             cutoff_time = time.time() - (36 * 3600)
             state["recent_entities"] = [
@@ -421,8 +427,8 @@ def main_loop():
 
             for channel in DONOR_CHANNELS:
                 items = scrape_channel(channel)
-                # Скануємо останні 3 повідомлення з кожного каналу
-                for item in items[-3:]:
+                # Перевіряємо 2 найсвіжіші публікації для максимальної швидкості
+                for item in items[-2:]:
                     item_hash = item["hash"]
                     if not item_hash or item_hash in state["posted_hashes"]:
                         continue
@@ -431,13 +437,13 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # 1. Перевірка на дублі за сутностями
+                    # 1. Фільтрація дублів за сутностями
                     if is_duplicate_post(item["entities"], channel_posts, state["recent_entities"]):
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # 2. Рерайтинг AI за журналістськими стандартами
+                    # 2. Редакторська обробка AI
                     rewritten = rewrite_news_with_groq(raw_text, model_name)
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
@@ -447,14 +453,14 @@ def main_loop():
                     if not rewritten:
                         continue
 
-                    # 3. Повторна перевірка згенерованого тексту проти історії
+                    # 3. Перевірка згенерованого тексту проти історії
                     rewritten_entities = extract_key_entities(rewritten)
                     if is_duplicate_post(rewritten_entities, channel_posts, state["recent_entities"]):
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # 4. Публікація в Telegram
+                    # 4. Нативна публікація з оригінальним медіа
                     has_media = item["has_video"] or item["has_photo"]
                     success = publish_native_post(
                         item["donor_channel"], 
@@ -465,24 +471,24 @@ def main_loop():
                     )
 
                     if success:
-                        logger.info(f"Successfully published post from {item['donor_channel']}!")
+                        logger.info(f"Published hot news from {item['donor_channel']}!")
                         state["posted_hashes"].append(item_hash)
                         state["recent_entities"].append({
                             "entities": item["entities"],
                             "time": time.time()
                         })
-                        if len(state["posted_hashes"]) > 1000:
-                            state["posted_hashes"] = state["posted_hashes"][-800:]
+                        if len(state["posted_hashes"]) > 1500:
+                            state["posted_hashes"] = state["posted_hashes"][-1000:]
                         save_state(state)
                         channel_posts.append(rewritten)
                         time.sleep(15)
 
-                time.sleep(1.5) # Пауза між донорами для захисту від блокувань
+                time.sleep(0.6) # Швидка пауза між каналами
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
 
-        time.sleep(60) # Швидка перевірка щохвилини для максимальної оперативності
+        time.sleep(45) # Цикл кожні 45 секунд — максимальний пульс новин
 
 if __name__ == "__main__":
     t_http = threading.Thread(target=run_http_server, daemon=True)
