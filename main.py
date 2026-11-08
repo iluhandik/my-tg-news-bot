@@ -87,7 +87,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"posted_hashes": [], "recent_posts_context": []}
+    return {"posted_hashes": [], "recent_published_posts": []}
 
 def save_state(state):
     try:
@@ -99,6 +99,30 @@ def save_state(state):
 def get_hash(text):
     clean = re.sub(r'\W+', '', text.lower())
     return hashlib.md5(clean.encode('utf-8')).hexdigest()
+
+def extract_canonical_roots(text):
+    t = text.lower()
+    t = t.replace('ы', 'и').replace('э', 'е').replace('ё', 'е').replace('ъ', '').replace('ь', '')
+    t = t.replace('и', 'і')
+
+    words = re.findall(r'[а-яіїєґ0-9]{3,}', t)
+    stop_roots = {
+        'який', 'яка', 'яке', 'які', 'його', 'цього', 'було', 'буде', 'коли', 
+        'також', 'після', 'через', 'про', 'для', 'новини', 'канал', 'підписатися', 
+        'фото', 'відео', 'повідомляє', 'заявив', 'каже', 'стало', 'відомо', 'повідомили', 
+        'словами', 'офіційно', 'року', 'сьогодні', 'зараз', 'украї', 'росі', 'облас', 
+        'район', 'місті', 'внасл', 'людей', 'траси', 'нового', 'перший', 'повідо'
+    }
+
+    roots = set()
+    for w in words:
+        root = w[:5] if len(w) >= 5 else w
+        if root in stop_roots:
+            continue
+        if root.startswith('міст'):
+            root = 'мост' + root[4:]
+        roots.add(root)
+    return roots
 
 # --- SCRAPER FOR TELEGRAM DONORS ---
 def scrape_channel(channel_name):
@@ -159,31 +183,36 @@ def scrape_channel(channel_name):
                 "has_video": has_video,
                 "has_photo": has_photo,
                 "photos": photos,
-                "hash": get_hash(raw_text) if raw_text else None
+                "hash": get_hash(raw_text) if raw_text else None,
+                "roots": extract_canonical_roots(raw_text)
             })
 
     return messages
 
-# --- ГЛИБОКЕ ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ ---
+# --- ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ (СВІЖІ ПОСТИ ЗАВЖДИ НА ПОЧАТКУ) ---
 def get_channel_recent_posts(target_channel):
     posts = []
     clean_target = target_channel.lstrip('@')
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     current_url = f"https://t.me/s/{clean_target}"
-    for _ in range(3):
+    for _ in range(2):
         try:
             req = urllib.request.Request(current_url, headers=headers)
             with urllib.request.urlopen(req, timeout=8) as resp:
                 content = resp.read().decode('utf-8', errors='ignore')
 
             blocks = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', content, re.DOTALL)
+            page_posts = []
             for b in blocks:
                 clean = re.sub(r'<br\s*/?>', ' ', b)
                 clean = re.sub(r'<[^>]+>', '', clean)
                 clean = html.unescape(clean).strip()
-                if clean and clean not in posts:
-                    posts.append(clean)
+                if clean:
+                    page_posts.append(clean)
+
+            # Додаємо сторінку
+            posts.extend(page_posts)
 
             post_ids = re.findall(r'data-post=["\'][^/]+/(\d+)["\']', content)
             if post_ids:
@@ -195,6 +224,8 @@ def get_channel_recent_posts(target_channel):
             logger.warning(f"Error reading channel history: {e}")
             break
 
+    # ГОЛОВНИЙ ФІКС: РОЗВЕРТАЄМО СПИСОК, ЩОБ НАЙСВІЖІШІ ПОСТИ БУЛИ НА ПОЧАТКУ!
+    posts.reverse()
     return posts
 
 # --- DYNAMIC GROQ MODEL DISCOVERY ---
@@ -221,6 +252,33 @@ def get_working_groq_model():
         logger.warning(f"Model lookup failed: {e}")
     return "llama-3.1-8b-instant"
 
+# --- ШВИДКА ПЕРЕВІРКА НА ПОВТОР БЕЗ ОНОВЛЕНЬ ---
+def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
+    """
+    Якщо збігаються 3 корені (наприклад 'рютте' + 'зеленськ' + 'швейцар')
+    і в тексті немає маркерів нових фактів — це 100% повтор.
+    """
+    if len(candidate_roots) < 3:
+        return False
+
+    update_markers = [
+        "повторн", "новий удар", "обвалив", "зруйновано повністю",
+        "кількість зросла", "підтвердив генштаб", "з'явилися кадри",
+        "з'явилося відео", "загинуло вже"
+    ]
+    has_update = any(m in raw_text.lower() for m in update_markers)
+    if has_update:
+        return False # Є оновлення, даємо шанс моделі обробити новий факт
+
+    for p in recent_posts[:25]:
+        p_roots = extract_canonical_roots(p)
+        common = candidate_roots & p_roots
+        if len(common) >= 3:
+            logger.info(f"BLATANT DUPLICATE BLOCKED: common roots {common}")
+            return True
+
+    return False
+
 # --- AI РЕДАКТУРА ТА РОЗУМНЕ ВІДСІЮВАННЯ ДУБЛІВ ---
 def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
     if not GROQ_API_KEY or not text or len(text.strip()) < 30:
@@ -228,7 +286,7 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
 
     lower_raw = text.lower()
 
-    # 1. Відсікаємо некрологи минулих років
+    # Відсікаємо некрологи
     memorial_words = [
         "хвилина мовчання", "пам'яті геро", "пам'яті загибл", "вічна пам'ять",
         "загинув у 2022", "загинув у 2023", "загинув 2022", "загинув 2023",
@@ -238,7 +296,7 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping past years memorial.")
         return "SKIP"
 
-    # 2. Відсікаємо нічний радарний спам
+    # Відсікаємо радарний нічний спам
     radar_words = [
         "летять на захід", "летять на схід", "курсом на", "вектор руху",
         "повітряна тривога в області", "загроза балістики", "ракета в напрямку",
@@ -248,22 +306,20 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping transient flight radar alert.")
         return "SKIP"
 
-    # 3. Формуємо стислий контекст останніх 15 публікацій на каналі
+    # ТЕПЕР ТУТ ТОЧНО ОСТАННІ 20 ОПУБЛІКОВАНИХ НОВИН
     recent_context_lines = []
-    for i, p in enumerate(recent_channel_posts[:15], 1):
-        # беремо заголовок і перші 100 символів
-        snippet = p.replace('\n', ' ')[:120]
+    for i, p in enumerate(recent_channel_posts[:20], 1):
+        snippet = p.replace('\n', ' ')[:140]
         recent_context_lines.append(f"{i}. {snippet}")
     context_str = "\n".join(recent_context_lines)
 
     system_prompt = (
         "ТИ — ДОСВІДЧЕНИЙ ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
-        f"ОСЬ ОСТАННІ НОВИНИ, ЯКІ ВЖЕ ВИЙШЛИ В КАНАЛІ:\n{context_str}\n\n"
+        f"ОСЬ НАЙСВІЖІШІ НОВИНИ, ЯКІ ЩОЙНО ВИЙШЛИ В КАНАЛІ:\n{context_str}\n\n"
         "РОЗУМНИЙ РЕДАКТОРСЬКИЙ КОНТРОЛЬ ДУБЛІВ ТА АПДЕЙТІВ:\n"
-        "1. ЯКЩО ЦЕ ДУБЛЬ: Якщо вхідна новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (наприклад, той самий нічний удар по мосту на річці Міус, той самий міст Кличка, те саме число загиблих), "
-        "і НЕ МІСТИТЬ принципово нової інформації — ПОВЕРНИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
-        "2. ЯКЩО ЦЕ НОВИЙ ФАКТ / РОЗВИТОК ПОДІЙ: Якщо стався ПОВТОРНИЙ УДАР по тому ж об'єкту, міст повністю обвалився, з'явилися нові офіційні подробиці або нові підтверджені дані — "
-        "ЦЕ НЕ ДУБЛЬ! Напиши новий пост, чітко підкресливши оновлення (наприклад: «Повторний удар...», «З'явилися нові подробиці...»).\n"
+        "1. ЯКЩО ЦЕ ДУБЛЬ: Якщо вхідна новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (наприклад, слова Рютте про Швейцарію/гору/випити, міст на річці Міус, удар по тому ж мосту в Києві), "
+        "і НЕ МІСТИТЬ принципово нового факту — ТИ ЗОБОВ'ЯЗАНИЙ ПОВЕРНУТИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
+        "2. ЯКЩО ЦЕ НОВИЙ ФАКТ / РОЗВИТОК ПОДІЙ: Якщо стався ПОВТОРНИЙ УДАР, міст завалився, з'явилося перше відео прильоту — пиши новий пост, акцентуючи увагу на оновленні.\n"
         "3. ПРАВДА ПРО УДАРИ ПО РФ: Якщо ЗСУ уразили об'єкт у РФ — новина ТІЛЬКИ про успішний удар ЗСУ!\n"
         "4. КАТЕГОРИЧНО ЗАБОРОНЕНО писати примітки, міркування чи текст від першої особи.\n"
         "5. Чиста українська мова: «ДСНС» (не «ГСЧС»), «вирва» (не «воронка»), «величезна» (не «огромна»).\n\n"
@@ -334,7 +390,7 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
 
     return out
 
-# --- POSTING TO TELEGRAM (ANTI-BLUR GUARD) ---
+# --- POSTING TO TELEGRAM ---
 def publish_native_post(donor_channel, msg_id, text, has_media, photos):
     caption = text.strip()
     if len(caption) > 1020:
@@ -373,11 +429,11 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
                         logger.info(f"Published HIGH-RES photo ({len(resp.content)} bytes)!")
                         return True
                 else:
-                    logger.warning(f"Rejected blurry image ({len(resp.content)} bytes). Posting clean text.")
+                    logger.warning(f"Rejected blurry image ({len(resp.content)} bytes). Posting text.")
             except Exception as e:
                 logger.warning(f"Fallback photo upload failed: {e}")
 
-    logger.info("Publishing as clean text post...")
+    logger.info("Publishing as text post...")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
     r = requests.post(url, json=payload, timeout=15)
@@ -385,10 +441,13 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
 
 # --- MAIN LOOP ---
 def main_loop():
-    logger.info("Initializing news bot with Semantic Intelligence...")
+    logger.info("Initializing news bot with True Chronological Memory...")
     state = load_state()
 
+    # Завантажуємо свіжу історію каналу (найновіші пости перші)
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
+    if not state.get("recent_published_posts"):
+        state["recent_published_posts"] = channel_posts[:30]
 
     if not state.get("posted_hashes"):
         logger.info("Cold start: seeding existing messages into cache...")
@@ -407,6 +466,11 @@ def main_loop():
 
             if loop_count % 8 == 0:
                 channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
+                # Синхронізуємо пам'ять
+                for p in channel_posts[:15]:
+                    if p not in state["recent_published_posts"]:
+                        state["recent_published_posts"].insert(0, p)
+                state["recent_published_posts"] = state["recent_published_posts"][:40]
             loop_count += 1
 
             for channel in DONOR_CHANNELS:
@@ -420,9 +484,15 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # РОЗУМНА ОБРОБКА: Модель сама аналізує контекст каналу і вирішує:
-                    # дубль це чи новий розвиток подій
-                    rewritten = process_news_with_smart_editorial(raw_text, model_name, channel_posts)
+                    # БАР'ЄР 1: Швидка перевірка на повтор без оновлень (блокує Рютте+Швейцарія)
+                    if is_blatant_duplicate(item["roots"], raw_text, state["recent_published_posts"]):
+                        logger.info(f"Skipping duplicate without updates: {list(item['roots'])[:3]}")
+                        state["posted_hashes"].append(item_hash)
+                        save_state(state)
+                        continue
+
+                    # БАР'ЄР 2: Модель бачить НАЙНОВІШІ пости прямо перед очима
+                    rewritten = process_news_with_smart_editorial(raw_text, model_name, state["recent_published_posts"])
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
@@ -445,10 +515,13 @@ def main_loop():
                         headline = rewritten.split('\n')[0]
                         logger.info(f"Published: {headline}")
                         state["posted_hashes"].append(item_hash)
+                        # МИТТЄВО ДОДАЄМО СВІЖИЙ ПОСТ НА ПЕРШУ ПОЗИЦІЮ ПАМ'ЯТІ
+                        state["recent_published_posts"].insert(0, rewritten)
+                        if len(state["recent_published_posts"]) > 40:
+                            state["recent_published_posts"] = state["recent_published_posts"][:40]
                         if len(state["posted_hashes"]) > 2000:
                             state["posted_hashes"] = state["posted_hashes"][-1500:]
                         save_state(state)
-                        channel_posts.insert(0, rewritten)
                         time.sleep(15)
 
                 time.sleep(0.6)
