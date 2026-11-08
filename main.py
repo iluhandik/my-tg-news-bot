@@ -162,34 +162,55 @@ def scrape_channel(channel_name):
             raw_text = re.sub(r'<[^>]+>', '', raw_text)
             raw_text = html.unescape(raw_text).strip()
 
-        has_video = ('tgme_widget_message_video_player' in block or '<video' in block)
-        has_photo = ('tgme_widget_message_photo_wrap' in block)
+        has_media = ('tgme_widget_message_video_player' in block or '<video' in block or 'tgme_widget_message_photo_wrap' in block)
 
-        photos = []
-        if not has_video:
-            photo_matches = re.findall(r'class="[^"]*tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:\s*url\((?:&quot;|\'|")?([^&\'"\)\s]+)', block)
-            for u in photo_matches:
-                u = html.unescape(u).strip()
-                if any(skip in u.lower() for skip in ['user_photo', 'avatar', 'emoji', 'stickers']):
-                    continue
-                if u not in photos:
-                    photos.append(u)
-
-        if raw_text or has_video or has_photo:
+        if raw_text or has_media:
             messages.append({
                 "donor_channel": donor_username,
                 "msg_id": msg_id,
                 "text": raw_text,
-                "has_video": has_video,
-                "has_photo": has_photo,
-                "photos": photos,
+                "has_media": has_media,
                 "hash": get_hash(raw_text) if raw_text else None,
                 "roots": extract_canonical_roots(raw_text)
             })
 
     return messages
 
-# --- ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ (СВІЖІ ПОСТИ ЗАВЖДИ НА ПОЧАТКУ) ---
+# --- ЗЧИТУВАННЯ МЕДІА (ПРЯМИЙ MP4 / HD ФОТО З EMBED ВІДЖЕТА) ---
+def fetch_media_from_embed(donor_channel, msg_id):
+    clean_channel = donor_channel.lstrip('@')
+    embed_url = f"https://t.me/{clean_channel}/{msg_id}?embed=1"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": f"https://t.me/s/{clean_channel}"
+    }
+    video_url = None
+    photo_urls = []
+    try:
+        req = urllib.request.Request(embed_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html_text = resp.read().decode('utf-8', errors='ignore')
+
+        # Прямий відеофайл .mp4
+        v_match = re.search(r'<video[^>]+src=["\']([^"\']+)["\']', html_text)
+        if v_match:
+            video_url = v_match.group(1).replace('&amp;', '&')
+
+        # Повнорозмірні фото
+        p_matches = re.findall(r'class="[^"]*tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:\s*url\((?:&quot;|\'|")?([^&\'"\)\s]+)', html_text)
+        for p in p_matches:
+            p = p.replace('&amp;', '&').strip()
+            if any(skip in p.lower() for skip in ['user_photo', 'avatar', 'emoji', 'stickers']):
+                continue
+            if p not in photo_urls:
+                photo_urls.append(p)
+
+    except Exception as e:
+        logger.warning(f"Error fetching embed media from {embed_url}: {e}")
+
+    return video_url, photo_urls
+
+# --- ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ ---
 def get_channel_recent_posts(target_channel):
     posts = []
     clean_target = target_channel.lstrip('@')
@@ -211,7 +232,6 @@ def get_channel_recent_posts(target_channel):
                 if clean:
                     page_posts.append(clean)
 
-            # Додаємо сторінку
             posts.extend(page_posts)
 
             post_ids = re.findall(r'data-post=["\'][^/]+/(\d+)["\']', content)
@@ -224,7 +244,7 @@ def get_channel_recent_posts(target_channel):
             logger.warning(f"Error reading channel history: {e}")
             break
 
-    # ГОЛОВНИЙ ФІКС: РОЗВЕРТАЄМО СПИСОК, ЩОБ НАЙСВІЖІШІ ПОСТИ БУЛИ НА ПОЧАТКУ!
+    # Розвертаємо, щоб найсвіжіші пости були першими
     posts.reverse()
     return posts
 
@@ -252,12 +272,8 @@ def get_working_groq_model():
         logger.warning(f"Model lookup failed: {e}")
     return "llama-3.1-8b-instant"
 
-# --- ШВИДКА ПЕРЕВІРКА НА ПОВТОР БЕЗ ОНОВЛЕНЬ ---
+# --- ШВИДКА ПЕРЕВІРКА НА ПОВТОР ---
 def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
-    """
-    Якщо збігаються 3 корені (наприклад 'рютте' + 'зеленськ' + 'швейцар')
-    і в тексті немає маркерів нових фактів — це 100% повтор.
-    """
     if len(candidate_roots) < 3:
         return False
 
@@ -268,7 +284,7 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
     ]
     has_update = any(m in raw_text.lower() for m in update_markers)
     if has_update:
-        return False # Є оновлення, даємо шанс моделі обробити новий факт
+        return False
 
     for p in recent_posts[:25]:
         p_roots = extract_canonical_roots(p)
@@ -286,7 +302,6 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
 
     lower_raw = text.lower()
 
-    # Відсікаємо некрологи
     memorial_words = [
         "хвилина мовчання", "пам'яті геро", "пам'яті загибл", "вічна пам'ять",
         "загинув у 2022", "загинув у 2023", "загинув 2022", "загинув 2023",
@@ -296,7 +311,6 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping past years memorial.")
         return "SKIP"
 
-    # Відсікаємо радарний нічний спам
     radar_words = [
         "летять на захід", "летять на схід", "курсом на", "вектор руху",
         "повітряна тривога в області", "загроза балістики", "ракета в напрямку",
@@ -306,7 +320,6 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping transient flight radar alert.")
         return "SKIP"
 
-    # ТЕПЕР ТУТ ТОЧНО ОСТАННІ 20 ОПУБЛІКОВАНИХ НОВИН
     recent_context_lines = []
     for i, p in enumerate(recent_channel_posts[:20], 1):
         snippet = p.replace('\n', ' ')[:140]
@@ -316,13 +329,11 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
     system_prompt = (
         "ТИ — ДОСВІДЧЕНИЙ ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСЬ НАЙСВІЖІШІ НОВИНИ, ЯКІ ЩОЙНО ВИЙШЛИ В КАНАЛІ:\n{context_str}\n\n"
-        "РОЗУМНИЙ РЕДАКТОРСЬКИЙ КОНТРОЛЬ ДУБЛІВ ТА АПДЕЙТІВ:\n"
-        "1. ЯКЩО ЦЕ ДУБЛЬ: Якщо вхідна новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (наприклад, слова Рютте про Швейцарію/гору/випити, міст на річці Міус, удар по тому ж мосту в Києві), "
+        "РОЗУМНИЙ РЕДАКТОРСЬКИЙ КОНТРОЛЬ ДУБЛІВ:\n"
+        "1. ЯКЩО ЦЕ ДУБЛЬ: Якщо вхідна новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (наприклад, слова Рютте про Швейцарію, міст на річці Міус, той самий інцидент), "
         "і НЕ МІСТИТЬ принципово нового факту — ТИ ЗОБОВ'ЯЗАНИЙ ПОВЕРНУТИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
-        "2. ЯКЩО ЦЕ НОВИЙ ФАКТ / РОЗВИТОК ПОДІЙ: Якщо стався ПОВТОРНИЙ УДАР, міст завалився, з'явилося перше відео прильоту — пиши новий пост, акцентуючи увагу на оновленні.\n"
-        "3. ПРАВДА ПРО УДАРИ ПО РФ: Якщо ЗСУ уразили об'єкт у РФ — новина ТІЛЬКИ про успішний удар ЗСУ!\n"
-        "4. КАТЕГОРИЧНО ЗАБОРОНЕНО писати примітки, міркування чи текст від першої особи.\n"
-        "5. Чиста українська мова: «ДСНС» (не «ГСЧС»), «вирва» (не «воронка»), «величезна» (не «огромна»).\n\n"
+        "2. ЯКЩО ЦЕ НОВИЙ ФАКТ / РОЗВИТОК ПОДІЙ: Якщо стався ПОВТОРНИЙ УДАР чи нові наслідки — пиши новий пост з акцентом на оновленні.\n"
+        "3. БЕЗДОГАННА УКРАЇНСЬКА МОВА: Жодних русизмів! «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»), «величезна» (НЕ «огромна»).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -371,7 +382,10 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         else:
             return None
 
+    # СУВОРИЙ СЛОВНИК АВТОЗАМІНИ РУСИЗМІВ ТА ПОМИЛОК
     ru_fixes = {
+        r'\b[иі]стека[а-я]* кров[\'’]ю\b': 'стікав кров\'ю',
+        r'\b[иі]стека[а-я]*\b': 'стікав',
         r'\bГСЧС\b': 'ДСНС',
         r'\bгсчс\b': 'ДСНС',
         r'\bогромн(а|у|е|і|их|им|ому)\b': r'величезн\1',
@@ -390,49 +404,54 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
 
     return out
 
-# --- POSTING TO TELEGRAM ---
-def publish_native_post(donor_channel, msg_id, text, has_media, photos):
+# --- ПУБЛІКАЦІЯ В TELEGRAM З ПРЯМИМ ЗАВАНТАЖЕННЯМ ВІДЕО/ФОТО ---
+def publish_post_with_real_media(donor_channel, msg_id, text):
     caption = text.strip()
     if len(caption) > 1020:
         caption = caption[:1015].rsplit(' ', 1)[0] + '...'
 
-    if has_media and donor_channel and msg_id:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/copyMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHANNEL_ID,
-            "from_chat_id": donor_channel,
-            "message_id": msg_id,
-            "caption": caption,
-            "parse_mode": "HTML"
-        }
-        try:
-            r = requests.post(url, json=payload, timeout=25)
-            res = r.json()
-            if res.get("ok"):
-                logger.info(f"Successfully copied native media from {donor_channel}/{msg_id}!")
-                return True
-        except Exception as e:
-            logger.warning(f"copyMessage exception: {e}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": "https://t.me/"
+    }
 
-    # Захист від розмитих фото менше 30 Кб
-    if photos:
-        unique_photos = list(dict.fromkeys(photos))
-        for p_url in unique_photos[:1]:
+    # Отримуємо прямі лінки на медіа з embed-віджета
+    video_url, photo_urls = fetch_media_from_embed(donor_channel, msg_id)
+
+    # 1. Якщо є справжнє відео (MP4) — викачуємо і вантажимо
+    if video_url:
+        try:
+            logger.info(f"Downloading real MP4 video from {video_url[:60]}...")
+            resp = requests.get(video_url, headers=headers, timeout=35)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                if len(resp.content) <= 50 * 1024 * 1024:
+                    files = {"video": ("video.mp4", resp.content, "video/mp4")}
+                    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=60)
+                    if r.json().get("ok"):
+                        logger.info("Successfully published post with REAL VIDEO!")
+                        return True
+                    else:
+                        logger.warning(f"sendVideo error: {r.json().get('description')}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch/upload video: {e}")
+
+    # 2. Якщо є якісне фото
+    if photo_urls:
+        for p_url in photo_urls[:1]:
             try:
-                headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://t.me/"}
                 resp = requests.get(p_url, headers=headers, timeout=15)
-                if resp.status_code == 200 and len(resp.content) >= 30000:
+                if resp.status_code == 200 and len(resp.content) >= 20000:
                     files = {"photo": ("image.jpg", resp.content, "image/jpeg")}
                     data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                     r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=30)
                     if r.json().get("ok"):
-                        logger.info(f"Published HIGH-RES photo ({len(resp.content)} bytes)!")
+                        logger.info("Successfully published post with REAL PHOTO!")
                         return True
-                else:
-                    logger.warning(f"Rejected blurry image ({len(resp.content)} bytes). Posting text.")
             except Exception as e:
-                logger.warning(f"Fallback photo upload failed: {e}")
+                logger.warning(f"Failed to fetch/upload photo: {e}")
 
+    # 3. Текстовий пост тільки якщо взагалі не було медіа
     logger.info("Publishing as text post...")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
@@ -441,10 +460,9 @@ def publish_native_post(donor_channel, msg_id, text, has_media, photos):
 
 # --- MAIN LOOP ---
 def main_loop():
-    logger.info("Initializing news bot with True Chronological Memory...")
+    logger.info("Initializing news bot with Direct Media Fetcher...")
     state = load_state()
 
-    # Завантажуємо свіжу історію каналу (найновіші пости перші)
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
     if not state.get("recent_published_posts"):
         state["recent_published_posts"] = channel_posts[:30]
@@ -466,7 +484,6 @@ def main_loop():
 
             if loop_count % 8 == 0:
                 channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
-                # Синхронізуємо пам'ять
                 for p in channel_posts[:15]:
                     if p not in state["recent_published_posts"]:
                         state["recent_published_posts"].insert(0, p)
@@ -484,14 +501,14 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # БАР'ЄР 1: Швидка перевірка на повтор без оновлень (блокує Рютте+Швейцарія)
+                    # Блокування очевидних дублів без оновлень
                     if is_blatant_duplicate(item["roots"], raw_text, state["recent_published_posts"]):
-                        logger.info(f"Skipping duplicate without updates: {list(item['roots'])[:3]}")
+                        logger.info(f"Skipping duplicate: {list(item['roots'])[:3]}")
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # БАР'ЄР 2: Модель бачить НАЙНОВІШІ пости прямо перед очима
+                    # Редакторський контроль
                     rewritten = process_news_with_smart_editorial(raw_text, model_name, state["recent_published_posts"])
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
@@ -501,21 +518,17 @@ def main_loop():
                     if not rewritten:
                         continue
 
-                    # Публікація в Telegram
-                    has_media = item["has_video"] or item["has_photo"]
-                    success = publish_native_post(
+                    # Публікація зі справжнім відео чи фото
+                    success = publish_post_with_real_media(
                         item["donor_channel"], 
                         item["msg_id"], 
-                        rewritten, 
-                        has_media, 
-                        item["photos"]
+                        rewritten
                     )
 
                     if success:
                         headline = rewritten.split('\n')[0]
                         logger.info(f"Published: {headline}")
                         state["posted_hashes"].append(item_hash)
-                        # МИТТЄВО ДОДАЄМО СВІЖИЙ ПОСТ НА ПЕРШУ ПОЗИЦІЮ ПАМ'ЯТІ
                         state["recent_published_posts"].insert(0, rewritten)
                         if len(state["recent_published_posts"]) > 40:
                             state["recent_published_posts"] = state["recent_published_posts"][:40]
