@@ -176,7 +176,7 @@ def scrape_channel(channel_name):
 
     return messages
 
-# --- ЗЧИТУВАННЯ МЕДІА (ПРЯМИЙ MP4 / HD ФОТО З EMBED ВІДЖЕТА) ---
+# --- ЗЧИТУВАННЯ МЕДІА (MP4 ТА HD ФОТО З EMBED ВІДЖЕТА) ---
 def fetch_media_from_embed(donor_channel, msg_id):
     clean_channel = donor_channel.lstrip('@')
     embed_url = f"https://t.me/{clean_channel}/{msg_id}?embed=1"
@@ -191,12 +191,10 @@ def fetch_media_from_embed(donor_channel, msg_id):
         with urllib.request.urlopen(req, timeout=8) as resp:
             html_text = resp.read().decode('utf-8', errors='ignore')
 
-        # Прямий відеофайл .mp4
         v_match = re.search(r'<video[^>]+src=["\']([^"\']+)["\']', html_text)
         if v_match:
             video_url = v_match.group(1).replace('&amp;', '&')
 
-        # Повнорозмірні фото
         p_matches = re.findall(r'class="[^"]*tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:\s*url\((?:&quot;|\'|")?([^&\'"\)\s]+)', html_text)
         for p in p_matches:
             p = p.replace('&amp;', '&').strip()
@@ -244,7 +242,6 @@ def get_channel_recent_posts(target_channel):
             logger.warning(f"Error reading channel history: {e}")
             break
 
-    # Розвертаємо, щоб найсвіжіші пости були першими
     posts.reverse()
     return posts
 
@@ -382,7 +379,6 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         else:
             return None
 
-    # СУВОРИЙ СЛОВНИК АВТОЗАМІНИ РУСИЗМІВ ТА ПОМИЛОК
     ru_fixes = {
         r'\b[иі]стека[а-я]* кров[\'’]ю\b': 'стікав кров\'ю',
         r'\b[иі]стека[а-я]*\b': 'стікав',
@@ -404,21 +400,31 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
 
     return out
 
-# --- ПУБЛІКАЦІЯ В TELEGRAM З ПРЯМИМ ЗАВАНТАЖЕННЯМ ВІДЕО/ФОТО ---
+# --- ДОДАВАННЯ ФІРМОВОГО ПІДПИСУ КАНАЛУ ---
+def append_channel_signature(text):
+    clean_text = text.strip()
+    channel_user = TELEGRAM_CHANNEL_ID.lstrip('@')
+    signature = f'\n\n👉 <a href="https://t.me/{channel_user}">NEWS УКРАЇНА 365 | Підписатися</a>'
+    
+    # Telegram ліміт 1024 знаки: резервуємо місце під підпис
+    max_text_len = 1015 - len(signature)
+    if len(clean_text) > max_text_len:
+        clean_text = clean_text[:max_text_len].rsplit(' ', 1)[0] + '...'
+        
+    return clean_text + signature
+
+# --- ПУБЛІКАЦІЯ В TELEGRAM З МЕДІА ТА ПІДПИСОМ ---
 def publish_post_with_real_media(donor_channel, msg_id, text):
-    caption = text.strip()
-    if len(caption) > 1020:
-        caption = caption[:1015].rsplit(' ', 1)[0] + '...'
+    caption = append_channel_signature(text)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer": "https://t.me/"
     }
 
-    # Отримуємо прямі лінки на медіа з embed-віджета
     video_url, photo_urls = fetch_media_from_embed(donor_channel, msg_id)
 
-    # 1. Якщо є справжнє відео (MP4) — викачуємо і вантажимо
+    # 1. Справжнє відео (MP4)
     if video_url:
         try:
             logger.info(f"Downloading real MP4 video from {video_url[:60]}...")
@@ -429,14 +435,14 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
                     data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                     r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=60)
                     if r.json().get("ok"):
-                        logger.info("Successfully published post with REAL VIDEO!")
+                        logger.info("Successfully published post with REAL VIDEO and SIGNATURE!")
                         return True
                     else:
                         logger.warning(f"sendVideo error: {r.json().get('description')}")
         except Exception as e:
             logger.warning(f"Failed to fetch/upload video: {e}")
 
-    # 2. Якщо є якісне фото
+    # 2. Якісне фото
     if photo_urls:
         for p_url in photo_urls[:1]:
             try:
@@ -446,21 +452,26 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
                     data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                     r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=30)
                     if r.json().get("ok"):
-                        logger.info("Successfully published post with REAL PHOTO!")
+                        logger.info("Successfully published post with REAL PHOTO and SIGNATURE!")
                         return True
             except Exception as e:
                 logger.warning(f"Failed to fetch/upload photo: {e}")
 
-    # 3. Текстовий пост тільки якщо взагалі не було медіа
-    logger.info("Publishing as text post...")
+    # 3. Текстовий пост
+    logger.info("Publishing as text post with SIGNATURE...")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID, 
+        "text": caption, 
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     r = requests.post(url, json=payload, timeout=15)
     return r.json().get("ok", False)
 
 # --- MAIN LOOP ---
 def main_loop():
-    logger.info("Initializing news bot with Direct Media Fetcher...")
+    logger.info("Initializing news bot with Branded Signatures...")
     state = load_state()
 
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
@@ -501,14 +512,12 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # Блокування очевидних дублів без оновлень
                     if is_blatant_duplicate(item["roots"], raw_text, state["recent_published_posts"]):
                         logger.info(f"Skipping duplicate: {list(item['roots'])[:3]}")
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # Редакторський контроль
                     rewritten = process_news_with_smart_editorial(raw_text, model_name, state["recent_published_posts"])
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
@@ -518,7 +527,6 @@ def main_loop():
                     if not rewritten:
                         continue
 
-                    # Публікація зі справжнім відео чи фото
                     success = publish_post_with_real_media(
                         item["donor_channel"], 
                         item["msg_id"], 
