@@ -274,24 +274,32 @@ def download_tg_file(file_id):
 # --- ШВИДКИЙ СЛУХАЧ ДЛЯ ПЕРЕСИЛАНЬ ВІД ВЛАСНИКА В ПРИВАТ ---
 def run_admin_listener():
     logger.info("Admin VIP listener started...")
-    # Очищуємо старі завислі повідомлення черги
+    
+    # ГОЛОВНИЙ ФІКС: ПРИМУСОВО ВИДАЛЯЄМО СТАРИЙ ВЕБХУК, ЩОБ ВІДКРИТИ ЧЕРГУ
+    try:
+        del_r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=8)
+        logger.info(f"deleteWebhook result: {del_r.text}")
+    except Exception as e:
+        logger.warning(f"deleteWebhook error: {e}")
+
     offset = 0
     try:
         init_r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1", timeout=8)
         init_data = init_r.json()
         if init_data.get("ok") and init_data.get("result"):
             offset = init_data["result"][-1]["update_id"] + 1
-            logger.info(f"Cleared old updates, starting from offset {offset}")
+            logger.info(f"Initialized offset to {offset}")
     except Exception as e:
         logger.warning(f"Error initializing offset: {e}")
 
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {"offset": offset, "timeout": 3}
+            params = {"offset": offset, "timeout": 2}
             r = requests.get(url, params=params, timeout=10)
             data = r.json()
             if not data.get("ok"):
+                logger.warning(f"Telegram getUpdates returned: {data}")
                 time.sleep(2)
                 continue
 
