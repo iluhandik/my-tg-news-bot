@@ -23,7 +23,6 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 WEBHOOK_SECRET = hashlib.md5((TELEGRAM_BOT_TOKEN + "safe_secret").encode()).hexdigest()[:12]
 WEBHOOK_PATH = f"/tg-webhook-{WEBHOOK_SECRET}"
 
-# ВСІ 24 ДОНОРИ НА МІСЦІ, БЕЗ ВИЛУЧЕНЬ
 DONOR_CHANNELS = [
     "insiderUKR",
     "truexanewsua",
@@ -101,29 +100,37 @@ def extract_canonical_roots(text):
         roots.add(root)
     return roots
 
-# --- ОЧИЩЕННЯ ВІД РЕКЛАМИ ЧУЖИХ КАНАЛІВ ---
+# --- БЕЗПЕЧНЕ ВИДАЛЕННЯ ЧУЖИХ ПІДПИСІВ ТА КОПІРАЙТІВ ФОТО ---
 def strip_foreign_signatures(text):
     if not text:
         return ""
     lines = text.strip().split('\n')
     cleaned = []
+    
+    photo_credit_pattern = r'(?i)^\s*фото\s*:\s*.*(?:\/Facebook|\/Instagram|\/Telegram|Reuters|Getty|EPA|Укрінформ|ДСНС|соцмереж).*$'
     promo_patterns = [
         r'(?i)(підписатися|підписатись|подписаться|прислать контент|надіслати новину|джерело:?|джерело)',
-        r'(?i)(україна online|insider ua|труха|уніан|реальна війна|всевидящее око|hromadske|новини|політика)',
+        r'(?i)(україна online|insider ua|труха|уніан|реальна війна|всевидящее око|hromadske)',
         r'https?://t\.me/\S+',
         r't\.me/\S+'
     ]
+
     for line in lines:
+        if re.match(photo_credit_pattern, line):
+            continue
         line_clean = line
         for pat in promo_patterns:
             line_clean = re.sub(pat, '', line_clean).strip()
         line_clean = re.sub(r'^[\|\—\-\•\👉\⚡\s]+|[\|\—\-\•\👉\⚡\s]+$', '', line_clean).strip()
         if line_clean:
             cleaned.append(line_clean)
+            
     return "\n\n".join(cleaned).strip()
 
 def append_channel_signature(text):
     clean_text = strip_foreign_signatures(text)
+    if not clean_text:
+        return ""
     channel_user = TELEGRAM_CHANNEL_ID.lstrip('@')
     signature = f'\n\n👉 <a href="https://t.me/{channel_user}">NEWS УКРАЇНА 365 | Підписатися</a>'
     max_text_len = 1015 - len(signature)
@@ -163,12 +170,10 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
     lower_raw = clean_input.lower()
 
     if not is_admin_forward:
-        # Бан чужих дайджестів
         digest_markers = ["важливе за день", "головне за день", "підсумки дня", "дайджест"]
         if any(d in lower_raw for d in digest_markers):
             return "SKIP"
 
-        # Бан некрологів минулих років
         if any(m in lower_raw for m in ["хвилина мовчання", "пам'яті геро", "загинув у 2022", "загинув у 2023"]):
             return "SKIP"
 
@@ -179,12 +184,11 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
         "ПРОФЕСІЙНІ РЕДАКТОРСЬКІ ПРАВИЛА:\n"
         "1. ЧИСТА УКРАЇНСЬКА МОВА: Російський текст обов'язково перекласти літературною українською мовою. Жодного російського слова!\n"
-        "2. НОВИНИ ПРОТИ СИРЕН: Ми — новинне видання. Публікуємо новини про реальні факти, заяви та події. "
-        "Окремі технічні фрази про увімкнення сирени чи заклики на зразок «стежте в реальному часі» або «жовта/червона тривога» без наслідків — це не новина, пиши SKIP. "
-        "А от якщо є робота ППО, збиття, влучання, пожежа чи будь-які наслідки — публікуй обов'язково!\n"
-        "3. БЕЗ ПАНІКИ: Якщо новина — це подробиці розслідування старої трагедії чи теракту (як у Кракові), пиши «Розкрито подробиці», а не «Стався теракт».\n"
-        "4. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення Зеленського чи посадовців публікувати окремими постами!\n"
-        "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
+        "2. БЕЗ ТЕХНІЧНИХ КОПІРАЙТІВ ФОТО: Не пиши в кінці «Фото: Facebook / Reuters». Лишай тільки сам текст новини!\n"
+        "3. НОВИНИ ПРОТИ СИРЕН: Окремі фрази про сирени без наслідків — пиши SKIP. А якщо є робота ППО, збиття чи влучання — публікуй обов'язково!\n"
+        "4. БЕЗ ПАНІКИ: Якщо новина — подробиці старої трагедії, пиши «Розкрито подробиці», а не «Стався теракт».\n"
+        "5. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення Зеленського чи посадовців публікувати окремими постами!\n"
+        "6. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -220,9 +224,7 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
     out = out.replace("<blockquote>", "").replace("</blockquote>", "")
 
-    # Перевірка на російські літери
     if bool(re.search(r'[ыэъёЫЭЪЁ]', out)):
-        logger.warning("Rejected output containing Russian letters.")
         return None
 
     ru_fixes = {
@@ -265,35 +267,39 @@ def download_tg_file(file_id):
         logger.warning(f"Error downloading tg file: {e}")
     return None
 
-# --- ВІДПРАВКА ОБ'ЄДНАНОГО АЛЬБОМУ ---
 def send_telegram_media_group(photos, videos, caption):
     media = []
     files = {}
 
-    for i, p_bytes in enumerate(photos):
-        f_key = f"photo_{i}"
-        files[f_key] = (f"{f_key}.jpg", p_bytes, "image/jpeg")
-        m_item = {"type": "photo", "media": f"attach://{f_key}"}
-        if i == 0:
-            m_item["caption"] = caption
-            m_item["parse_mode"] = "HTML"
-        media.append(m_item)
+    # Завжди прикріплюємо підпис до ПЕРШОГО елемента альбому
+    is_caption_attached = False
 
     for i, v_bytes in enumerate(videos):
         f_key = f"video_{i}"
         files[f_key] = (f"{f_key}.mp4", v_bytes, "video/mp4")
         m_item = {"type": "video", "media": f"attach://{f_key}"}
-        if not photos and i == 0:
+        if not is_caption_attached and caption:
             m_item["caption"] = caption
             m_item["parse_mode"] = "HTML"
+            is_caption_attached = True
+        media.append(m_item)
+
+    for i, p_bytes in enumerate(photos):
+        f_key = f"photo_{i}"
+        files[f_key] = (f"{f_key}.jpg", p_bytes, "image/jpeg")
+        m_item = {"type": "photo", "media": f"attach://{f_key}"}
+        if not is_caption_attached and caption:
+            m_item["caption"] = caption
+            m_item["parse_mode"] = "HTML"
+            is_caption_attached = True
         media.append(m_item)
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
     data = {"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media)}
-    r = requests.post(url, data=data, files=files, timeout=45)
+    r = requests.post(url, data=data, files=files, timeout=50)
     return r.json().get("ok", False)
 
-# --- БУФЕР ЗБИРАННЯ АЛЬБОМІВ ---
+# --- РОЗУМНИЙ БУФЕР АЛЬБОМІВ ---
 album_buffers = {}
 album_lock = threading.Lock()
 
@@ -304,40 +310,53 @@ def process_buffered_album(media_group_id):
         return
 
     chat_id = buf["chat_id"]
-    text_content = buf["text"]
+    text_content = buf["text"].strip()
     photos = buf["photos"]
     videos = buf["videos"]
 
+    # ЗАХИСТ: Не публікувати, якщо текст порожній
+    if not text_content and not photos and not videos:
+        return
+
     model_name = get_working_groq_model()
-    rewritten = rewrite_news_for_channel(text_content, model_name, is_admin_forward=True)
+    rewritten = rewrite_news_for_channel(text_content, model_name, is_admin_forward=True) if text_content else ""
     if not rewritten or rewritten == "SKIP":
         rewritten = strip_foreign_signatures(text_content)
 
-    caption = append_channel_signature(rewritten)
+    caption = append_channel_signature(rewritten) if rewritten else ""
 
     published = False
     if len(photos) + len(videos) > 1:
         published = send_telegram_media_group(photos, videos, caption)
-    elif photos:
-        files = {"photo": ("image.jpg", photos[0], "image/jpeg")}
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files=files, timeout=25)
-        published = r.json().get("ok", False)
     elif videos:
         files = {"video": ("video.mp4", videos[0], "video/mp4")}
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}, files=files, timeout=45)
+        data_p = {"chat_id": TELEGRAM_CHANNEL_ID}
+        if caption:
+            data_p["caption"] = caption
+            data_p["parse_mode"] = "HTML"
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data_p, files=files, timeout=45)
+        published = r.json().get("ok", False)
+    elif photos:
+        files = {"photo": ("image.jpg", photos[0], "image/jpeg")}
+        data_p = {"chat_id": TELEGRAM_CHANNEL_ID}
+        if caption:
+            data_p["caption"] = caption
+            data_p["parse_mode"] = "HTML"
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data_p, files=files, timeout=25)
         published = r.json().get("ok", False)
 
     if published:
-        headline = rewritten.split('\n')[0]
-        app_state["recent_published_posts"].insert(0, rewritten)
-        save_state(app_state)
+        headline = rewritten.split('\n')[0] if rewritten else "Медіа-альбом"
+        if rewritten:
+            app_state["recent_published_posts"].insert(0, rewritten)
+            save_state(app_state)
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
             "chat_id": chat_id,
             "text": f"🚀 <b>Успішно опубліковано альбом у @kropivnit!</b>\n\n{headline}",
             "parse_mode": "HTML"
         })
 
-# --- БЕЗПЕЧНА ОБРОБКА ПОВІДОМЛЕННЯ ВІД ВЛАСНИКА ---
+# --- ОБРОБКА ПЕРЕСИЛАНЬ ВІД ВЛАСНИКА ---
 def handle_incoming_admin_update(update):
     try:
         msg = update.get("message")
@@ -353,13 +372,31 @@ def handle_incoming_admin_update(update):
         media_group_id = msg.get("media_group_id")
         text_content = msg.get("text") or msg.get("caption") or ""
 
+        # СПЕЦІАЛЬНИЙ RESOLVER: Якщо це пересилання з публічного каналу — витягуємо дані з першоджерела
+        fwd_chat = msg.get("forward_from_chat", {}).get("username")
+        fwd_id = msg.get("forward_from_message_id")
+
         photo_bytes = None
         video_bytes = None
-        if "video" in msg:
-            video_bytes = download_tg_file(msg["video"]["file_id"])
-        elif "photo" in msg:
-            photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
 
+        if fwd_chat and fwd_id and not media_group_id:
+            v_url, p_urls = fetch_media_from_embed(fwd_chat, fwd_id)
+            if v_url:
+                v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+                if v_resp.status_code == 200:
+                    video_bytes = v_resp.content
+            elif p_urls:
+                p_resp = requests.get(p_urls[0], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if p_resp.status_code == 200:
+                    photo_bytes = p_resp.content
+
+        if not video_bytes and not photo_bytes:
+            if "video" in msg:
+                video_bytes = download_tg_file(msg["video"]["file_id"])
+            elif "photo" in msg:
+                photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
+
+        # АЛЬБОМ: Буферизуємо з таймером 2.0 секунди
         if media_group_id:
             with album_lock:
                 if media_group_id not in album_buffers:
@@ -377,15 +414,16 @@ def handle_incoming_admin_update(update):
                     buf["photos"].append(photo_bytes)
                 if video_bytes:
                     buf["videos"].append(video_bytes)
-                if text_content and not buf["text"]:
+                if text_content:
                     buf["text"] = text_content
 
                 if buf["timer"]:
                     buf["timer"].cancel()
-                buf["timer"] = threading.Timer(0.8, process_buffered_album, args=(media_group_id,))
+                buf["timer"] = threading.Timer(2.0, process_buffered_album, args=(media_group_id,))
                 buf["timer"].start()
             return
 
+        # ОДИНАРНИЙ ДОПИС
         if text_content.strip() == "/start":
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                 "chat_id": chat_id,
@@ -398,6 +436,7 @@ def handle_incoming_admin_update(update):
             "text": "⏳ Отримав! Оформлюю через AI та публікую в канал..."
         })
 
+        # Перевірка на лінк t.me/...
         link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
         if link_match:
             ch_name = link_match.group(1)
@@ -422,27 +461,35 @@ def handle_incoming_admin_update(update):
         published = False
         if video_bytes:
             files = {"video": ("video.mp4", video_bytes, "video/mp4")}
-            data_post = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+            data_post = {"chat_id": TELEGRAM_CHANNEL_ID}
+            if caption:
+                data_post["caption"] = caption
+                data_post["parse_mode"] = "HTML"
             res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data_post, files=files, timeout=45)
             published = res.json().get("ok", False)
         elif photo_bytes:
             files = {"photo": ("image.jpg", photo_bytes, "image/jpeg")}
-            data_post = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+            data_post = {"chat_id": TELEGRAM_CHANNEL_ID}
+            if caption:
+                data_post["caption"] = caption
+                data_post["parse_mode"] = "HTML"
             res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data_post, files=files, timeout=25)
             published = res.json().get("ok", False)
         else:
-            res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                "chat_id": TELEGRAM_CHANNEL_ID,
-                "text": caption,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            }, timeout=15)
-            published = res.json().get("ok", False)
+            if caption:
+                res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                    "chat_id": TELEGRAM_CHANNEL_ID,
+                    "text": caption,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                }, timeout=15)
+                published = res.json().get("ok", False)
 
         if published:
-            headline = rewritten.split('\n')[0]
-            app_state["recent_published_posts"].insert(0, rewritten)
-            save_state(app_state)
+            headline = rewritten.split('\n')[0] if rewritten else "Медіапост"
+            if rewritten:
+                app_state["recent_published_posts"].insert(0, rewritten)
+                save_state(app_state)
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                 "chat_id": chat_id,
                 "text": f"🚀 <b>Успішно опубліковано в @kropivnit!</b>\n\n{headline}",
@@ -641,7 +688,10 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
             resp = requests.get(video_url, headers=headers, timeout=25)
             if resp.status_code == 200 and len(resp.content) > 5000 and len(resp.content) <= 50 * 1024 * 1024:
                 files = {"video": ("video.mp4", resp.content, "video/mp4")}
-                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                data = {"chat_id": TELEGRAM_CHANNEL_ID}
+                if caption:
+                    data["caption"] = caption
+                    data["parse_mode"] = "HTML"
                 r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=45)
                 if r.json().get("ok"):
                     return True
@@ -654,17 +704,22 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
                 resp = requests.get(p_url, headers=headers, timeout=12)
                 if resp.status_code == 200 and len(resp.content) >= 20000:
                     files = {"photo": ("image.jpg", resp.content, "image/jpeg")}
-                    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                    data = {"chat_id": TELEGRAM_CHANNEL_ID}
+                    if caption:
+                        data["caption"] = caption
+                        data["parse_mode"] = "HTML"
                     r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=25)
                     if r.json().get("ok"):
                         return True
             except Exception:
                 pass
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}
-    r = requests.post(url, json=payload, timeout=12)
-    return r.json().get("ok", False)
+    if caption:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=12)
+        return r.json().get("ok", False)
+    return False
 
 # --- ГОЛОВНИЙ АВТОНОМНИЙ ЦИКЛ ---
 def main_loop():
@@ -711,7 +766,6 @@ def main_loop():
                         save_state(app_state)
                         continue
 
-                    # Якщо AI вирішив пропустити технічне сповіщення сирени — не публікуємо
                     rewritten = rewrite_news_for_channel(raw_text, model_name, is_admin_forward=False, recent_headlines=recent_headlines)
                     if not rewritten or rewritten == "SKIP":
                         app_state["posted_hashes"].append(item_hash)
