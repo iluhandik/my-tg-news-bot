@@ -132,7 +132,6 @@ def scrape_channel(channel_name):
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        # Швидкий таймаут 5 секунд замість 10
         with urllib.request.urlopen(req, timeout=5) as response:
             html_content = response.read().decode('utf-8', errors='ignore')
     except Exception as e:
@@ -291,14 +290,26 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
 
     return False
 
-# --- ЛЕГКИЙ AI РЕДАКТОР (БЕЗ ПЕРЕПОВНЕННЯ ЛІМІТУ ТОКЕНІВ) ---
+# --- ЛЕГКИЙ AI РЕДАКТОР З ФІЛЬТРОМ ЧУЖИХ ДАЙДЖЕСТІВ ---
 def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
     if not GROQ_API_KEY or not text or len(text.strip()) < 30:
         return None
 
     lower_raw = text.lower()
 
-    # Тотальний бан радарного спаму (напрямки дронів над селами)
+    # 1. ТОТАЛЬНИЙ БАН ЧУЖИХ ПІДСУМКІВ ТА ДАЙДЖЕСТІВ ДНЯ
+    digest_markers = [
+        "важливе за день", "головне за день", "підсумки дня", "підсумок дня",
+        "головне за сьогодні", "топ новин", "головні новини дня", "головне за ніч",
+        "дайджест", "вечірній дайджест", "ранковий дайджест", "що відбулося за день",
+        "головні події дня", "картина дня", "хроніка дня", "найважливіше за день",
+        "коротко про головне", "головне на цей час", "головне станом на"
+    ]
+    if any(d in lower_raw for d in digest_markers):
+        logger.info("Skipping donor daily digest/summary banner.")
+        return "SKIP"
+
+    # 2. Бан радарного спаму (напрямки дронів над селами)
     flight_radar_words = [
         "рухаються у", "рухаються в", "курс на", "курсом на", "фіксують у", "фіксуються в",
         "напрямок руху", "напрямку чорнобиля", "напрямку києва", "напрямку білої",
@@ -312,7 +323,7 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping flight radar alert.")
         return "SKIP"
 
-    # Бан некрологів минулих років
+    # 3. Бан некрологів минулих років
     memorial_words = [
         "хвилина мовчання", "пам'яті геро", "пам'яті загибл", "вічна пам'ять",
         "загинув у 2022", "загинув у 2023", "загинув 2022", "загинув 2023",
@@ -322,7 +333,7 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping past years memorial.")
         return "SKIP"
 
-    # ОПТИМІЗАЦІЯ ШВИДКОСТІ: ТІЛЬКИ ОДНОРЯДКОВІ ЗАГОЛОВКИ ОСТАННІХ 15 НОВИН (~120 ТОКЕНІВ)
+    # Однорядкові заголовки останніх 15 новин (~120 токенів)
     recent_headlines = []
     for p in recent_channel_posts[:20]:
         first_line = p.strip().split('\n')[0][:90]
@@ -334,11 +345,13 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ В КАНАЛІ:\n{context_str}\n\n"
         "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
-        "1. АНТИДУБЛЬ: Якщо новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (без нових фактів) — ПОВЕРНИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
-        "2. БЕЗ ПАНІКИ: Якщо новина — це подробиці старої трагедії чи теракту (як у Кракові), заборонено писати заголовок «Сталася стрілянина/теракт»! Заголовок має казати: «Стрілянина у Кракові: нові подробиці розслідування». Якщо нових деталей нема — пиши SKIP.\n"
-        "3. ГЕОГРАФІЯ: Столиця Польщі — Варшава (НЕ Краків!).\n"
-        "4. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n"
-        "5. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n\n"
+        "1. ЗАБОРОНА ЧУЖИХ ДАЙДЖЕСТІВ ТА ПІДСУМКІВ: Категорично заборонено брати щоденні добірки та підсумки чужих каналів («Важливе за день», «Головне за день», «Підсумки дня», «Дайджест»). "
+        "Якщо в дописі зібрано кілька різних тем докупи або це брендований підсумок чужого медіа — ПОВЕРНИ ТІЛЬКИ СЛОВО: SKIP.\n"
+        "2. АНТИДУБЛЬ: Якщо новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (без нових фактів) — пиши SKIP.\n"
+        "3. БЕЗ ПАНІКИ: Якщо новина — це подробиці старої трагедії чи теракту (як у Кракові), заборонено писати заголовок «Сталася стрілянина/теракт»! Заголовок має казати: «Стрілянина у Кракові: нові подробиці розслідування». Якщо нових деталей нема — пиши SKIP.\n"
+        "4. ГЕОГРАФІЯ: Столиця Польщі — Варшава (НЕ Краків!).\n"
+        "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n"
+        "6. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -481,9 +494,9 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
     r = requests.post(url, json=payload, timeout=12)
     return r.json().get("ok", False)
 
-# --- БЛИСКАВИЧНИЙ ЦИКЛ ОНОВЛЕННЯ ---
+# --- ОСНОВНИЙ ЦИКЛ ОНОВЛЕННЯ ---
 def main_loop():
-    logger.info("Initializing news bot with Lightning Fast Pipeline...")
+    logger.info("Initializing news bot with Foreign Digest Filter...")
     state = load_state()
 
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
@@ -530,7 +543,7 @@ def main_loop():
                         save_state(state)
                         continue
 
-                    # 2. Легкий AI-рерайтер
+                    # 2. Легкий AI-рерайтер із фільтрацією чужих дайджестів
                     rewritten = process_news_with_smart_editorial(raw_text, model_name, state["recent_published_posts"])
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
@@ -557,14 +570,14 @@ def main_loop():
                         if len(state["posted_hashes"]) > 2500:
                             state["posted_hashes"] = state["posted_hashes"][-2000:]
                         save_state(state)
-                        time.sleep(10) # 10 сек між публікаціями
+                        time.sleep(10)
 
-                time.sleep(0.3) # 0.3 сек між донорами
+                time.sleep(0.3)
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
 
-        time.sleep(20) # Новий швидкий цикл кожні 20 секунд!
+        time.sleep(20)
 
 if __name__ == "__main__":
     t_http = threading.Thread(target=run_http_server, daemon=True)
