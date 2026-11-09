@@ -23,6 +23,7 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 WEBHOOK_SECRET = hashlib.md5((TELEGRAM_BOT_TOKEN + "safe_secret").encode()).hexdigest()[:12]
 WEBHOOK_PATH = f"/tg-webhook-{WEBHOOK_SECRET}"
 
+# ВСІ 24 ДОНОРИ НА МІСЦІ, БЕЗ ВИЛУЧЕНЬ
 DONOR_CHANNELS = [
     "insiderUKR",
     "truexanewsua",
@@ -100,13 +101,12 @@ def extract_canonical_roots(text):
         roots.add(root)
     return roots
 
-# --- ОЧИЩЕННЯ ВІД РЕКЛАМИ ТА ПІДПИСІВ ЧУЖИХ КАНАЛІВ ---
+# --- ОЧИЩЕННЯ ВІД РЕКЛАМИ ЧУЖИХ КАНАЛІВ ---
 def strip_foreign_signatures(text):
     if not text:
         return ""
     lines = text.strip().split('\n')
     cleaned = []
-    # Шаблони чужих підписів
     promo_patterns = [
         r'(?i)(підписатися|підписатись|подписаться|прислать контент|надіслати новину|джерело:?|джерело)',
         r'(?i)(україна online|insider ua|труха|уніан|реальна війна|всевидящее око|hromadske|новини|політика)',
@@ -117,13 +117,11 @@ def strip_foreign_signatures(text):
         line_clean = line
         for pat in promo_patterns:
             line_clean = re.sub(pat, '', line_clean).strip()
-        # Видаляємо сміттєві символи
         line_clean = re.sub(r'^[\|\—\-\•\👉\⚡\s]+|[\|\—\-\•\👉\⚡\s]+$', '', line_clean).strip()
         if line_clean:
             cleaned.append(line_clean)
     return "\n\n".join(cleaned).strip()
 
-# --- ДОДАВАННЯ НАШОГО ПІДПИСУ КАНАЛУ ---
 def append_channel_signature(text):
     clean_text = strip_foreign_signatures(text)
     channel_user = TELEGRAM_CHANNEL_ID.lstrip('@')
@@ -133,7 +131,6 @@ def append_channel_signature(text):
         clean_text = clean_text[:max_text_len].rsplit(' ', 1)[0] + '...'
     return clean_text + signature
 
-# --- DYNAMIC GROQ MODEL DISCOVERY ---
 def get_working_groq_model():
     if not GROQ_API_KEY:
         return "llama-3.1-8b-instant"
@@ -157,29 +154,22 @@ def get_working_groq_model():
         pass
     return "llama-3.1-8b-instant"
 
-# --- AI РЕДАКТУРА ДЛЯ ВСІХ ТИПІВ НОВИН ---
-def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, recent_headlines=[]):
+# --- AI РЕДАКТУРА ---
+def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_headlines=[]):
     clean_input = strip_foreign_signatures(text)
     if not GROQ_API_KEY or not clean_input or len(clean_input) < 15:
-        return clean_input
+        return clean_input if is_admin_forward else None
 
     lower_raw = clean_input.lower()
 
-    if not skip_duplicates_check:
-        digest_markers = [
-            "важливе за день", "головне за день", "підсумки дня", "підсумок дня",
-            "головне за сьогодні", "топ новин", "головні новини дня", "головне за ніч",
-            "дайджест", "вечірній дайджест", "ранковий дайджест"
-        ]
+    if not is_admin_forward:
+        # Бан чужих дайджестів
+        digest_markers = ["важливе за день", "головне за день", "підсумки дня", "дайджест"]
         if any(d in lower_raw for d in digest_markers):
             return "SKIP"
 
-        flight_radar_words = [
-            "рухаються у", "рухаються в", "курс на", "курсом на", "фіксують у", "фіксуються в",
-            "напрямок руху", "напрямку чорнобиля", "напрямку києва", "повз миронівку", "повз "
-        ]
-        has_real_impact = any(k in lower_raw for k in ["збито", "відбито", "влучання", "руйнування", "пожежа", "загинули"])
-        if any(r in lower_raw for r in flight_radar_words) and not has_real_impact:
+        # Бан некрологів минулих років
+        if any(m in lower_raw for m in ["хвилина мовчання", "пам'яті геро", "загинув у 2022", "загинув у 2023"]):
             return "SKIP"
 
     context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:15], 1)]) if recent_headlines else ""
@@ -187,13 +177,14 @@ def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, rece
     system_prompt = (
         "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
-        "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
-        "1. Якщо новину надіслав адміністратор — оформи її обов'язково у фірмовому стилі!\n"
-        "2. ЖОДНИХ ЧУЖИХ ПІДПИСІВ: Повністю видаляй назви чужих каналів, посилання чи заклики підписатися.\n"
-        "3. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення публікувати окремими постами!\n"
-        "4. БЕЗ ПАНІКИ: Якщо новина — подробиці старої трагедії, пиши «Розкрито подробиці», а не «Стався теракт».\n"
-        "5. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n"
-        "6. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
+        "ПРОФЕСІЙНІ РЕДАКТОРСЬКІ ПРАВИЛА:\n"
+        "1. ЧИСТА УКРАЇНСЬКА МОВА: Російський текст обов'язково перекласти літературною українською мовою. Жодного російського слова!\n"
+        "2. НОВИНИ ПРОТИ СИРЕН: Ми — новинне видання. Публікуємо новини про реальні факти, заяви та події. "
+        "Окремі технічні фрази про увімкнення сирени чи заклики на зразок «стежте в реальному часі» або «жовта/червона тривога» без наслідків — це не новина, пиши SKIP. "
+        "А от якщо є робота ППО, збиття, влучання, пожежа чи будь-які наслідки — публікуй обов'язково!\n"
+        "3. БЕЗ ПАНІКИ: Якщо новина — це подробиці розслідування старої трагедії чи теракту (як у Кракові), пиши «Розкрито подробиці», а не «Стався теракт».\n"
+        "4. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення Зеленського чи посадовців публікувати окремими постами!\n"
+        "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -216,10 +207,10 @@ def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, rece
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code != 200:
-            return clean_input
+            return clean_input if is_admin_forward else None
         raw_out = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception:
-        return clean_input
+        return clean_input if is_admin_forward else None
 
     raw_out = re.sub(r'<think>.*?</think>', '', raw_out, flags=re.DOTALL).strip()
     if raw_out.upper() == "SKIP" or "SKIP" in raw_out[:10]:
@@ -228,6 +219,11 @@ def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, rece
     out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
     out = out.replace("<blockquote>", "").replace("</blockquote>", "")
+
+    # Перевірка на російські літери
+    if bool(re.search(r'[ыэъёЫЭЪЁ]', out)):
+        logger.warning("Rejected output containing Russian letters.")
+        return None
 
     ru_fixes = {
         r'\bекс-президент(а|у|ом|і)?\s+США\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 США \2Трамп\3',
@@ -269,7 +265,7 @@ def download_tg_file(file_id):
         logger.warning(f"Error downloading tg file: {e}")
     return None
 
-# --- ВІДПРАВКА ОБ'ЄДНАНОГО АЛЬБОМУ (2+ ФОТО/ВІДЕО В ОДНОМУ ПОСТІ) ---
+# --- ВІДПРАВКА ОБ'ЄДНАНОГО АЛЬБОМУ ---
 def send_telegram_media_group(photos, videos, caption):
     media = []
     files = {}
@@ -297,7 +293,7 @@ def send_telegram_media_group(photos, videos, caption):
     r = requests.post(url, data=data, files=files, timeout=45)
     return r.json().get("ok", False)
 
-# --- БУФЕР ДЛЯ ЗБИРАННЯ АЛЬБОМІВ ---
+# --- БУФЕР ЗБИРАННЯ АЛЬБОМІВ ---
 album_buffers = {}
 album_lock = threading.Lock()
 
@@ -313,13 +309,12 @@ def process_buffered_album(media_group_id):
     videos = buf["videos"]
 
     model_name = get_working_groq_model()
-    rewritten = rewrite_news_for_channel(text_content, model_name, skip_duplicates_check=True)
+    rewritten = rewrite_news_for_channel(text_content, model_name, is_admin_forward=True)
     if not rewritten or rewritten == "SKIP":
         rewritten = strip_foreign_signatures(text_content)
 
     caption = append_channel_signature(rewritten)
 
-    # Публікуємо альбом
     published = False
     if len(photos) + len(videos) > 1:
         published = send_telegram_media_group(photos, videos, caption)
@@ -358,7 +353,6 @@ def handle_incoming_admin_update(update):
         media_group_id = msg.get("media_group_id")
         text_content = msg.get("text") or msg.get("caption") or ""
 
-        # Витягуємо медіа
         photo_bytes = None
         video_bytes = None
         if "video" in msg:
@@ -366,7 +360,6 @@ def handle_incoming_admin_update(update):
         elif "photo" in msg:
             photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
 
-        # ЯКЩО ЦЕ АЛЬБОМ (2+ фото/відео) — ЗБИРАЄМО ДО КУПИ
         if media_group_id:
             with album_lock:
                 if media_group_id not in album_buffers:
@@ -374,7 +367,6 @@ def handle_incoming_admin_update(update):
                         "photos": [], "videos": [], "text": "",
                         "chat_id": chat_id, "timer": None
                     }
-                    # Повідомляємо адміна про старт збору
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                         "chat_id": chat_id,
                         "text": "⏳ Збираю альбом і оформлюю пост для каналу..."
@@ -390,12 +382,10 @@ def handle_incoming_admin_update(update):
 
                 if buf["timer"]:
                     buf["timer"].cancel()
-                # Чекаємо 0.8 сек, доки Telegram дошле решту фото альбому
                 buf["timer"] = threading.Timer(0.8, process_buffered_album, args=(media_group_id,))
                 buf["timer"].start()
             return
 
-        # ОДИНАРНЕ ПОВІДОМЛЕННЯ
         if text_content.strip() == "/start":
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                 "chat_id": chat_id,
@@ -408,7 +398,6 @@ def handle_incoming_admin_update(update):
             "text": "⏳ Отримав! Оформлюю через AI та публікую в канал..."
         })
 
-        # Перевірка на посилання
         link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
         if link_match:
             ch_name = link_match.group(1)
@@ -424,7 +413,7 @@ def handle_incoming_admin_update(update):
                     photo_bytes = p_resp.content
 
         model_name = get_working_groq_model()
-        rewritten = rewrite_news_for_channel(text_content, model_name, skip_duplicates_check=True)
+        rewritten = rewrite_news_for_channel(text_content, model_name, is_admin_forward=True)
         if not rewritten or rewritten == "SKIP":
             rewritten = strip_foreign_signatures(text_content)
 
@@ -679,7 +668,7 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
 
 # --- ГОЛОВНИЙ АВТОНОМНИЙ ЦИКЛ ---
 def main_loop():
-    logger.info("Initializing Safe Autonomous News Pipeline...")
+    logger.info("Initializing Pure Autonomous Pipeline...")
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
     if not app_state.get("recent_published_posts"):
         app_state["recent_published_posts"] = channel_posts[:60]
@@ -722,13 +711,11 @@ def main_loop():
                         save_state(app_state)
                         continue
 
-                    rewritten = rewrite_news_for_channel(raw_text, model_name, skip_duplicates_check=False, recent_headlines=recent_headlines)
-                    if rewritten == "SKIP":
+                    # Якщо AI вирішив пропустити технічне сповіщення сирени — не публікуємо
+                    rewritten = rewrite_news_for_channel(raw_text, model_name, is_admin_forward=False, recent_headlines=recent_headlines)
+                    if not rewritten or rewritten == "SKIP":
                         app_state["posted_hashes"].append(item_hash)
                         save_state(app_state)
-                        continue
-
-                    if not rewritten:
                         continue
 
                     success = publish_post_with_real_media(item["donor_channel"], item["msg_id"], rewritten)
