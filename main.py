@@ -20,6 +20,10 @@ GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY") o
 PORT = int(os.environ.get("PORT", 10000))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
+# Секретний захищений шлях для вебхука Telegram
+WEBHOOK_SECRET = hashlib.md5((TELEGRAM_BOT_TOKEN + "safe_secret").encode()).hexdigest()[:12]
+WEBHOOK_PATH = f"/tg-webhook-{WEBHOOK_SECRET}"
+
 DONOR_CHANNELS = [
     "insiderUKR",
     "truexanewsua",
@@ -49,37 +53,6 @@ DONOR_CHANNELS = [
 
 STATE_FILE = "bot_state.json"
 
-# --- HEALTH CHECK HTTP SERVER & KEEP-ALIVE ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK: News Bot is running 24/7.")
-
-def run_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logger.info(f"Health-check HTTP server listening on port {PORT}")
-    server.serve_forever()
-
-def run_keep_alive():
-    if not RENDER_EXTERNAL_URL:
-        return
-    url = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL.startswith("http") else f"https://{RENDER_EXTERNAL_URL}"
-    logger.info(f"Keep-alive worker activated for URL: {url}")
-    while True:
-        try:
-            time.sleep(480)
-            r = requests.get(url, timeout=15)
-            logger.info(f"Keep-alive ping sent to {url}, status: {r.status_code}")
-        except Exception as e:
-            logger.warning(f"Keep-alive ping error: {e}")
-
 # --- STATE MANAGEMENT ---
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -96,6 +69,9 @@ def save_state(state):
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
+
+# Глобальний стан у пам'яті для безпечного доступу
+app_state = load_state()
 
 def get_hash(text):
     clean = re.sub(r'\W+', '', text.lower())
@@ -156,11 +132,285 @@ def get_working_groq_model():
                     return pref
             if valid_ids:
                 return valid_ids[0]
-    except Exception as e:
+    except Exception:
         pass
     return "llama-3.1-8b-instant"
 
-# --- ШВИДКИЙ СКРАПЕР ДОНОРІВ ---
+# --- AI РЕДАКТУРА ДЛЯ ВСІХ ТИПІВ НОВИН ---
+def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, recent_headlines=[]):
+    if not GROQ_API_KEY or not text or len(text.strip()) < 15:
+        return None
+
+    lower_raw = text.lower()
+
+    if not skip_duplicates_check:
+        digest_markers = [
+            "важливе за день", "головне за день", "підсумки дня", "підсумок дня",
+            "головне за сьогодні", "топ новин", "головні новини дня", "головне за ніч",
+            "дайджест", "вечірній дайджест", "ранковий дайджест"
+        ]
+        if any(d in lower_raw for d in digest_markers):
+            return "SKIP"
+
+        flight_radar_words = [
+            "рухаються у", "рухаються в", "курс на", "курсом на", "фіксують у", "фіксуються в",
+            "напрямок руху", "напрямку чорнобиля", "напрямку києва", "повз миронівку", "повз "
+        ]
+        has_real_impact = any(k in lower_raw for k in ["збито", "відбито", "влучання", "руйнування", "пожежа", "загинули"])
+        if any(r in lower_raw for r in flight_radar_words) and not has_real_impact:
+            return "SKIP"
+
+    context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:15], 1)]) if recent_headlines else ""
+
+    system_prompt = (
+        "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
+        f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
+        "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
+        "1. Якщо новину надіслав адміністратор — оформи її обов'язково у фірмовому стилі!\n"
+        "2. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення публікувати обов'язково окремими постами!\n"
+        "3. БЕЗ ПАНІКИ: Якщо новина — подробиці старої трагедії, пиши «Розкрито подробиці», а не «Стався теракт».\n"
+        "4. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n"
+        "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
+        "ФОРМАТ ПОСТА:\n"
+        "⚡ <b>Короткий влучний заголовок</b>\n\n"
+        "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
+        "Цитати: «Текст», — <b>Прізвище</b>.\n\n"
+        "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ АБО СЛОВО SKIP."
+    )
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Вхідна новина:\n\n{text}"}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 800
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code != 200:
+            return None
+        raw_out = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+    raw_out = re.sub(r'<think>.*?</think>', '', raw_out, flags=re.DOTALL).strip()
+    if raw_out.upper() == "SKIP" or "SKIP" in raw_out[:10]:
+        return "SKIP"
+
+    out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
+    out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
+    out = out.replace("<blockquote>", "").replace("</blockquote>", "")
+
+    ru_fixes = {
+        r'\bекс-президент(а|у|ом|і)?\s+США\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 США \2Трамп\3',
+        r'\bекс-президент(а|у|ом|і)?\s+США\b': r'Президент\1 США',
+        r'\bекс-президент(а|у|ом|і)?\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 \2Трамп\3',
+        r'\bколишн(ій|ього|ьому|ім)\s+президент(а|у|ом|і)?\s+США\b': r'Президент\2 США',
+        r'\bУ\s+інтерв[\'’]ю\b': 'В інтерв\'ю',
+        r'\bу\s+інтерв[\'’]ю\b': 'в інтерв\'ю',
+        r'\b[иі]стека[а-я]* кров[\'’]ю\b': 'стікав кров\'ю',
+        r'\b[иі]стека[а-я]*\b': 'стікав',
+        r'\bГСЧС\b': 'ДСНС',
+        r'\bгсчс\b': 'ДСНС',
+        r'\bогромн(а|у|е|і|их|им|ому)\b': r'величезн\1',
+        r'\bворонку\b': 'вирву',
+        r'\bворонка\b': 'вирва',
+        r'\bворонки\b': 'вирви',
+        r'\bукраїнські зсу\b': 'ЗСУ',
+        r'\bтолп[а-я]*': 'натовп',
+        r'\bпозор[а-я]*': 'ганьба',
+        r'\bВСУ\b': 'ЗСУ'
+    }
+    for r_pattern, replacement in ru_fixes.items():
+        out = re.sub(r_pattern, replacement, out, flags=re.IGNORECASE)
+
+    return out
+
+# --- ВИКАЧУВАННЯ ФАЙЛІВ З TELEGRAM ---
+def download_tg_file(file_id):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
+        r = requests.get(url, timeout=10)
+        file_path = r.json().get("result", {}).get("file_path")
+        if file_path:
+            download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+            f_resp = requests.get(download_url, timeout=30)
+            if f_resp.status_code == 200:
+                return f_resp.content
+    except Exception as e:
+        logger.warning(f"Error downloading tg file: {e}")
+    return None
+
+# --- БЕЗПЕЧНА ОБРОБКА ПОВІДОМЛЕННЯ ВІД ВЛАСНИКА (WEBHOOK WORKER) ---
+def handle_incoming_admin_update(update):
+    try:
+        msg = update.get("message")
+        if not msg:
+            return
+
+        chat_id = msg.get("chat", {}).get("id")
+        chat_type = msg.get("chat", {}).get("type")
+
+        # Працюємо ТІЛЬКИ в приватному чаті з ботом
+        if chat_type != "private":
+            return
+
+        text_content = msg.get("text") or msg.get("caption") or ""
+        
+        if text_content.strip() == "/start":
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "👋 Привіт! Я твій новинний бот-редактор.\n\nПросто пересилай мені будь-яку новину чи відео з будь-якого каналу — я сам зроблю гарний пост і опублікую на @kropivnit!"
+            })
+            return
+
+        # Миттєва відповідь у чат
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": "⏳ Отримав! Оформлюю через AI та публікую в канал..."
+        })
+
+        video_bytes = None
+        photo_bytes = None
+
+        # Перевірка на посилання t.me/...
+        link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
+        if link_match:
+            ch_name = link_match.group(1)
+            m_id = link_match.group(2)
+            v_url, p_urls = fetch_media_from_embed(ch_name, m_id)
+            if v_url:
+                v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+                if v_resp.status_code == 200:
+                    video_bytes = v_resp.content
+            elif p_urls:
+                p_resp = requests.get(p_urls[0], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if p_resp.status_code == 200:
+                    photo_bytes = p_resp.content
+        else:
+            if "video" in msg:
+                video_bytes = download_tg_file(msg["video"]["file_id"])
+            elif "photo" in msg:
+                photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
+            elif "animation" in msg:
+                video_bytes = download_tg_file(msg["animation"]["file_id"])
+
+        model_name = get_working_groq_model()
+        rewritten = rewrite_news_for_channel(text_content, model_name, skip_duplicates_check=True)
+        if not rewritten or rewritten == "SKIP":
+            rewritten = text_content.strip()
+
+        caption = append_channel_signature(rewritten)
+
+        published = False
+        if video_bytes:
+            files = {"video": ("video.mp4", video_bytes, "video/mp4")}
+            data_post = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+            res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data_post, files=files, timeout=45)
+            published = res.json().get("ok", False)
+        elif photo_bytes:
+            files = {"photo": ("image.jpg", photo_bytes, "image/jpeg")}
+            data_post = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+            res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data_post, files=files, timeout=25)
+            published = res.json().get("ok", False)
+        else:
+            res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                "chat_id": TELEGRAM_CHANNEL_ID,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }, timeout=15)
+            published = res.json().get("ok", False)
+
+        if published:
+            headline = rewritten.split('\n')[0]
+            # Записуємо в пам'ять автопілота, щоб він не повторив цю новину пізніше
+            app_state["recent_published_posts"].insert(0, rewritten)
+            save_state(app_state)
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"🚀 <b>Успішно опубліковано в @kropivnit!</b>\n\n{headline}",
+                "parse_mode": "HTML"
+            })
+        else:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "❌ Не вдалося опублікувати. Перевірте формат повідомлення."
+            })
+
+    except Exception as e:
+        logger.warning(f"Error handling admin forward: {e}")
+
+# --- HEALTH CHECK ТА WEBHOOK СЕРВЕР (БЕЗ ЖОДНИХ КОНФЛІКТІВ) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK: News Bot is running 24/7.")
+
+    def do_POST(self):
+        # Приймаємо Webhook від Telegram миттєво
+        if self.path == WEBHOOK_PATH:
+            try:
+                content_len = int(self.headers.get('Content-Length', 0))
+                post_body = self.rfile.read(content_len)
+                update = json.loads(post_body.decode('utf-8'))
+                
+                # Відповідаємо Telegram 200 OK за 0.001 секунди
+                self.send_response(200)
+                self.end_headers()
+                
+                # Обробляємо новину у фоні, щоб веб-сервер не чекав
+                threading.Thread(target=handle_incoming_admin_update, args=(update,), daemon=True).start()
+                return
+            except Exception as e:
+                logger.warning(f"Webhook error: {e}")
+
+        self.send_response(200)
+        self.end_headers()
+
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    logger.info(f"Health-check & Webhook server listening on port {PORT}")
+    server.serve_forever()
+
+def setup_webhook_safe():
+    if not RENDER_EXTERNAL_URL:
+        return
+    base_url = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL.startswith("http") else f"https://{RENDER_EXTERNAL_URL}"
+    webhook_url = f"{base_url}{WEBHOOK_PATH}"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    try:
+        r = requests.post(url, json={"url": webhook_url, "drop_pending_updates": True}, timeout=10)
+        logger.info(f"Telegram setWebhook result: {r.json()}")
+    except Exception as e:
+        logger.warning(f"setWebhook error: {e}")
+
+def run_keep_alive():
+    if not RENDER_EXTERNAL_URL:
+        return
+    url = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL.startswith("http") else f"https://{RENDER_EXTERNAL_URL}"
+    logger.info(f"Keep-alive worker activated for URL: {url}")
+    while True:
+        try:
+            time.sleep(480)
+            r = requests.get(url, timeout=15)
+            logger.info(f"Keep-alive ping sent to {url}, status: {r.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping error: {e}")
+
+# --- SCRAPER & EMBED UTILITIES ---
 def scrape_channel(channel_name):
     url = f"https://t.me/s/{channel_name.lstrip('@')}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -206,7 +456,6 @@ def scrape_channel(channel_name):
             })
     return messages
 
-# --- ЗЧИТУВАННЯ МЕДІА (MP4 ТА HD ФОТО) ---
 def fetch_media_from_embed(donor_channel, msg_id):
     clean_channel = donor_channel.lstrip('@')
     embed_url = f"https://t.me/{clean_channel}/{msg_id}?embed=1"
@@ -231,7 +480,6 @@ def fetch_media_from_embed(donor_channel, msg_id):
         logger.warning(f"Embed fetch error: {e}")
     return video_url, photo_urls
 
-# --- ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ ---
 def get_channel_recent_posts(target_channel):
     posts = []
     clean_target = target_channel.lstrip('@')
@@ -262,7 +510,6 @@ def get_channel_recent_posts(target_channel):
     posts.reverse()
     return posts
 
-# --- ШВИДКИЙ PYTHON-АНТИДУБЛЬ ---
 def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
     if len(candidate_roots) < 2:
         return False
@@ -276,123 +523,6 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
             return True
     return False
 
-# --- AI РЕДАКТУРА ТА РОЗУМНИЙ КОНТРОЛЬ ---
-def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
-    if not GROQ_API_KEY or not text or len(text.strip()) < 30:
-        return None
-
-    lower_raw = text.lower()
-
-    digest_markers = [
-        "важливе за день", "головне за день", "підсумки дня", "підсумок дня",
-        "головне за сьогодні", "топ новин", "головні новини дня", "головне за ніч",
-        "дайджест", "вечірній дайджест", "ранковий дайджест"
-    ]
-    if any(d in lower_raw for d in digest_markers):
-        return "SKIP"
-
-    flight_radar_words = [
-        "рухаються у", "рухаються в", "курс на", "курсом на", "фіксують у", "фіксуються в",
-        "напрямок руху", "напрямку чорнобиля", "напрямку києва", "повз миронівку", "повз "
-    ]
-    has_real_impact = any(k in lower_raw for k in ["збито", "відбито", "влучання", "руйнування", "пожежа", "загинули"])
-    if any(r in lower_raw for r in flight_radar_words) and not has_real_impact:
-        return "SKIP"
-
-    memorial_words = [
-        "хвилина мовчання", "пам'яті геро", "пам'яті загибл", "вічна пам'ять",
-        "загинув у 2022", "загинув у 2023", "загинув 2022", "загинув 2023",
-        "загинув 2024", "поховали на кладовищі"
-    ]
-    if any(m in lower_raw for m in memorial_words):
-        return "SKIP"
-
-    recent_headlines = []
-    for p in recent_channel_posts[:20]:
-        first_line = p.strip().split('\n')[0][:90]
-        if first_line and first_line not in recent_headlines:
-            recent_headlines.append(first_line)
-    context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:15], 1)])
-
-    system_prompt = (
-        "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
-        f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ В КАНАЛІ:\n{context_str}\n\n"
-        "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
-        "1. ЗВЕРНЕННЯ ТА ЗАЯВИ: Одне звернення містить КІЛЬКА РІЗНИХ ТЕМ (удари по РФ, боротьба з корупцією, нагородження). "
-        "Якщо новина стосується ІНШОЇ ТЕМИ — ЦЕ НЕ ДУБЛЬ! Обов'язково пиши окремий пост.\n"
-        "2. АНТИДУБЛЬ: Якщо новина описує ТУ САМУ ПОДІЮ (без нових фактів) — пиши SKIP.\n"
-        "3. БЕЗ ПАНІКИ: Якщо новина — подробиці розслідування старої трагедії, пиши «Розкрито подробиці», а не «Стався теракт».\n"
-        "4. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n"
-        "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
-        "ФОРМАТ ПОСТА:\n"
-        "⚡ <b>Короткий влучний заголовок</b>\n\n"
-        "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
-        "Цитати: «Текст», — <b>Прізвище</b>.\n\n"
-        "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ АБО СЛОВО SKIP."
-    )
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Вхідна новина:\n\n{text}"}
-        ],
-        "temperature": 0.1,
-        "max_tokens": 800
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        if resp.status_code != 200:
-            return None
-        raw_out = resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return None
-
-    raw_out = re.sub(r'<think>.*?</think>', '', raw_out, flags=re.DOTALL).strip()
-    if raw_out.upper() == "SKIP" or "SKIP" in raw_out[:10]:
-        return "SKIP"
-
-    out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
-    out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
-    out = out.replace("<blockquote>", "").replace("</blockquote>", "")
-
-    valid_endings = ('.', '!', '?', '»', '"', '</b>', '</i>', ')')
-    if not out.rstrip().endswith(valid_endings):
-        last_punct = max(out.rfind('.'), out.rfind('!'), out.rfind('?'), out.rfind('»'))
-        if last_punct > 120:
-            out = out[:last_punct+1].strip()
-        else:
-            return None
-
-    ru_fixes = {
-        r'\bекс-президент(а|у|ом|і)?\s+США\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 США \2Трамп\3',
-        r'\bекс-президент(а|у|ом|і)?\s+США\b': r'Президент\1 США',
-        r'\bекс-президент(а|у|ом|і)?\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 \2Трамп\3',
-        r'\bколишн(ій|ього|ьому|ім)\s+президент(а|у|ом|і)?\s+США\b': r'Президент\2 США',
-        r'\bУ\s+інтерв[\'’]ю\b': 'В інтерв\'ю',
-        r'\bу\s+інтерв[\'’]ю\b': 'в інтерв\'ю',
-        r'\b[иі]стека[а-я]* кров[\'’]ю\b': 'стікав кров\'ю',
-        r'\b[иі]стека[а-я]*\b': 'стікав',
-        r'\bГСЧС\b': 'ДСНС',
-        r'\bгсчс\b': 'ДСНС',
-        r'\bогромн(а|у|е|і|их|им|ому)\b': r'величезн\1',
-        r'\bворонку\b': 'вирву',
-        r'\bворонка\b': 'вирва',
-        r'\bворонки\b': 'вирви',
-        r'\bукраїнські зсу\b': 'ЗСУ',
-        r'\bтолп[а-я]*': 'натовп',
-        r'\bпозор[а-я]*': 'ганьба',
-        r'\bВСУ\b': 'ЗСУ'
-    }
-    for r_pattern, replacement in ru_fixes.items():
-        out = re.sub(r_pattern, replacement, out, flags=re.IGNORECASE)
-
-    return out
-
-# --- ПУБЛІКАЦІЯ В TELEGRAM ---
 def publish_post_with_real_media(donor_channel, msg_id, text):
     caption = append_channel_signature(text)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://t.me/"}
@@ -428,79 +558,71 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
     r = requests.post(url, json=payload, timeout=12)
     return r.json().get("ok", False)
 
-# --- ОСНОВНИЙ ЧИСТИЙ АВТОНОМНИЙ ЦИКЛ ---
+# --- ГОЛОВНИЙ АВТОНОМНИЙ ЦИКЛ (ПРАЦЮЄ БЕЗПЕРЕРВНО) ---
 def main_loop():
-    logger.info("Initializing 100% Autonomous Pure News Bot...")
-    state = load_state()
-
+    logger.info("Initializing Safe Autonomous News Pipeline...")
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
-    if not state.get("recent_published_posts"):
-        state["recent_published_posts"] = channel_posts[:60]
+    if not app_state.get("recent_published_posts"):
+        app_state["recent_published_posts"] = channel_posts[:60]
 
-    if not state.get("posted_hashes"):
-        logger.info("Cold start: seeding existing messages into cache...")
+    if not app_state.get("posted_hashes"):
         for ch in DONOR_CHANNELS:
             msgs = scrape_channel(ch)
             for m in msgs:
                 if m["hash"]:
-                    state["posted_hashes"].append(m["hash"])
-        save_state(state)
+                    app_state["posted_hashes"].append(m["hash"])
+        save_state(app_state)
 
     loop_count = 0
     while True:
         try:
             model_name = get_working_groq_model()
-            logger.info(f"Fast-scanning {len(DONOR_CHANNELS)} channels ({model_name})...")
-
             if loop_count % 12 == 0:
                 channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
                 for p in channel_posts[:20]:
-                    if p not in state["recent_published_posts"]:
-                        state["recent_published_posts"].insert(0, p)
-                state["recent_published_posts"] = state["recent_published_posts"][:100]
+                    if p not in app_state["recent_published_posts"]:
+                        app_state["recent_published_posts"].insert(0, p)
+                app_state["recent_published_posts"] = app_state["recent_published_posts"][:100]
             loop_count += 1
+
+            recent_headlines = [p.strip().split('\n')[0][:90] for p in app_state["recent_published_posts"][:15] if p]
 
             for channel in DONOR_CHANNELS:
                 items = scrape_channel(channel)
                 for item in items[-3:]:
                     item_hash = item["hash"]
-                    if not item_hash or item_hash in state["posted_hashes"]:
+                    if not item_hash or item_hash in app_state["posted_hashes"]:
                         continue
 
                     raw_text = item["text"]
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    if is_blatant_duplicate(item["roots"], raw_text, state["recent_published_posts"]):
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
+                    if is_blatant_duplicate(item["roots"], raw_text, app_state["recent_published_posts"]):
+                        app_state["posted_hashes"].append(item_hash)
+                        save_state(app_state)
                         continue
 
-                    rewritten = process_news_with_smart_editorial(raw_text, model_name, state["recent_published_posts"])
+                    rewritten = rewrite_news_for_channel(raw_text, model_name, skip_duplicates_check=False, recent_headlines=recent_headlines)
                     if rewritten == "SKIP":
-                        state["posted_hashes"].append(item_hash)
-                        save_state(state)
+                        app_state["posted_hashes"].append(item_hash)
+                        save_state(app_state)
                         continue
 
                     if not rewritten:
                         continue
 
-                    success = publish_post_with_real_media(
-                        item["donor_channel"], 
-                        item["msg_id"], 
-                        rewritten
-                    )
-
+                    success = publish_post_with_real_media(item["donor_channel"], item["msg_id"], rewritten)
                     if success:
                         headline = rewritten.split('\n')[0]
-                        logger.info(f"Published in real-time: {headline}")
-                        state["posted_hashes"].append(item_hash)
-                        state["recent_published_posts"].insert(0, rewritten)
-                        if len(state["recent_published_posts"]) > 100:
-                            state["recent_published_posts"] = state["recent_published_posts"][:100]
-                        if len(state["posted_hashes"]) > 2500:
-                            state["posted_hashes"] = state["posted_hashes"][-2000:]
-                        save_state(state)
+                        logger.info(f"Published auto-post: {headline}")
+                        app_state["posted_hashes"].append(item_hash)
+                        app_state["recent_published_posts"].insert(0, rewritten)
+                        if len(app_state["recent_published_posts"]) > 100:
+                            app_state["recent_published_posts"] = app_state["recent_published_posts"][:100]
+                        if len(app_state["posted_hashes"]) > 2500:
+                            app_state["posted_hashes"] = app_state["posted_hashes"][-2000:]
+                        save_state(app_state)
                         time.sleep(10)
 
                 time.sleep(0.3)
@@ -516,5 +638,8 @@ if __name__ == "__main__":
 
     t_ping = threading.Thread(target=run_keep_alive, daemon=True)
     t_ping.start()
+
+    # Безпечно реєструємо Webhook (не викликає 409 конфліктів)
+    setup_webhook_safe()
 
     main_loop()
