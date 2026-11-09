@@ -105,7 +105,6 @@ def extract_canonical_roots(text):
     t = t.replace('ы', 'и').replace('э', 'е').replace('ё', 'е').replace('ъ', '').replace('ь', '')
     t = t.replace('и', 'і')
 
-    # ПІДТРИМКА ЛАТИНИЦІ [a-z] (Nvidia, GeForce, Apple тощо)
     words = re.findall(r'[а-яіїєґa-z0-9]{3,}', t)
     stop_roots = {
         'який', 'яка', 'яке', 'які', 'його', 'цього', 'було', 'буде', 'коли', 
@@ -125,7 +124,7 @@ def extract_canonical_roots(text):
         roots.add(root)
     return roots
 
-# --- SCRAPER FOR TELEGRAM DONORS ---
+# --- ШВИДКИЙ СКРАПЕР ДОНОРІВ ---
 def scrape_channel(channel_name):
     url = f"https://t.me/s/{channel_name.lstrip('@')}"
     headers = {
@@ -133,10 +132,11 @@ def scrape_channel(channel_name):
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
+        # Швидкий таймаут 5 секунд замість 10
+        with urllib.request.urlopen(req, timeout=5) as response:
             html_content = response.read().decode('utf-8', errors='ignore')
     except Exception as e:
-        logger.warning(f"Failed to fetch {url}: {e}")
+        logger.warning(f"Fetch {channel_name} skipped: {e}")
         return []
 
     messages = []
@@ -177,19 +177,19 @@ def scrape_channel(channel_name):
 
     return messages
 
-# --- ЗЧИТУВАННЯ МЕДІА (MP4 ТА HD ФОТО З EMBED ВІДЖЕТА) ---
+# --- ЗЧИТУВАННЯ МЕДІА (MP4 ТА HD ФОТО) ---
 def fetch_media_from_embed(donor_channel, msg_id):
     clean_channel = donor_channel.lstrip('@')
     embed_url = f"https://t.me/{clean_channel}/{msg_id}?embed=1"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Referer": f"https://t.me/s/{clean_channel}"
     }
     video_url = None
     photo_urls = []
     try:
         req = urllib.request.Request(embed_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             html_text = resp.read().decode('utf-8', errors='ignore')
 
         v_match = re.search(r'<video[^>]+src=["\']([^"\']+)["\']', html_text)
@@ -209,17 +209,17 @@ def fetch_media_from_embed(donor_channel, msg_id):
 
     return video_url, photo_urls
 
-# --- ГЛИБОКЕ ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ (ДО 100 ПОСТІВ) ---
+# --- ЗЧИТУВАННЯ ІСТОРІЇ КАНАЛУ ---
 def get_channel_recent_posts(target_channel):
     posts = []
     clean_target = target_channel.lstrip('@')
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     current_url = f"https://t.me/s/{clean_target}"
-    for _ in range(3):
+    for _ in range(2):
         try:
             req = urllib.request.Request(current_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=6) as resp:
                 content = resp.read().decode('utf-8', errors='ignore')
 
             blocks = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', content, re.DOTALL)
@@ -240,7 +240,6 @@ def get_channel_recent_posts(target_channel):
             else:
                 break
         except Exception as e:
-            logger.warning(f"Error reading channel history: {e}")
             break
 
     posts.reverse()
@@ -253,7 +252,7 @@ def get_working_groq_model():
     url = "https://api.groq.com/openai/v1/models"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     try:
-        r = requests.get(url, headers=headers, timeout=8)
+        r = requests.get(url, headers=headers, timeout=5)
         if r.status_code == 200:
             data = r.json().get("data", [])
             valid_ids = [
@@ -267,10 +266,10 @@ def get_working_groq_model():
             if valid_ids:
                 return valid_ids[0]
     except Exception as e:
-        logger.warning(f"Model lookup failed: {e}")
+        pass
     return "llama-3.1-8b-instant"
 
-# --- ШВИДКА ПЕРЕВІРКА НА ПОВТОР (З ПІДТРИМКОЮ БРЕНДІВ І ЛАТИНИЦІ) ---
+# --- ШВИДКИЙ PYTHON-АНТИДУБЛЬ ---
 def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
     if len(candidate_roots) < 2:
         return False
@@ -280,28 +279,26 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
         "кількість зросла", "підтвердив генштаб", "з'явилися кадри",
         "з'явилося відео", "загинуло вже"
     ]
-    has_update = any(m in raw_text.lower() for m in update_markers)
-    if has_update:
+    if any(m in raw_text.lower() for m in update_markers):
         return False
 
-    for p in recent_posts[:35]:
+    for p in recent_posts[:30]:
         p_roots = extract_canonical_roots(p)
         common = candidate_roots & p_roots
-        # Якщо збігаються 2 важливих корені (наприклад 'nvidia' + 'хуанг' або 'краків' + 'стрілян')
         if len(common) >= 2 and len(common) / len(candidate_roots) >= 0.25:
-            logger.info(f"BLATANT DUPLICATE BLOCKED: common roots {common}")
+            logger.info(f"Duplicate blocked instantly in Python: {common}")
             return True
 
     return False
 
-# --- AI РЕДАКТУРА ТА ЖОРСТКИЙ РЕДАКТОРСЬКИЙ КОНТРОЛЬ ---
+# --- ЛЕГКИЙ AI РЕДАКТОР (БЕЗ ПЕРЕПОВНЕННЯ ЛІМІТУ ТОКЕНІВ) ---
 def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
     if not GROQ_API_KEY or not text or len(text.strip()) < 30:
         return None
 
     lower_raw = text.lower()
 
-    # 1. ТОТАЛЬНИЙ БАН РАДАРНОГО СПАМУ (НАПРЯМКИ БПЛА НАД СЕЛАМИ)
+    # Тотальний бан радарного спаму (напрямки дронів над селами)
     flight_radar_words = [
         "рухаються у", "рухаються в", "курс на", "курсом на", "фіксують у", "фіксуються в",
         "напрямок руху", "напрямку чорнобиля", "напрямку києва", "напрямку білої",
@@ -310,13 +307,12 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         "підвищена небезпека", "зафіксовано рух", "наближаються до", "група бпла",
         "шахеди курсом", "бпла повз", "чисто по областях", "відбій тривоги"
     ]
-    # Пропускаємо ТІЛЬКИ якщо є реальні наслідки або підсумки
     has_real_impact = any(k in lower_raw for k in ["збито", "відбито", "влучання", "руйнування", "пожежа", "загинули", "постраждали"])
     if any(r in lower_raw for r in flight_radar_words) and not has_real_impact:
         logger.info("Skipping flight radar alert.")
         return "SKIP"
 
-    # 2. ВІДСІКАЄМО НЕКРОЛОГИ МИНУЛИХ РОКІВ
+    # Бан некрологів минулих років
     memorial_words = [
         "хвилина мовчання", "пам'яті геро", "пам'яті загибл", "вічна пам'ять",
         "загинув у 2022", "загинув у 2023", "загинув 2022", "загинув 2023",
@@ -326,25 +322,23 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         logger.info("Skipping past years memorial.")
         return "SKIP"
 
-    # 3. ПЕРЕДАЄМО ПОВНИЙ ЗМІСТ ОСТАННІХ 25 ПУБЛІКАЦІЙ (ДО 300 СИМВОЛІВ КОЖНА)
-    recent_context_lines = []
-    for i, p in enumerate(recent_channel_posts[:25], 1):
-        snippet = p.replace('\n', ' ')[:300]
-        recent_context_lines.append(f"{i}. {snippet}")
-    context_str = "\n".join(recent_context_lines)
+    # ОПТИМІЗАЦІЯ ШВИДКОСТІ: ТІЛЬКИ ОДНОРЯДКОВІ ЗАГОЛОВКИ ОСТАННІХ 15 НОВИН (~120 ТОКЕНІВ)
+    recent_headlines = []
+    for p in recent_channel_posts[:20]:
+        first_line = p.strip().split('\n')[0][:90]
+        if first_line and first_line not in recent_headlines:
+            recent_headlines.append(first_line)
+    context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:15], 1)])
 
     system_prompt = (
         "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
-        f"ОСЬ ОСТАННІ ПУБЛІКАЦІЇ НА КАНАЛІ ЗА ОСТАННІ ДНІ:\n{context_str}\n\n"
+        f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ В КАНАЛІ:\n{context_str}\n\n"
         "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
-        "1. ЗАБОРОНА ДУБЛІВ: Якщо вхідна новина описує ТУ САМУ ПОДІЮ (дефіцит/зрада голови Nvidia Дженсена Хуанга, стрілянина у Кракові, удар по мосту на Міусі), "
-        "яка ВЖЕ ВИСВІТЛЮВАЛАСЯ в каналі — ПОВЕРНИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
-        "2. НЕ ПЛОДИ ПАНІКУ ПРО СТАРІ ТЕРАКТИ: Якщо донор публікує подробиці розслідування чи особу нападника старої трагедії (яка сталася вчора або 2 дні тому, як у Кракові) — "
-        "КАТЕГОРИЧНО ЗАБОРОНЕНО писати заголовок ніби це сталося щойно («Сталася стрілянина», «Теракт»)! Заголовок має чітко казати: «Стрілянина у Кракові: поліція розкрила особу нападника». "
-        "А якщо в дописі немає нових фактів — пиши SKIP.\n"
-        "3. ГЕОГРАФІЧНІ ФАКТИ: Столиця Польщі — Варшава (НЕ Краків!). Не приписуй містам вигаданих статусів.\n"
-        "4. АКТУАЛЬНИЙ СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n"
-        "5. ЧИСТА УКРАЇНСЬКА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n\n"
+        "1. АНТИДУБЛЬ: Якщо новина описує ТУ САМУ ПОДІЮ, яка вже є у списку вище (без нових фактів) — ПОВЕРНИ ТІЛЬКИ ОДНЕ СЛОВО: SKIP.\n"
+        "2. БЕЗ ПАНІКИ: Якщо новина — це подробиці старої трагедії чи теракту (як у Кракові), заборонено писати заголовок «Сталася стрілянина/теракт»! Заголовок має казати: «Стрілянина у Кракові: нові подробиці розслідування». Якщо нових деталей нема — пиши SKIP.\n"
+        "3. ГЕОГРАФІЯ: Столиця Польщі — Варшава (НЕ Краків!).\n"
+        "4. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n"
+        "5. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -361,15 +355,16 @@ def process_news_with_smart_editorial(text, model_name, recent_channel_posts):
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Вхідна новина для аналізу:\n\n{text}"}
+            {"role": "user", "content": f"Вхідна новина:\n\n{text}"}
         ],
         "temperature": 0.1,
         "max_tokens": 800
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=25)
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code != 200:
+            logger.warning(f"Groq API {resp.status_code}: {resp.text[:100]}")
             return None
         raw_out = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
@@ -437,7 +432,7 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
     caption = append_channel_signature(text)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Referer": "https://t.me/"
     }
 
@@ -447,32 +442,32 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
     if video_url:
         try:
             logger.info(f"Downloading MP4 from {video_url[:60]}...")
-            resp = requests.get(video_url, headers=headers, timeout=35)
+            resp = requests.get(video_url, headers=headers, timeout=25)
             if resp.status_code == 200 and len(resp.content) > 5000:
                 if len(resp.content) <= 50 * 1024 * 1024:
                     files = {"video": ("video.mp4", resp.content, "video/mp4")}
                     data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-                    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=60)
+                    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=45)
                     if r.json().get("ok"):
                         logger.info("Published post with REAL VIDEO!")
                         return True
         except Exception as e:
-            logger.warning(f"Failed to fetch/upload video: {e}")
+            logger.warning(f"Failed to upload video: {e}")
 
     # 2. Фото
     if photo_urls:
         for p_url in photo_urls[:1]:
             try:
-                resp = requests.get(p_url, headers=headers, timeout=15)
+                resp = requests.get(p_url, headers=headers, timeout=12)
                 if resp.status_code == 200 and len(resp.content) >= 20000:
                     files = {"photo": ("image.jpg", resp.content, "image/jpeg")}
                     data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
-                    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=30)
+                    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=25)
                     if r.json().get("ok"):
                         logger.info("Published post with REAL PHOTO!")
                         return True
             except Exception as e:
-                logger.warning(f"Failed to fetch/upload photo: {e}")
+                logger.warning(f"Failed to upload photo: {e}")
 
     # 3. Текст
     logger.info("Publishing as text post...")
@@ -483,12 +478,12 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    r = requests.post(url, json=payload, timeout=15)
+    r = requests.post(url, json=payload, timeout=12)
     return r.json().get("ok", False)
 
-# --- MAIN LOOP ---
+# --- БЛИСКАВИЧНИЙ ЦИКЛ ОНОВЛЕННЯ ---
 def main_loop():
-    logger.info("Initializing news bot with Deep 100-Post Memory & Anti-Panic Guard...")
+    logger.info("Initializing news bot with Lightning Fast Pipeline...")
     state = load_state()
 
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
@@ -508,14 +503,13 @@ def main_loop():
     while True:
         try:
             model_name = get_working_groq_model()
-            logger.info(f"Scanning {len(DONOR_CHANNELS)} channels using model: {model_name}...")
+            logger.info(f"Fast-scanning {len(DONOR_CHANNELS)} channels ({model_name})...")
 
-            if loop_count % 8 == 0:
+            if loop_count % 12 == 0:
                 channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
-                for p in channel_posts[:25]:
+                for p in channel_posts[:20]:
                     if p not in state["recent_published_posts"]:
                         state["recent_published_posts"].insert(0, p)
-                # Зберігаємо до 100 постів пам'яті (3-4 доби)
                 state["recent_published_posts"] = state["recent_published_posts"][:100]
             loop_count += 1
 
@@ -530,14 +524,13 @@ def main_loop():
                     if not raw_text or len(raw_text) < 30:
                         continue
 
-                    # 1. Швидкий Python-фільтр з підтримкою англійських брендів (Nvidia тощо)
+                    # 1. Швидкий Python-фільтр
                     if is_blatant_duplicate(item["roots"], raw_text, state["recent_published_posts"]):
-                        logger.info(f"Skipping duplicate: {list(item['roots'])[:3]}")
                         state["posted_hashes"].append(item_hash)
                         save_state(state)
                         continue
 
-                    # 2. Редакторська перевірка AI
+                    # 2. Легкий AI-рерайтер
                     rewritten = process_news_with_smart_editorial(raw_text, model_name, state["recent_published_posts"])
                     if rewritten == "SKIP":
                         state["posted_hashes"].append(item_hash)
@@ -556,7 +549,7 @@ def main_loop():
 
                     if success:
                         headline = rewritten.split('\n')[0]
-                        logger.info(f"Published: {headline}")
+                        logger.info(f"Published in real-time: {headline}")
                         state["posted_hashes"].append(item_hash)
                         state["recent_published_posts"].insert(0, rewritten)
                         if len(state["recent_published_posts"]) > 100:
@@ -564,14 +557,14 @@ def main_loop():
                         if len(state["posted_hashes"]) > 2500:
                             state["posted_hashes"] = state["posted_hashes"][-2000:]
                         save_state(state)
-                        time.sleep(15)
+                        time.sleep(10) # 10 сек між публікаціями
 
-                time.sleep(0.6)
+                time.sleep(0.3) # 0.3 сек між донорами
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
 
-        time.sleep(45)
+        time.sleep(20) # Новий швидкий цикл кожні 20 секунд!
 
 if __name__ == "__main__":
     t_http = threading.Thread(target=run_http_server, daemon=True)
