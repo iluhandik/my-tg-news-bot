@@ -126,19 +126,6 @@ def extract_canonical_roots(text):
         roots.add(root)
     return roots
 
-# --- ПЕРЕВІРКА ПРАВ АДМІНІСТРАТОРА КАНАЛУ ---
-def is_channel_admin(user_id):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChatMember"
-    try:
-        r = requests.get(url, params={"chat_id": TELEGRAM_CHANNEL_ID, "user_id": user_id}, timeout=8)
-        data = r.json()
-        if data.get("ok"):
-            status = data.get("result", {}).get("status", "")
-            return status in ["creator", "administrator"]
-    except Exception as e:
-        logger.warning(f"Admin check error: {e}")
-    return False
-
 # --- ПІДПИС КАНАЛУ ---
 def append_channel_signature(text):
     clean_text = text.strip()
@@ -173,7 +160,7 @@ def get_working_groq_model():
         pass
     return "llama-3.1-8b-instant"
 
-# --- AI РЕДАКТУРА ДЛЯ АДМІН-ПОСТІВ ТА АВТОМАТИКИ ---
+# --- AI РЕДАКТУРА ДЛЯ ВСІХ ТИПІВ НОВИН ---
 def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, recent_headlines=[]):
     if not GROQ_API_KEY or not text or len(text.strip()) < 15:
         return None
@@ -203,7 +190,7 @@ def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, rece
         "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
         "СУВОРІ РЕДАКЦІЙНІ ПРАВИЛА:\n"
-        "1. АНТИДУБЛЬ (якщо це авто-пост): Якщо це та сама подія без нових фактів — пиши SKIP. Якщо пост надіслав адмін — оформи обов'язково!\n"
+        "1. Якщо новину надіслав адміністратор — оформи її обов'язково у фірмовому стилі!\n"
         "2. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення публікувати обов'язково окремими постами!\n"
         "3. БЕЗ ПАНІКИ: Якщо новина — подробиці старої трагедії, пиши «Розкрито подробиці», а не «Стався теракт».\n"
         "4. ЧИСТА МОВА: «В інтерв'ю» (НЕ «У інтерв'ю»), «стікав кров'ю» (НЕ «истекав кров'ю»), «ДСНС» (НЕ «ГСЧС»), «вирва» (НЕ «воронка»).\n"
@@ -269,7 +256,7 @@ def rewrite_news_for_channel(text, model_name, skip_duplicates_check=False, rece
 
     return out
 
-# --- ВИКАЧУВАННЯ ФАЙЛІВ З TELEGRAM ДЛЯ ПЕРЕСЛАНИХ ПОВІДОМЛЕНЬ ---
+# --- ВИКАЧУВАННЯ ФАЙЛІВ З TELEGRAM ДЛЯ ПЕРЕСЛАНИХ МЕДІА ---
 def download_tg_file(file_id):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
@@ -284,15 +271,25 @@ def download_tg_file(file_id):
         logger.warning(f"Error downloading tg file: {e}")
     return None
 
-# --- ФОНОВИЙ СЛУХАЧ ДЛЯ ПОВІДОМЛЕНЬ АДМІНІСТРАТОРА (VIP ПУШ) ---
+# --- ШВИДКИЙ СЛУХАЧ ДЛЯ ПЕРЕСИЛАНЬ ВІД ВЛАСНИКА В ПРИВАТ ---
 def run_admin_listener():
-    logger.info("Admin VIP listener activated for private forwards...")
+    logger.info("Admin VIP listener started...")
+    # Очищуємо старі завислі повідомлення черги
     offset = 0
+    try:
+        init_r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1", timeout=8)
+        init_data = init_r.json()
+        if init_data.get("ok") and init_data.get("result"):
+            offset = init_data["result"][-1]["update_id"] + 1
+            logger.info(f"Cleared old updates, starting from offset {offset}")
+    except Exception as e:
+        logger.warning(f"Error initializing offset: {e}")
+
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {"offset": offset, "timeout": 20}
-            r = requests.get(url, params=params, timeout=25)
+            params = {"offset": offset, "timeout": 3}
+            r = requests.get(url, params=params, timeout=10)
             data = r.json()
             if not data.get("ok"):
                 time.sleep(2)
@@ -304,41 +301,39 @@ def run_admin_listener():
                 if not msg:
                     continue
 
-                user_id = msg.get("from", {}).get("id")
+                chat_id = msg.get("chat", {}).get("id")
                 chat_type = msg.get("chat", {}).get("type")
 
-                # Приймаємо тільки особисті повідомлення (в ПП боту)
+                # Обробляємо ТІЛЬКИ особисті повідомлення (в ПП боту)
                 if chat_type != "private":
                     continue
 
-                # Перевіряємо, чи користувач є адміном або власником @kropivnit
-                if not is_channel_admin(user_id):
+                text_content = msg.get("text") or msg.get("caption") or ""
+                
+                # Команда /start
+                if text_content.strip() == "/start":
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": user_id,
-                        "text": "⛔ Доступ лише для адміністраторів та власника каналу @kropivnit."
+                        "chat_id": chat_id,
+                        "text": "👋 Привіт! Я твій новинний бот-редактор.\n\nПросто пересилай мені будь-які новини, пости чи відео з інших каналів — я сам оформлю їх через AI і опублікую на @kropivnit за пару секунд!"
                     })
                     continue
 
-                # Повідомляємо адміна про старт обробки
+                # Миттєве підтвердження отримання
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": user_id,
-                    "text": "⏳ Отримав! Обробляю через AI та публікую в канал..."
+                    "chat_id": chat_id,
+                    "text": "⏳ Отримав новину! Оформлюю через AI та публікую в канал..."
                 })
 
-                # Витягуємо текст
-                text_content = msg.get("text") or msg.get("caption") or ""
-                
-                # Перевіряємо, чи це посилання на пост (наприклад, t.me/exilenova_plus/12345)
-                link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
                 video_bytes = None
                 photo_bytes = None
 
+                link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
                 if link_match:
                     ch_name = link_match.group(1)
                     m_id = link_match.group(2)
                     v_url, p_urls = fetch_media_from_embed(ch_name, m_id)
                     if v_url:
-                        v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                        v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
                         if v_resp.status_code == 200:
                             video_bytes = v_resp.content
                     elif p_urls:
@@ -346,33 +341,31 @@ def run_admin_listener():
                         if p_resp.status_code == 200:
                             photo_bytes = p_resp.content
                 else:
-                    # Якщо переслано напряму з відео або фото
                     if "video" in msg:
                         video_bytes = download_tg_file(msg["video"]["file_id"])
                     elif "photo" in msg:
-                        # беремо найбільший розмір фото
                         photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
+                    elif "animation" in msg:
+                        video_bytes = download_tg_file(msg["animation"]["file_id"])
 
-                # Робимо рерайт через AI
                 model_name = get_working_groq_model()
                 rewritten = rewrite_news_for_channel(text_content, model_name, skip_duplicates_check=True)
                 if not rewritten or rewritten == "SKIP":
-                    rewritten = text_content # якщо AI відмовився, лишаємо текст адміна
+                    rewritten = text_content.strip()
 
                 caption = append_channel_signature(rewritten)
 
-                # Публікуємо в канал
-                success = False
+                published = False
                 if video_bytes:
                     files = {"video": ("video.mp4", video_bytes, "video/mp4")}
                     data_post = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                     res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data_post, files=files, timeout=45)
-                    success = res.json().get("ok", False)
+                    published = res.json().get("ok", False)
                 elif photo_bytes:
                     files = {"photo": ("image.jpg", photo_bytes, "image/jpeg")}
                     data_post = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                     res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data_post, files=files, timeout=25)
-                    success = res.json().get("ok", False)
+                    published = res.json().get("ok", False)
                 else:
                     res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                         "chat_id": TELEGRAM_CHANNEL_ID,
@@ -380,23 +373,23 @@ def run_admin_listener():
                         "parse_mode": "HTML",
                         "disable_web_page_preview": True
                     }, timeout=15)
-                    success = res.json().get("ok", False)
+                    published = res.json().get("ok", False)
 
-                # Звіт адміну
-                if success:
+                if published:
+                    headline = rewritten.split('\n')[0]
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": user_id,
-                        "text": f"🚀 <b>Успішно опубліковано в @kropivnit!</b>\n\n{rewritten.split(chr(10))[0]}",
+                        "chat_id": chat_id,
+                        "text": f"🚀 <b>Успішно опубліковано в @kropivnit!</b>\n\n{headline}",
                         "parse_mode": "HTML"
                     })
                 else:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": user_id,
-                        "text": "❌ Помилка під час публікації. Перевірте формат повідомлення."
+                        "chat_id": chat_id,
+                        "text": "❌ Не вдалося опублікувати. Перевірте, чи бот має права адміністратора на каналі."
                     })
 
         except Exception as e:
-            logger.warning(f"Admin listener loop error: {e}")
+            logger.warning(f"Admin listener error: {e}")
             time.sleep(2)
 
 # --- SCRAPER & EMBED UTILITIES ---
@@ -549,7 +542,7 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
 
 # --- ОСНОВНИЙ ЦИКЛ ОНОВЛЕННЯ ---
 def main_loop():
-    logger.info("Initializing news bot with Admin VIP Listener...")
+    logger.info("Initializing news bot with Fast Admin Listener...")
     state = load_state()
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
     if not state.get("recent_published_posts"):
@@ -629,7 +622,6 @@ if __name__ == "__main__":
     t_ping = threading.Thread(target=run_keep_alive, daemon=True)
     t_ping.start()
 
-    # Запускаємо VIP-слухача для пересилань від власника в приваті
     t_admin = threading.Thread(target=run_admin_listener, daemon=True)
     t_admin.start()
 
