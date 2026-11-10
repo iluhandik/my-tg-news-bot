@@ -31,9 +31,8 @@ CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit"
 CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}").strip()
 
-AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or os.getenv("AI_KEY") or os.getenv("GROQ_KEY") or "").strip()
+AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or os.getenv("AI_KEY") or os.getenv("GROQ_KEY") or "").strip().strip('"').strip("'")
 
-# 24 канали-донори для автономного сканування
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
@@ -85,7 +84,7 @@ def save_json(path: str, data: list):
     except Exception:
         pass
 
-# ==================== СТОП-СЛОВА ТА БІЛИЙ СПИСОК ====================
+# ==================== СТОП-СЛОВА ====================
 COMMON_STOP_WORDS = {
     "сьогодні", "зараз", "вчора", "цього", "після", "також", "було", "проти", "може",
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
@@ -94,15 +93,10 @@ COMMON_STOP_WORDS = {
     "внаслідок", "відповідно", "разом", "перший", "другий", "можуть", "бути", "своїх"
 }
 
-# Слова з великої літери, які НЕ МОЖУТЬ блокувати новини як дублікат
 EXCLUDED_FROM_ENTITY_MATCH = {
-    # Країни та столиці
     "украї", "украи", "росі", "росси", "сша", "київ", "киев", "москв", "рф", "єс", "оон", "вашин", "брюсс",
-    # ЗМІ та агентства (новини від The Economist більше не блокують одна одну)
     "the", "econo", "reute", "bloom", "finan", "times", "bild", "polit", "washi", "post", "nytim", "bbc", "cnn", "isw", "deeps",
-    # Політики та посадовці
     "зелен", "трамп", "путін", "путин", "байден", "єрмак", "будан", "сирсь", "умеро", "шольц", "макро",
-    # Військові та державні структури
     "геншт", "штаб", "сили", "оборо", "зсу", "гурма", "сбу", "дбр", "набу", "офіс", "прези", "мініс", "уряд", "рада", "верхо",
     "дснс", "укрен", "поліц", "захис", "окупа", "ворог", "новий", "перши", "повідо", "згідн"
 }
@@ -186,7 +180,6 @@ def is_topic_already_covered(text: str) -> bool:
     now = time.time()
     min_time = now - (36 * 3600)
 
-    # Виключаємо ЗМІ, політиків, загальні назви, щоб вони не спричиняли хибних блокувань
     specific_cur_caps = {c for c in cur_caps if not any(c.startswith(g) for g in EXCLUDED_FROM_ENTITY_MATCH)}
 
     for t in topics:
@@ -196,12 +189,10 @@ def is_topic_already_covered(text: str) -> bool:
         prev_caps = set(t.get("capitals", []))
         specific_prev_caps = {c for c in prev_caps if not any(c.startswith(g) for g in EXCLUDED_FROM_ENTITY_MATCH)}
 
-        # Збіг 2+ конкретних локацій (наприклад: Виледь + Архангельськ, Бердянськ + Рубікон)
         common_specific = specific_cur_caps.intersection(specific_prev_caps)
         if len(common_specific) >= 2:
             return True
 
-        # Висока лексична схожість тексту (Jaccard > 42%)
         prev_stems = set(t.get("stems", []))
         if cur_stems and prev_stems:
             overlap = len(cur_stems.intersection(prev_stems)) / len(cur_stems.union(prev_stems))
@@ -304,8 +295,10 @@ def process_admin_post_with_ai(raw_text: str) -> str:
                     res_text = json.loads(data["choices"][0]["message"]["content"]).get("telegram_post", "")
                     if res_text and not re.search(r"[ыэъё]", res_text, re.IGNORECASE):
                         return fix_ukrainian_calques(res_text)
-            except Exception:
-                continue
+                else:
+                    print(f"[GROQ ADMIN]: Код {resp.status_code} - {resp.text[:100]}", flush=True)
+            except Exception as e:
+                print(f"[GROQ ADMIN ПОМИЛКА]: {e}", flush=True)
 
     translated = translate_fallback_api(cleaned)
     if translated and not re.search(r"[ыэъё]", translated, re.IGNORECASE):
@@ -317,13 +310,13 @@ def process_admin_post_with_ai(raw_text: str) -> str:
 
     return ""
 
-# ==================== GROQ ДЛЯ СКАНЕРА ====================
+# ==================== GROQ ДЛЯ АВТОНОМНОГО СКАНЕРА ====================
 SYSTEM_PROMPT = """Ти — редактор провідного українського новинного каналу.
 Твоє завдання — перекласти та оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ без води та емоцій.
 
 ПРАВИЛА:
 1. АНТИДУБЛІКАТ: Якщо ця сама подія ВЖЕ є в списку постів каналу — поверни "is_duplicate": true!
-2. Рутинні тривоги/польоти дронів без прильотів/збиття — став "is_ad": true.
+2. Тільки спам або комерційну рекламу — став "is_ad": true. Реальні новини та кадри війни обов'язково публікуй!
 3. Оформлення:
    - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 емодзі.
    - 1-2 чіткі абзаци з головними фактами. Важливі акценти — <b>жирним</b>. Пряму мову — в <blockquote>.
@@ -338,12 +331,23 @@ SYSTEM_PROMPT = """Ти — редактор провідного українс
 
 def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Optional[Dict]:
     cleaned = strip_foreign_signatures(raw_text)
-    if len(cleaned) < 25 or not AI_API_KEY:
+    if len(cleaned) < 10:
+        return None
+
+    if not AI_API_KEY:
+        print("[AI ПОМИЛКА]: Змінна AI_API_KEY порожня! Перевірте налаштування в Render.", flush=True)
+        # Автоматичний фолбек без Groq
+        trans = translate_fallback_api(cleaned)
+        if trans and not re.search(r"[ыэъё]", trans, re.IGNORECASE):
+            lines = [l.strip() for l in trans.splitlines() if l.strip()]
+            head = f"⚡ <b>{lines[0]}</b>"
+            body = "\n\n".join(lines[1:])
+            return {"telegram_post": fix_ukrainian_calques(f"{head}\n\n{body}" if body else head)}
         return None
 
     recent_context = ""
     if recent_channel_posts:
-        recent_context = "ОСТАННІ НОВИНИ КАНАЛУ:\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:10]]) + "\n\n"
+        recent_context = "ОСТАННІ НОВИНИ КАНАЛУ:\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:8]]) + "\n\n"
 
     user_prompt = f"{recent_context}НОВА НОВИНА ДЛЯ РЕДАГУВАННЯ:\n{cleaned}"
 
@@ -366,15 +370,32 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
             )
             if resp.status_code == 200:
                 parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-                if parsed.get("is_duplicate") or parsed.get("is_ad"):
+                if parsed.get("is_duplicate"):
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏩ ШІ відхилив як дубль: {cleaned[:35]}...", flush=True)
+                    return None
+                if parsed.get("is_ad"):
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏩ ШІ відхилив як рекламу: {cleaned[:35]}...", flush=True)
                     return None
                 if "telegram_post" in parsed:
                     post_res = fix_ukrainian_calques(parsed["telegram_post"])
                     if not re.search(r"[ыэъё]", post_res, re.IGNORECASE):
                         parsed["telegram_post"] = post_res
                         return parsed
-        except Exception:
-            continue
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [GROQ СКАНЕР]: Код {resp.status_code}: {resp.text[:100]}", flush=True)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [GROQ ВИНЯТОК]: {e}", flush=True)
+
+    # Резервний переклад, якщо Groq відмовив (429 чи збій)
+    trans = translate_fallback_api(cleaned)
+    if trans and not re.search(r"[ыэъё]", trans, re.IGNORECASE):
+        lines = [l.strip() for l in trans.splitlines() if l.strip()]
+        if lines:
+            head = f"⚡ <b>{lines[0]}</b>"
+            body = "\n\n".join(lines[1:])
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Застосовано резервний автопереклад", flush=True)
+            return {"telegram_post": fix_ukrainian_calques(f"{head}\n\n{body}" if body else head)}
+
     return None
 
 # ==================== ВІДПРАВКА В TELEGRAM ====================
@@ -774,7 +795,7 @@ def run_scanner_loop():
                         continue
 
                     post_text = ai.get("telegram_post", "")
-                    if len(post_text) < 25 or is_topic_already_covered(post_text):
+                    if len(post_text) < 15 or is_topic_already_covered(post_text):
                         register_post_id(p_id)
                         continue
 
@@ -801,6 +822,8 @@ def run_scanner_loop():
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
+    print(f"[AI СТАТУС]: Ключ Groq знайдено: {bool(AI_API_KEY)} (довжина: {len(AI_API_KEY)})", flush=True)
+
     if TELEGRAM_BOT_TOKEN:
         webhook_url = f"{RENDER_URL.rstrip('/')}/tg-webhook"
         print(f"[WEBHOOK]: Реєстрація: {webhook_url}", flush=True)
