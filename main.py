@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
+# Вимикаємо буферизацію для миттєвих логів у Render
+sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 
 # ==================== НАЛАШТУВАННЯ ====================
@@ -90,6 +92,11 @@ COMMON_STOP_WORDS = {
     "внаслідок", "відповідно", "разом", "перший", "другий", "можуть", "бути", "своїх"
 }
 
+GENERIC_STOP_ENTITIES = {
+    "украї", "росі", "сша", "київ", "києв", "москв", "зсу", "рф", "єс", "оон",
+    "донба", "кремл", "вашин", "прези", "новий", "перши"
+}
+
 def fix_ukrainian_calques(text: str) -> str:
     text = re.sub(r"\bвсу\b", "ЗСУ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bвійськові сили україни\b", "Збройні Сили України", text, flags=re.IGNORECASE)
@@ -115,11 +122,9 @@ def strip_foreign_signatures(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 def translate_fallback_api(text: str) -> str:
-    """Резервний переклад через безкоштовні відкриті API без блокування за IP."""
-    # 1. Спроба через MyMemory API
     try:
         url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(text[:450])}&langpair=ru|uk"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             res = r.json().get("responseData", {}).get("translatedText")
@@ -128,7 +133,6 @@ def translate_fallback_api(text: str) -> str:
     except Exception:
         pass
 
-    # 2. Спроба через Google API
     try:
         url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uk&dt=t&q=" + urllib.parse.quote(text)
         r = requests.get(url, timeout=8)
@@ -142,7 +146,7 @@ def translate_fallback_api(text: str) -> str:
 
     return ""
 
-# ==================== ТОЧНИЙ АНТИДУБЛІКАТ ====================
+# ==================== АНТИДУБЛІКАТ ====================
 def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
     caps_raw = set(re.findall(r"\b[А-ЯІЇЄҐA-Z]{2,}\b|\b[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{2,}\b", text))
     capitals = set()
@@ -165,21 +169,26 @@ def is_topic_already_covered(text: str) -> bool:
     now = time.time()
     min_time = now - (36 * 3600)
 
+    # Виключаємо загальновживані слова (Україна, Росія, Київ), щоб не блокувати різні новини
+    specific_cur_caps = {c for c in cur_caps if not any(c.startswith(g) for g in GENERIC_STOP_ENTITIES)}
+
     for t in topics:
         if t.get("timestamp", 0) < min_time:
             continue
-        prev_caps = set(t.get("capitals", []))
-        prev_stems = set(t.get("stems", []))
 
-        # Збіг 2+ конкретних назв/локацій (наприклад, Київ + Москва, Виледь + Архангельськ)
-        common_caps = cur_caps.intersection(prev_caps)
-        if len(common_caps) >= 2:
+        prev_caps = set(t.get("capitals", []))
+        specific_prev_caps = {c for c in prev_caps if not any(c.startswith(g) for g in GENERIC_STOP_ENTITIES)}
+
+        # Збіг 2+ конкретних локацій або специфічних назв
+        common_specific = specific_cur_caps.intersection(specific_prev_caps)
+        if len(common_specific) >= 2:
             return True
 
-        # Висока загальна схожість усього тексту (Jaccard > 35%)
+        # Загальна схожість усього тексту (Jaccard > 40%)
+        prev_stems = set(t.get("stems", []))
         if cur_stems and prev_stems:
             overlap = len(cur_stems.intersection(prev_stems)) / len(cur_stems.union(prev_stems))
-            if overlap >= 0.35:
+            if overlap >= 0.40:
                 return True
 
     return False
@@ -219,7 +228,7 @@ def sync_channel_history(channel_username: str) -> List[str]:
         return recent_texts
 
     url = f"https://t.me/s/{clean_name}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         r = requests.get(url, headers=headers, timeout=12)
         if r.status_code == 200:
@@ -236,18 +245,18 @@ def sync_channel_history(channel_username: str) -> List[str]:
                     register_published_topic(head, clean)
                     recent_texts.insert(0, head)
     except Exception as e:
-        print(f"[СИНХРОНІЗАЦІЯ]: Помилка: {e}")
+        print(f"[СИНХРОНІЗАЦІЯ]: Помилка: {e}", flush=True)
 
     return recent_texts
 
-# ==================== РЕРАЙТ ПЕРЕСИЛАНЬ АДМІНА ====================
+# ==================== РЕРАЙТ ПЕРЕСИЛАНЬ ====================
 def process_admin_post_with_ai(raw_text: str) -> str:
     cleaned = strip_foreign_signatures(raw_text)
     if not cleaned: return ""
 
     prompt = f"""Ти — український редактор новин. ПЕРЕКЛАДИ ТА ОФОРМИ цю новину ЧИСТОЮ СОЛОВ'ЇНОЮ УКРАЇНСЬКОЮ МОВОЮ для Telegram-каналу.
 ВИМОГИ:
-- Жодного слова російською! Тільки бездоганна українська мова!
+- Жодного слова російською!
 - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі.
 - Далі: 1-2 чіткі фактичні абзаци. Прізвища, цифри та назви виділяй <b>жирним</b>, пряму мову — в <blockquote>.
 - Жодних підписів.
@@ -258,7 +267,6 @@ def process_admin_post_with_ai(raw_text: str) -> str:
 Відповідай ВИКЛЮЧНО JSON:
 {{"telegram_post": "Текст новини українською з тегами <b> та <blockquote>"}}"""
 
-    # 1. Пріоритет: швидка модель Groq без спалювання квоти
     if AI_API_KEY:
         models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
         for model in models:
@@ -279,12 +287,9 @@ def process_admin_post_with_ai(raw_text: str) -> str:
                     res_text = json.loads(data["choices"][0]["message"]["content"]).get("telegram_post", "")
                     if res_text and not re.search(r"[ыэъё]", res_text, re.IGNORECASE):
                         return fix_ukrainian_calques(res_text)
-                else:
-                    print(f"[GROQ ADMIN ПОМИЛКА]: {resp.status_code} - {resp.text[:120]}")
-            except Exception as ge:
-                print(f"[GROQ ВИНЯТОК]: {ge}")
+            except Exception:
+                continue
 
-    # 2. Резервний автопереклад, якщо Groq тимчасово недоступний
     translated = translate_fallback_api(cleaned)
     if translated and not re.search(r"[ыэъё]", translated, re.IGNORECASE):
         lines = [l.strip() for l in translated.splitlines() if l.strip()]
@@ -295,7 +300,7 @@ def process_admin_post_with_ai(raw_text: str) -> str:
 
     return ""
 
-# ==================== GROQ AI ДЛЯ АВТОНОМНОГО СКАНЕРА ====================
+# ==================== GROQ ДЛЯ СКАНЕРА ====================
 SYSTEM_PROMPT = """Ти — редактор провідного українського новинного каналу.
 Твоє завдання — перекласти та оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ без води та емоцій.
 
@@ -319,10 +324,9 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
     if len(cleaned) < 25 or not AI_API_KEY:
         return None
 
-    # Передаємо лише останні 10 заголовків для економії токенів Groq
     recent_context = ""
     if recent_channel_posts:
-        recent_context = "ОСТАННІ НОВИНИ КАНАЛУ (НЕ ПОВТОРЮВАТИ):\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:10]]) + "\n\n"
+        recent_context = "ОСТАННІ НОВИНИ КАНАЛУ:\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:10]]) + "\n\n"
 
     user_prompt = f"{recent_context}НОВА НОВИНА ДЛЯ РЕДАГУВАННЯ:\n{cleaned}"
 
@@ -352,8 +356,6 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
                     if not re.search(r"[ыэъё]", post_res, re.IGNORECASE):
                         parsed["telegram_post"] = post_res
                         return parsed
-            else:
-                print(f"[GROQ СКАНЕР]: Код {resp.status_code}")
         except Exception:
             continue
     return None
@@ -380,13 +382,13 @@ def download_tg_file(file_id: str) -> Optional[bytes]:
             if dl_resp.status_code == 200:
                 return dl_resp.content
     except Exception as e:
-        print(f"[TG GETFILE]: {e}")
+        print(f"[TG GETFILE]: {e}", flush=True)
     return None
 
 def extract_media_from_embed(channel_username: str, msg_id: int) -> Tuple[Optional[bytes], Optional[str]]:
     try:
         url = f"https://t.me/{channel_username}/{msg_id}?embed=1"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         r = requests.get(url, headers=headers, timeout=12)
         if r.status_code == 200:
             v_match = re.search(r'<video[^>]+src="([^"]+)"', r.text)
@@ -402,7 +404,7 @@ def extract_media_from_embed(channel_username: str, msg_id: int) -> Tuple[Option
                 if p_resp.status_code == 200 and len(p_resp.content) > 5000:
                     return p_resp.content, "photo"
     except Exception as e:
-        print(f"[EMBED EXTRACT]: {e}")
+        print(f"[EMBED EXTRACT]: {e}", flush=True)
     return None, None
 
 def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) -> bool:
@@ -434,10 +436,10 @@ def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) 
         ).json()
         return res.get("ok", False)
     except Exception as e:
-        print(f"[TELEGRAM SEND]: {e}")
+        print(f"[TELEGRAM SEND]: {e}", flush=True)
         return False
 
-# ==================== VIP ADMIN ОБРОБКА ====================
+# ==================== VIP ADMIN ====================
 album_buffer = {}
 album_lock = threading.Lock()
 
@@ -603,6 +605,13 @@ def handle_admin_message(msg: dict):
 
 # ==================== WEBHOOK СЕРВЕР ====================
 class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Відповідаємо Render Health Check, щоб статус завжди був 200 OK
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"NEWS BOT 365 ALIVE")
+
     def do_POST(self):
         content_len = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_len)
@@ -631,12 +640,12 @@ def start_webhook_server():
     server.serve_forever()
 
 # ==================== АВТОНОМНИЙ СКАНЕР ====================
-def fetch_posts(channel: str) -> List[Dict]:
+def fetch_posts(channel: str, session: requests.Session = None) -> List[Dict]:
     url = f"https://t.me/s/{channel}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+    req_obj = session or requests
     posts = []
     try:
-        r = requests.get(url, headers=headers, timeout=12)
+        r = req_obj.get(url, timeout=12)
         if r.status_code != 200:
             return posts
 
@@ -673,18 +682,21 @@ def fetch_posts(channel: str) -> List[Dict]:
     return posts
 
 def run_scanner_loop():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [АВТОНОМНІСТЬ]: Автономний сканер 24 каналів запущено!")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [АВТОНОМНІСТЬ]: Автономний сканер 24 каналів запущено!", flush=True)
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
     while True:
         try:
-            current_time_str = datetime.now().strftime("%H:%M:%S")
             recent_posts = sync_channel_history(CHANNEL_USERNAME)
             published = 0
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [СКАНЕР]: Починаю обхід 24 донорів...", flush=True)
 
             for ch in DONOR_CHANNELS:
                 if published >= MAX_POSTS_PER_RUN:
                     break
 
-                posts = fetch_posts(ch)
+                posts = fetch_posts(ch, session=session)
                 for p in posts:
                     if published >= MAX_POSTS_PER_RUN:
                         break
@@ -712,11 +724,13 @@ def run_scanner_loop():
                         register_published_topic(head, post_text)
                         register_post_id(p_id)
                         recent_posts.insert(0, head)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...", flush=True)
                         time.sleep(DELAY_BETWEEN_POSTS)
 
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [СКАНЕР]: Цикл завершено. Опубліковано: {published}. Очікування 30 сек...", flush=True)
+
         except Exception as e:
-            print(f"[СКАНЕР]: Помилка: {e}")
+            print(f"[СКАНЕР]: Помилка: {e}", flush=True)
 
         time.sleep(30)
 
@@ -726,20 +740,20 @@ if __name__ == "__main__":
         render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or os.getenv("RENDER_EXTERNAL_URL") or "my-tg-news-bot-53bh.onrender.com"
         render_url = render_host if render_host.startswith("http") else f"https://{render_host}"
         webhook_url = f"{render_url.rstrip('/')}/tg-webhook"
-        print(f"[WEBHOOK]: Реєстрація: {webhook_url}")
+        print(f"[WEBHOOK]: Реєстрація: {webhook_url}", flush=True)
         try:
             res = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
                 json={"url": webhook_url, "allowed_updates": ["message", "channel_post", "edited_channel_post"], "drop_pending_updates": False},
                 timeout=15
             ).json()
-            print(f"[WEBHOOK STATUS]: {res}")
+            print(f"[WEBHOOK STATUS]: {res}", flush=True)
         except Exception as e:
-            print(f"[WEBHOOK ERROR]: {e}")
+            print(f"[WEBHOOK ERROR]: {e}", flush=True)
 
     # 1. Запуск автономного сканера 24/7 у фоні
     t_scanner = threading.Thread(target=run_scanner_loop, daemon=True)
     t_scanner.start()
 
-    # 2. Запуск вебхука для миттєвих ручних пересилань
+    # 2. Запуск вебхука для миттєвих ручних пересилань та відповідей Render
     start_webhook_server()
