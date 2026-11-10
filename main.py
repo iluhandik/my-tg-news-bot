@@ -27,9 +27,9 @@ CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit"
 CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}").strip()
 
-AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY", "")).strip()
+AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or os.getenv("AI_KEY") or os.getenv("GROQ_KEY") or "").strip()
 
-# 24 елітні українські донори новин
+# 24 канали-донори для автономного режиму
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
@@ -59,7 +59,6 @@ DONOR_CHANNELS = [
 
 MAX_POSTS_PER_RUN = 3
 DELAY_BETWEEN_POSTS = 25
-MAX_POST_AGE_HOURS = 4.0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOPICS_FILE = os.path.join(BASE_DIR, "published_topics.json")
@@ -106,6 +105,7 @@ def strip_foreign_signatures(text: str) -> str:
         r"(?i)(?:👉\s*)?(?:подписаться|підписатися|підписатись|присоединиться|стежити|читати|джерело)\s*[:\-—]?\s*(?:https?://\S+|t\.me/\S+|@[a-zA-Z0-9_]+|[^\n]+)?",
         r"(?i)\b(?:Украина\s*Сейчас|Україна\s*Online|Труха|INSIDER\s*UA|УНІАН|ТСН|RBC|Суспільне|Бабель|Supernova|Exilenova|Лачен|WarLife|Оперативний\s*ЗСУ)\b[^\n]*",
         r"(?i)Фото\s*[:\-—]\s*[^\n]+",
+        r"(?i)Великий\s*геостратег[^\n]*",
         r"https?://t\.me/\S+",
         r"@[a-zA-Z0-9_]+"
     ]
@@ -113,6 +113,20 @@ def strip_foreign_signatures(text: str) -> str:
     for p in patterns:
         cleaned = re.sub(p, "", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+def free_google_translate_to_uk(text: str) -> str:
+    """Гарантований резервний перекладач на солов'їну, якщо API Groq дало збій."""
+    try:
+        url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uk&dt=t&q=" + urllib.parse.quote(text)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            translated = "".join([part[0] for part in data[0] if part[0]])
+            return translated
+    except Exception:
+        pass
+    return text
 
 # ==================== АНТИДУБЛІКАТ ====================
 def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
@@ -214,7 +228,57 @@ def sync_channel_history(channel_username: str) -> List[str]:
 
     return recent_texts
 
-# ==================== GROQ AI РЕРАЙТ ====================
+# ==================== РЕРАЙТ ДЛЯ ВАШИХ РУЧНИХ ПЕРЕСИЛАНЬ ====================
+def process_admin_post_with_ai(raw_text: str) -> str:
+    cleaned = strip_foreign_signatures(raw_text)
+    if not cleaned: return ""
+
+    prompt = f"""Ти — професійний український журналіст. Твоє завдання — перекласти та стильно оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ УКРАЇНСЬКОЮ МОВОЮ для Telegram-каналу.
+Вимоги:
+- Жодного слова російською!
+- Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі.
+- Далі: 1-2 чіткі абзаци за фактами. Прізвища, цифри та назви виділяй <b>жирним</b>, пряму мову — в <blockquote>.
+- Жодних підписів каналу.
+
+Текст новини:
+{cleaned}
+
+Відповідай ВИКЛЮЧНО валідним JSON:
+{{"telegram_post": "Текст новини українською мовою з тегами <b> та <blockquote>"}}"""
+
+    if AI_API_KEY:
+        models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        for model in models:
+            try:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.2
+                    },
+                    headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+                    timeout=25
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    res_text = json.loads(data["choices"][0]["message"]["content"]).get("telegram_post", "")
+                    if res_text and not re.search(r"[ыэъё]", res_text, re.IGNORECASE):
+                        return fix_ukrainian_calques(res_text)
+            except Exception:
+                continue
+
+    # Резервний автопереклад, якщо ШІ був недоступний
+    translated = free_google_translate_to_uk(cleaned)
+    lines = [l.strip() for l in translated.splitlines() if l.strip()]
+    if lines:
+        head = f"⚡ <b>{lines[0]}</b>"
+        body = "\n\n".join(lines[1:])
+        return fix_ukrainian_calques(f"{head}\n\n{body}" if body else head)
+    return fix_ukrainian_calques(translated)
+
+# ==================== GROQ AI ДЛЯ АВТОНОМНОГО СКАНЕРА ====================
 SYSTEM_PROMPT = """Ти — головний редактор провідного українського новинного каналу.
 Твоє завдання — перекласти та оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ без води, емоцій та маніпуляцій.
 
@@ -268,8 +332,10 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
                 if parsed.get("is_duplicate") or parsed.get("is_ad"):
                     return None
                 if "telegram_post" in parsed:
-                    parsed["telegram_post"] = fix_ukrainian_calques(parsed["telegram_post"])
-                    return parsed
+                    post_res = fix_ukrainian_calques(parsed["telegram_post"])
+                    if not re.search(r"[ыэъё]", post_res, re.IGNORECASE):
+                        parsed["telegram_post"] = post_res
+                        return parsed
         except Exception:
             continue
     return None
@@ -353,7 +419,7 @@ def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) 
         print(f"[TELEGRAM SEND]: {e}")
         return False
 
-# ==================== VIP ADMIN ОБРОБНИКИ ====================
+# ==================== VIP ADMIN ОБРОБКА ====================
 album_buffer = {}
 album_lock = threading.Lock()
 
@@ -366,9 +432,8 @@ def process_vip_album(media_group_id: str):
     chat_id = data["chat_id"]
     caption = data.get("caption", "")
 
-    ai = process_news_with_ai(caption, sync_channel_history(CHANNEL_USERNAME)) if caption else None
-    final_caption = ai.get("telegram_post", caption) if ai else strip_foreign_signatures(caption)
-    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+    final_caption = process_admin_post_with_ai(caption) if caption else ""
+    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>" if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     media_group = []
     files = {}
@@ -407,9 +472,8 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
         send_admin_reply(chat_id, "❌ Не вдалося отримати медіафайл.")
         return
 
-    ai = process_news_with_ai(caption, sync_channel_history(CHANNEL_USERNAME)) if caption else None
-    final_caption = ai.get("telegram_post", caption) if ai else strip_foreign_signatures(caption)
-    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+    final_caption = process_admin_post_with_ai(caption) if caption else ""
+    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>" if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     success = False
     if media_type == "video":
@@ -431,8 +495,7 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
         send_admin_reply(chat_id, "❌ Помилка публікації в канал.")
 
 def publish_text_post(chat_id: int, text: str):
-    ai = process_news_with_ai(text, sync_channel_history(CHANNEL_USERNAME))
-    final_text = ai.get("telegram_post", text) if ai else strip_foreign_signatures(text)
+    final_text = process_admin_post_with_ai(text)
     full_post = f"{final_text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     res = requests.post(
@@ -459,7 +522,6 @@ def handle_admin_message(msg: dict):
     fwd_channel = fwd_chat.get("username")
     fwd_msg_id = msg.get("forward_from_message_id")
 
-    # 1. АЛЬБОМ
     if mg_id:
         file_id, m_type = None, "photo"
         if msg.get("photo"):
@@ -481,7 +543,7 @@ def handle_admin_message(msg: dict):
                 is_first = mg_id not in album_buffer
                 if is_first:
                     album_buffer[mg_id] = {"items": [], "chat_id": chat_id, "caption": caption}
-                    send_admin_reply(chat_id, "⏳ Збираю альбом і оформлюю пост для каналу...")
+                    send_admin_reply(chat_id, "⏳ Збираю альбом і перекладаю українською...")
                     threading.Thread(target=process_vip_album, args=(mg_id,), daemon=True).start()
 
                 if caption and not album_buffer[mg_id]["caption"]:
@@ -490,25 +552,22 @@ def handle_admin_message(msg: dict):
                 album_buffer[mg_id]["items"].append({"type": m_type, "bytes": f_bytes})
         return
 
-    # 2. ОДИНОЧНЕ ФОТО
     if msg.get("photo"):
-        send_admin_reply(chat_id, "⏳ Оформлюю та публікую пост у канал...")
+        send_admin_reply(chat_id, "⏳ Перекладаю та публікую пост у канал...")
         file_id = msg["photo"][-1]["file_id"]
         f_bytes = download_tg_file(file_id)
         publish_single_media_post(chat_id, caption, f_bytes, "photo", fwd_channel, fwd_msg_id)
         return
 
-    # 3. ОДИНОЧНЕ ВІДЕО
     if msg.get("video"):
-        send_admin_reply(chat_id, "⏳ Оформлюю та публікую відео у канал...")
+        send_admin_reply(chat_id, "⏳ Перекладаю та публікую відео у канал...")
         file_id = msg["video"]["file_id"]
         f_bytes = download_tg_file(file_id)
         publish_single_media_post(chat_id, caption, f_bytes, "video", fwd_channel, fwd_msg_id)
         return
 
-    # 4. ЧИСТИЙ ТЕКСТ АБО ПОСИЛАННЯ
     if caption:
-        send_admin_reply(chat_id, "⏳ Оформлюю текстовий пост для каналу...")
+        send_admin_reply(chat_id, "⏳ Перекладаю новину на чисту солов'їну...")
         publish_text_post(chat_id, caption)
         return
 
@@ -552,7 +611,7 @@ def fetch_posts(channel: str) -> List[Dict]:
             return posts
 
         blocks = r.text.split('<div class="tgme_widget_message_wrap')
-        for b in blocks[1:][-4:]:
+        for b in blocks[1:][-5:]:
             p_id = re.search(r'data-post="([^"]+)"', b)
             if not p_id: continue
             post_id = p_id.group(1)
@@ -579,9 +638,12 @@ def fetch_posts(channel: str) -> List[Dict]:
                 })
     except Exception:
         pass
+
+    posts.reverse()
     return posts
 
 def run_scanner_loop():
+    print("[АВТОНОМНІСТЬ]: Автономний сканер запущено успішно!")
     while True:
         try:
             recent_posts = sync_channel_history(CHANNEL_USERNAME)
@@ -619,6 +681,7 @@ def run_scanner_loop():
                         register_published_topic(head, post_text)
                         register_post_id(p_id)
                         recent_posts.insert(0, head)
+                        print(f"✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...")
                         time.sleep(DELAY_BETWEEN_POSTS)
 
         except Exception as e:
@@ -643,7 +706,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WEBHOOK ERROR]: {e}")
 
-    t_web = threading.Thread(target=start_webhook_server, daemon=True)
-    t_web.start()
+    # 1. Запуск автономного сканера у фоновому потоці
+    t_scanner = threading.Thread(target=run_scanner_loop, daemon=True)
+    t_scanner.start()
 
-    run_scanner_loop()
+    # 2. Запуск вебхука для миттєвих пересилань від вас
+    start_webhook_server()
