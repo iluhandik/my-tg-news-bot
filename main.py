@@ -152,7 +152,7 @@ def get_working_groq_model():
                 if m.get("active", True) 
                 and not any(x in m["id"].lower() for x in ["whisper", "guard", "embed", "vision", "audio"])
             ]
-            for pref in ["qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            for pref in ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]:
                 if pref in valid_ids:
                     return pref
             if valid_ids:
@@ -271,7 +271,6 @@ def send_telegram_media_group(photos, videos, caption):
     media = []
     files = {}
 
-    # Завжди прикріплюємо підпис до ПЕРШОГО елемента альбому
     is_caption_attached = False
 
     for i, v_bytes in enumerate(videos):
@@ -314,7 +313,6 @@ def process_buffered_album(media_group_id):
     photos = buf["photos"]
     videos = buf["videos"]
 
-    # ЗАХИСТ: Не публікувати, якщо текст порожній
     if not text_content and not photos and not videos:
         return
 
@@ -372,15 +370,15 @@ def handle_incoming_admin_update(update):
         media_group_id = msg.get("media_group_id")
         text_content = msg.get("text") or msg.get("caption") or ""
 
-        # СПЕЦІАЛЬНИЙ RESOLVER: Якщо це пересилання з публічного каналу — витягуємо дані з першоджерела
-        fwd_chat = msg.get("forward_from_chat", {}).get("username")
+        fwd_chat = msg.get("forward_from_chat", {})
+        fwd_username = fwd_chat.get("username")
         fwd_id = msg.get("forward_from_message_id")
 
         photo_bytes = None
         video_bytes = None
 
-        if fwd_chat and fwd_id and not media_group_id:
-            v_url, p_urls = fetch_media_from_embed(fwd_chat, fwd_id)
+        if fwd_username and fwd_id and not media_group_id:
+            v_url, p_urls = fetch_media_from_embed(fwd_username, fwd_id)
             if v_url:
                 v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
                 if v_resp.status_code == 200:
@@ -396,7 +394,6 @@ def handle_incoming_admin_update(update):
             elif "photo" in msg:
                 photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
 
-        # АЛЬБОМ: Буферизуємо з таймером 2.0 секунди
         if media_group_id:
             with album_lock:
                 if media_group_id not in album_buffers:
@@ -423,7 +420,6 @@ def handle_incoming_admin_update(update):
                 buf["timer"].start()
             return
 
-        # ОДИНАРНИЙ ДОПИС
         if text_content.strip() == "/start":
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                 "chat_id": chat_id,
@@ -436,7 +432,6 @@ def handle_incoming_admin_update(update):
             "text": "⏳ Отримав! Оформлюю через AI та публікую в канал..."
         })
 
-        # Перевірка на лінк t.me/...
         link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
         if link_match:
             ch_name = link_match.group(1)
@@ -573,7 +568,7 @@ def scrape_channel(channel_name):
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as response:
             html_content = response.read().decode('utf-8', errors='ignore')
-    except Exception as e:
+    except Exception:
         return []
 
     messages = []
@@ -678,6 +673,26 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
             return True
     return False
 
+# ТОЧКОВИЙ ЗАХИСТ: перевірка згенерованого заголовка на збіг
+def is_generated_headline_duplicate(rewritten_text, recent_posts):
+    if not rewritten_text:
+        return False
+    new_head = re.sub(r'<[^>]+>', '', rewritten_text.split('\n')[0]).strip().lower()
+    new_words = set(re.findall(r'[а-яіїєґa-z0-9]{3,}', new_head))
+    if not new_words:
+        return False
+
+    for p in recent_posts[:25]:
+        old_head = re.sub(r'<[^>]+>', '', p.split('\n')[0]).strip().lower()
+        # 1. Повний збіг заголовка
+        if new_head == old_head:
+            return True
+        # 2. Збіг ключових слів заголовка на 65%+
+        old_words = set(re.findall(r'[а-яіїєґa-z0-9]{3,}', old_head))
+        if old_words and len(new_words & old_words) / len(new_words) >= 0.65:
+            return True
+    return False
+
 def publish_post_with_real_media(donor_channel, msg_id, text):
     caption = append_channel_signature(text)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://t.me/"}
@@ -768,6 +783,13 @@ def main_loop():
 
                     rewritten = rewrite_news_for_channel(raw_text, model_name, is_admin_forward=False, recent_headlines=recent_headlines)
                     if not rewritten or rewritten == "SKIP":
+                        app_state["posted_hashes"].append(item_hash)
+                        save_state(app_state)
+                        continue
+
+                    # ТОЧКОВИЙ ЗАХИСТ: блокуємо, якщо ШІ видав однаковий заголовок з попереднім постом
+                    if is_generated_headline_duplicate(rewritten, app_state["recent_published_posts"]):
+                        logger.info(f"Skipped identical headline: {rewritten.split(chr(10))[0][:40]}")
                         app_state["posted_hashes"].append(item_hash)
                         save_state(app_state)
                         continue
