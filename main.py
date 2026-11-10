@@ -29,7 +29,7 @@ CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", f"https://t.me/{CHANNEL_U
 
 AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or os.getenv("AI_KEY") or os.getenv("GROQ_KEY") or "").strip()
 
-# 24 канали-донори для автономного режиму
+# 24 канали-донори для автономного сканування
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
@@ -114,21 +114,35 @@ def strip_foreign_signatures(text: str) -> str:
         cleaned = re.sub(p, "", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
-def free_google_translate_to_uk(text: str) -> str:
-    """Гарантований резервний перекладач на солов'їну, якщо API Groq дало збій."""
+def translate_fallback_api(text: str) -> str:
+    """Резервний переклад через безкоштовні відкриті API без блокування за IP."""
+    # 1. Спроба через MyMemory API
     try:
-        url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uk&dt=t&q=" + urllib.parse.quote(text)
+        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(text[:450])}&langpair=ru|uk"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
-        r = requests.get(url, headers=headers, timeout=8)
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
-            data = r.json()
-            translated = "".join([part[0] for part in data[0] if part[0]])
-            return translated
+            res = r.json().get("responseData", {}).get("translatedText")
+            if res and not re.search(r"[ыэъё]", res, re.IGNORECASE):
+                return html.unescape(res)
     except Exception:
         pass
-    return text
 
-# ==================== АНТИДУБЛІКАТ ====================
+    # 2. Спроба через Google API
+    try:
+        url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=uk&dt=t&q=" + urllib.parse.quote(text)
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            res = "".join([part[0] for part in data[0] if part[0]])
+            if res and not re.search(r"[ыэъё]", res, re.IGNORECASE):
+                return res
+    except Exception:
+        pass
+
+    return ""
+
+# ==================== ТОЧНИЙ АНТИДУБЛІКАТ ====================
 def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
     caps_raw = set(re.findall(r"\b[А-ЯІЇЄҐA-Z]{2,}\b|\b[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{2,}\b", text))
     capitals = set()
@@ -157,17 +171,15 @@ def is_topic_already_covered(text: str) -> bool:
         prev_caps = set(t.get("capitals", []))
         prev_stems = set(t.get("stems", []))
 
+        # Збіг 2+ конкретних назв/локацій (наприклад, Київ + Москва, Виледь + Архангельськ)
         common_caps = cur_caps.intersection(prev_caps)
         if len(common_caps) >= 2:
             return True
 
-        common_stems = cur_stems.intersection(prev_stems)
-        if len(common_stems) >= 4:
-            return True
-
+        # Висока загальна схожість усього тексту (Jaccard > 35%)
         if cur_stems and prev_stems:
-            overlap = len(common_stems) / len(cur_stems.union(prev_stems))
-            if overlap >= 0.25:
+            overlap = len(cur_stems.intersection(prev_stems)) / len(cur_stems.union(prev_stems))
+            if overlap >= 0.35:
                 return True
 
     return False
@@ -212,7 +224,7 @@ def sync_channel_history(channel_username: str) -> List[str]:
         r = requests.get(url, headers=headers, timeout=12)
         if r.status_code == 200:
             blocks = r.text.split('<div class="tgme_widget_message_wrap')
-            for b in blocks[1:][-40:]:
+            for b in blocks[1:][-35:]:
                 m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.DOTALL)
                 if not m:
                     continue
@@ -228,26 +240,27 @@ def sync_channel_history(channel_username: str) -> List[str]:
 
     return recent_texts
 
-# ==================== РЕРАЙТ ДЛЯ ВАШИХ РУЧНИХ ПЕРЕСИЛАНЬ ====================
+# ==================== РЕРАЙТ ПЕРЕСИЛАНЬ АДМІНА ====================
 def process_admin_post_with_ai(raw_text: str) -> str:
     cleaned = strip_foreign_signatures(raw_text)
     if not cleaned: return ""
 
-    prompt = f"""Ти — професійний український журналіст. Твоє завдання — перекласти та стильно оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ УКРАЇНСЬКОЮ МОВОЮ для Telegram-каналу.
-Вимоги:
-- Жодного слова російською!
+    prompt = f"""Ти — український редактор новин. ПЕРЕКЛАДИ ТА ОФОРМИ цю новину ЧИСТОЮ СОЛОВ'ЇНОЮ УКРАЇНСЬКОЮ МОВОЮ для Telegram-каналу.
+ВИМОГИ:
+- Жодного слова російською! Тільки бездоганна українська мова!
 - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі.
-- Далі: 1-2 чіткі абзаци за фактами. Прізвища, цифри та назви виділяй <b>жирним</b>, пряму мову — в <blockquote>.
-- Жодних підписів каналу.
+- Далі: 1-2 чіткі фактичні абзаци. Прізвища, цифри та назви виділяй <b>жирним</b>, пряму мову — в <blockquote>.
+- Жодних підписів.
 
 Текст новини:
 {cleaned}
 
-Відповідай ВИКЛЮЧНО валідним JSON:
-{{"telegram_post": "Текст новини українською мовою з тегами <b> та <blockquote>"}}"""
+Відповідай ВИКЛЮЧНО JSON:
+{{"telegram_post": "Текст новини українською з тегами <b> та <blockquote>"}}"""
 
+    # 1. Пріоритет: швидка модель Groq без спалювання квоти
     if AI_API_KEY:
-        models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
         for model in models:
             try:
                 resp = requests.post(
@@ -259,38 +272,41 @@ def process_admin_post_with_ai(raw_text: str) -> str:
                         "temperature": 0.2
                     },
                     headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
-                    timeout=25
+                    timeout=20
                 )
                 if resp.status_code == 200:
                     data = resp.json()
                     res_text = json.loads(data["choices"][0]["message"]["content"]).get("telegram_post", "")
                     if res_text and not re.search(r"[ыэъё]", res_text, re.IGNORECASE):
                         return fix_ukrainian_calques(res_text)
-            except Exception:
-                continue
+                else:
+                    print(f"[GROQ ADMIN ПОМИЛКА]: {resp.status_code} - {resp.text[:120]}")
+            except Exception as ge:
+                print(f"[GROQ ВИНЯТОК]: {ge}")
 
-    # Резервний автопереклад, якщо ШІ був недоступний
-    translated = free_google_translate_to_uk(cleaned)
-    lines = [l.strip() for l in translated.splitlines() if l.strip()]
-    if lines:
-        head = f"⚡ <b>{lines[0]}</b>"
-        body = "\n\n".join(lines[1:])
-        return fix_ukrainian_calques(f"{head}\n\n{body}" if body else head)
-    return fix_ukrainian_calques(translated)
+    # 2. Резервний автопереклад, якщо Groq тимчасово недоступний
+    translated = translate_fallback_api(cleaned)
+    if translated and not re.search(r"[ыэъё]", translated, re.IGNORECASE):
+        lines = [l.strip() for l in translated.splitlines() if l.strip()]
+        if lines:
+            head = f"⚡ <b>{lines[0]}</b>"
+            body = "\n\n".join(lines[1:])
+            return fix_ukrainian_calques(f"{head}\n\n{body}" if body else head)
+
+    return ""
 
 # ==================== GROQ AI ДЛЯ АВТОНОМНОГО СКАНЕРА ====================
-SYSTEM_PROMPT = """Ти — головний редактор провідного українського новинного каналу.
-Твоє завдання — перекласти та оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ без води, емоцій та маніпуляцій.
+SYSTEM_PROMPT = """Ти — редактор провідного українського новинного каналу.
+Твоє завдання — перекласти та оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ без води та емоцій.
 
 ПРАВИЛА:
-1. АНТИДУБЛІКАТ: Якщо ця подія, заява чи звіт ВЖЕ описані в списку публікацій каналу — поверни "is_duplicate": true!
-2. Жодних тривог, сирен, польотів дронів без влучань/збиття (це рутина, став "is_ad": true).
+1. АНТИДУБЛІКАТ: Якщо ця сама подія ВЖЕ є в списку постів каналу — поверни "is_duplicate": true!
+2. Рутинні тривоги/польоти дронів без прильотів/збиття — став "is_ad": true.
 3. Оформлення:
-   - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі.
-   - 1-2 чіткі абзаци з головними фактами.
-   - Важливі акценти (прізвища, назви, цифри) виділяй <b>жирним</b>. Пряму мову — в <blockquote>.
+   - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 емодзі.
+   - 1-2 чіткі абзаци з головними фактами. Важливі акценти — <b>жирним</b>. Пряму мову — в <blockquote>.
 
-Відповідай ВИКЛЮЧНО валідним JSON:
+Відповідай ВИКЛЮЧНО JSON:
 {
   "is_duplicate": false,
   "is_ad": false,
@@ -303,29 +319,29 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
     if len(cleaned) < 25 or not AI_API_KEY:
         return None
 
+    # Передаємо лише останні 10 заголовків для економії токенів Groq
     recent_context = ""
     if recent_channel_posts:
-        recent_context = "ОСЬ ОСТАННІ ОПУБЛІКОВАНІ ПОСТИ КАНАЛУ (НЕ ПОВТОРЮЙ ЇХ):\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:35]]) + "\n\n"
+        recent_context = "ОСТАННІ НОВИНИ КАНАЛУ (НЕ ПОВТОРЮВАТИ):\n" + "\n".join([f"- {p}" for p in recent_channel_posts[:10]]) + "\n\n"
 
-    user_prompt = f"{recent_context}НОВА ІНФОРМАЦІЯ ДЛЯ ОБРОБКИ:\n{cleaned}"
+    user_prompt = f"{recent_context}НОВА НОВИНА ДЛЯ РЕДАГУВАННЯ:\n{cleaned}"
 
-    models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
     for model in models:
         try:
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.1
-            }
             resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.1
+                },
                 headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
-                timeout=25
+                timeout=20
             )
             if resp.status_code == 200:
                 parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
@@ -336,6 +352,8 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
                     if not re.search(r"[ыэъё]", post_res, re.IGNORECASE):
                         parsed["telegram_post"] = post_res
                         return parsed
+            else:
+                print(f"[GROQ СКАНЕР]: Код {resp.status_code}")
         except Exception:
             continue
     return None
@@ -433,6 +451,10 @@ def process_vip_album(media_group_id: str):
     caption = data.get("caption", "")
 
     final_caption = process_admin_post_with_ai(caption) if caption else ""
+    if caption and not final_caption:
+        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію російською скасовано для захисту чистоти каналу.")
+        return
+
     final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>" if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     media_group = []
@@ -473,6 +495,10 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
         return
 
     final_caption = process_admin_post_with_ai(caption) if caption else ""
+    if caption and not final_caption:
+        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію російською скасовано для захисту чистоти каналу.")
+        return
+
     final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>" if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     success = False
@@ -496,6 +522,10 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
 
 def publish_text_post(chat_id: int, text: str):
     final_text = process_admin_post_with_ai(text)
+    if not final_text:
+        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію російською скасовано.")
+        return
+
     full_post = f"{final_text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     res = requests.post(
@@ -643,9 +673,10 @@ def fetch_posts(channel: str) -> List[Dict]:
     return posts
 
 def run_scanner_loop():
-    print("[АВТОНОМНІСТЬ]: Автономний сканер запущено успішно!")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [АВТОНОМНІСТЬ]: Автономний сканер 24 каналів запущено!")
     while True:
         try:
+            current_time_str = datetime.now().strftime("%H:%M:%S")
             recent_posts = sync_channel_history(CHANNEL_USERNAME)
             published = 0
 
@@ -681,13 +712,13 @@ def run_scanner_loop():
                         register_published_topic(head, post_text)
                         register_post_id(p_id)
                         recent_posts.insert(0, head)
-                        print(f"✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...")
                         time.sleep(DELAY_BETWEEN_POSTS)
 
         except Exception as e:
             print(f"[СКАНЕР]: Помилка: {e}")
 
-        time.sleep(20)
+        time.sleep(30)
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
@@ -706,9 +737,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WEBHOOK ERROR]: {e}")
 
-    # 1. Запуск автономного сканера у фоновому потоці
+    # 1. Запуск автономного сканера 24/7 у фоні
     t_scanner = threading.Thread(target=run_scanner_loop, daemon=True)
     t_scanner.start()
 
-    # 2. Запуск вебхука для миттєвих пересилань від вас
+    # 2. Запуск вебхука для миттєвих ручних пересилань
     start_webhook_server()
