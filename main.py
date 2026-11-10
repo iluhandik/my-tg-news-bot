@@ -27,7 +27,6 @@ DONOR_CHANNELS = [
     "insiderUKR",
     "truexanewsua",
     "u_now",
-    "kievreal1",
     "nefedoov365",
     "lachentyt",
     "voynareal",
@@ -100,6 +99,42 @@ def extract_canonical_roots(text):
         roots.add(root)
     return roots
 
+# --- ФІЛЬТР ЗБОЇВ ШІ (ЗАХИСТ ВІД «I AM SORRY» ТА ЗАСИЛЛЯ ПОВТОРІВ) ---
+MALFORMED_PATTERNS = [
+    r"(?i)\bi('m| am) sorry\b",
+    r"(?i)\bi (can't|cannot)\b",
+    r"(?i)\bas an ai\b",
+    r"(?i)\bвідповідь на ваш запит\b",
+    r"(?i)\bоформіть новину\b",
+    r"(?i)\bтільки готовий пост\b",
+    r"(?i)\bформат поста\b",
+    r"(?i)\bредакторські правила\b",
+    r"(?i)\bнова тема для каналу\b"
+]
+
+def is_malformed_ai_output(text: str) -> bool:
+    if not text or len(text) < 25:
+        return True
+    
+    # 1. Захист від відмов англійською та витоків системного промпту
+    for pat in MALFORMED_PATTERNS:
+        if re.search(pat, text):
+            logger.warning(f"Rejected malformed/refusal AI text: {text[:60]}")
+            return True
+
+    # 2. Захист від зациклення (якщо одне слово повторюється 3+ разів поспіль)
+    if re.search(r'(\b\w{3,}\b)(?:\s+\1){2,}', text, flags=re.IGNORECASE):
+        logger.warning(f"Rejected stuttering loop AI text: {text[:60]}")
+        return True
+
+    # 3. Захист від повторення однакових рядків
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) >= 4 and len(set(lines)) <= len(lines) // 2:
+        logger.warning(f"Rejected duplicate line loop text: {text[:60]}")
+        return True
+
+    return False
+
 # --- БЕЗПЕЧНЕ ВИДАЛЕННЯ ЧУЖИХ ПІДПИСІВ ТА КОПІРАЙТІВ ФОТО ---
 def strip_foreign_signatures(text):
     if not text:
@@ -139,26 +174,7 @@ def append_channel_signature(text):
     return clean_text + signature
 
 def get_working_groq_model():
-    if not GROQ_API_KEY:
-        return "llama-3.1-8b-instant"
-    url = "https://api.groq.com/openai/v1/models"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    try:
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            valid_ids = [
-                m["id"] for m in data 
-                if m.get("active", True) 
-                and not any(x in m["id"].lower() for x in ["whisper", "guard", "embed", "vision", "audio"])
-            ]
-            for pref in ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]:
-                if pref in valid_ids:
-                    return pref
-            if valid_ids:
-                return valid_ids[0]
-    except Exception:
-        pass
+    # Залізно використовуємо перевірену швидку модель, яка не глючить
     return "llama-3.1-8b-instant"
 
 # --- AI РЕДАКТУРА ---
@@ -199,13 +215,13 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": model_name,
+        "model": "llama-3.1-8b-instant",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Оформи новину для каналу:\n\n{clean_input}"}
         ],
-        "temperature": 0.1,
-        "max_tokens": 800
+        "temperature": 0.2,
+        "max_tokens": 700
     }
 
     try:
@@ -219,6 +235,10 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
     raw_out = re.sub(r'<think>.*?</think>', '', raw_out, flags=re.DOTALL).strip()
     if raw_out.upper() == "SKIP" or "SKIP" in raw_out[:10]:
         return "SKIP"
+
+    # Захист від збоїв ШІ
+    if is_malformed_ai_output(raw_out):
+        return clean_input if is_admin_forward else None
 
     out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
@@ -673,7 +693,7 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
             return True
     return False
 
-# ТОЧКОВИЙ ЗАХИСТ: перевірка згенерованого заголовка на збіг
+# ТОЧКОВИЙ ЗАХИСТ: перевірка згенерованого заголовка на збіг (щоб не було дублів як з Абу-Дабі)
 def is_generated_headline_duplicate(rewritten_text, recent_posts):
     if not rewritten_text:
         return False
@@ -684,10 +704,8 @@ def is_generated_headline_duplicate(rewritten_text, recent_posts):
 
     for p in recent_posts[:25]:
         old_head = re.sub(r'<[^>]+>', '', p.split('\n')[0]).strip().lower()
-        # 1. Повний збіг заголовка
         if new_head == old_head:
             return True
-        # 2. Збіг ключових слів заголовка на 65%+
         old_words = set(re.findall(r'[а-яіїєґa-z0-9]{3,}', old_head))
         if old_words and len(new_words & old_words) / len(new_words) >= 0.65:
             return True
@@ -787,7 +805,7 @@ def main_loop():
                         save_state(app_state)
                         continue
 
-                    # ТОЧКОВИЙ ЗАХИСТ: блокуємо, якщо ШІ видав однаковий заголовок з попереднім постом
+                    # Блокуємо дублікат або збійний текст від ШІ
                     if is_generated_headline_duplicate(rewritten, app_state["recent_published_posts"]):
                         logger.info(f"Skipped identical headline: {rewritten.split(chr(10))[0][:40]}")
                         app_state["posted_hashes"].append(item_hash)
