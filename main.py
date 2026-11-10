@@ -33,11 +33,9 @@ CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", f"https://t.me/{CHANNEL_U
 
 AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or os.getenv("AI_KEY") or os.getenv("GROQ_KEY") or "").strip().strip('"').strip("'")
 
-# Оперативний темп публікації: не пропускаємо свіжі новини
 MAX_POSTS_PER_RUN = 2
 DELAY_BETWEEN_POSTS = 25
 
-# Топові донори (без міського спаму сирен kievreal1)
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
@@ -87,7 +85,6 @@ def save_json(path: str, data: list):
 
 # ==================== ФІЛЬТР РУТИНИ СИРЕН ТА РЕКЛАМИ ====================
 def is_routine_siren_alert(text: str) -> bool:
-    """Відсікає порожні сповіщення про тривоги/відбої, якщо немає факту вибуху чи збиття."""
     t = text.lower()
     has_siren_signal = any(w in t for w in [
         "оголошена тривога", "оголошено тривогу", "повітряна тривога", "відбій тривоги",
@@ -96,7 +93,6 @@ def is_routine_siren_alert(text: str) -> bool:
     has_real_impact = any(w in t for w in [
         "вибух", "прильот", "влучан", "збит", "пожеж", "руйнув", "постражд", "загинул", "уражен", "наслідк", "пошкодж"
     ])
-    # Пропускаємо тільки якщо це «голе» сповіщення без наслідків
     if has_siren_signal and not has_real_impact:
         return True
     return False
@@ -109,6 +105,7 @@ AD_PATTERNS = [
     r"(?i)\b(?:aliexpress|вайлдберріз|wildberries|ozon)\b",
     r"(?i)\b(?:банкет під час чуми|білоцерківець|горовий|рудий|дерибан|земельні ділянки києва)\b",
     r"(?i)\b(?:позичив у знайомого|продав через tiktok|вкрав авто у знайомого)\b",
+    r"(?i)\b(?:цистерну лайна|розпив алкоголю|зарізав співчарковця)\b",
     r"t\.me/\+[a-zA-Z0-9_-]+",
     r"t\.me/joinchat/[a-zA-Z0-9_-]+"
 ]
@@ -295,11 +292,11 @@ SYSTEM_PROMPT = """Ти — професійний український ред
 «Завдяки чітким діям розвідки наступ ворога повністю зірвано», — зазначили в командуванні.
 
 ПРАВИЛА:
-1. Заголовок: перший рядок обов'язково жирним <b>...</b> з 1 тематичним емодзі.
+1. Перший рядок обов'язково жирним <b>...</b> з 1 тематичним емодзі.
 2. Тіло: 1-2 чіткі фактичні абзаци. Важливі цифри, прізвища та міста виділяй <b>жирним</b>.
 3. Пряму мову загортай у <blockquote>.
 4. Жодних чужих каналів («Труха», «УС», «ексклюзивно для»).
-5. Якщо це порожнє сповіщення про сирену тривоги, реклама або побутовий компромат — обов'язково поверни "is_ad": true!
+5. Якщо це порожнє сповіщення про сирену тривоги, реклама або компромат — поверни "is_ad": true!
 6. Якщо подія вже є в списку каналу — поверни "is_duplicate": true!
 
 Формат відповіді СТРОГО JSON:
@@ -316,7 +313,7 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
         return None
 
     cleaned = strip_foreign_signatures(raw_text)
-    if len(cleaned) < 30 or not AI_API_KEY:
+    if len(cleaned) < 20 or not AI_API_KEY:
         return None
 
     recent_context = ""
@@ -338,15 +335,11 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
                 "temperature": 0.15
             },
             headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
-            timeout=20
+            timeout=15
         )
         if resp.status_code == 200:
             parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-            if parsed.get("is_duplicate"):
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏩ Дубль: {cleaned[:35]}...", flush=True)
-                return None
-            if parsed.get("is_ad"):
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 Відхилено ШІ (реклама / сирена): {cleaned[:35]}...", flush=True)
+            if parsed.get("is_duplicate") or parsed.get("is_ad"):
                 return None
             if "telegram_post" in parsed:
                 post_res = fix_ukrainian_calques(parsed["telegram_post"])
@@ -354,6 +347,9 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
                 if not re.search(r"[ыэъё]", post_res, re.IGNORECASE) and not is_ad_or_unwanted(post_res):
                     parsed["telegram_post"] = post_res
                     return parsed
+        elif resp.status_code == 429:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [GROQ 429]: Ліміт запитів! Пауза 5 сек...", flush=True)
+            time.sleep(5)
     except Exception as e:
         print(f"[GROQ ВИНЯТОК]: {e}", flush=True)
 
@@ -361,7 +357,7 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
 
 def process_admin_post_with_ai(raw_text: str) -> str:
     cleaned = strip_foreign_signatures(raw_text)
-    if not cleaned or is_ad_or_unwanted(cleaned): return ""
+    if not cleaned: return ""
 
     prompt = f"""Ти — професійний український редактор новин. ПЕРЕКЛАДИ ТА ОФОРМИ цю новину ЧИСТОЮ СОЛОВ'ЇНОЮ УКРАЇНСЬКОЮ МОВОЮ для новинного каналу Telegram.
 Вимоги:
@@ -386,7 +382,7 @@ def process_admin_post_with_ai(raw_text: str) -> str:
                     "temperature": 0.2
                 },
                 headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
-                timeout=20
+                timeout=15
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -395,7 +391,14 @@ def process_admin_post_with_ai(raw_text: str) -> str:
                     return finish_incomplete_sentences(fix_ukrainian_calques(res_text))
         except Exception:
             pass
-    return ""
+
+    # ДЛЯ ВАШИХ ПЕРЕСИЛАНЬ: якщо ШІ тимчасово зайнятий — оформлюємо гарно самі, але ПУБЛІКУЄМО ЗАВЖДИ!
+    lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+    if lines:
+        head = f"⚡️ <b>{lines[0]}</b>"
+        body = "\n\n".join(lines[1:])
+        return fix_ukrainian_calques(f"{head}\n\n{body}" if body else head)
+    return fix_ukrainian_calques(cleaned)
 
 # ==================== ВІДПРАВКА В TELEGRAM ====================
 def send_admin_reply(chat_id: int, text: str):
@@ -434,7 +437,7 @@ def extract_media_from_embed(channel_username: str, msg_id: int) -> Tuple[Option
             if p_match:
                 img_url = p_match.group(1)
                 p_resp = requests.get(img_url, headers=headers, timeout=20)
-                if p_resp.status_code == 200 and len(p_resp.content) > 35000:
+                if p_resp.status_code == 200 and len(p_resp.content) > 30000:
                     return p_resp.content, "photo"
     except Exception as e:
         print(f"[EMBED EXTRACT]: {e}", flush=True)
@@ -465,7 +468,7 @@ def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) 
     if photo_url:
         try:
             r_img = requests.get(photo_url, timeout=15)
-            if r_img.status_code == 200 and len(r_img.content) > 35000:
+            if r_img.status_code == 200 and len(r_img.content) > 30000:
                 files = {"photo": ("photo.jpg", r_img.content, "image/jpeg")}
                 data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                 res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=30).json()
@@ -477,7 +480,6 @@ def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) 
         except Exception:
             pass
 
-    # Відправка без потворного вікна «ПЕРЕГЛЯНУТИ КАНАЛ»
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -510,10 +512,6 @@ def process_vip_album(media_group_id: str):
     caption = data.get("caption", "")
 
     final_caption = process_admin_post_with_ai(caption) if caption else ""
-    if caption and not final_caption:
-        send_admin_reply(chat_id, "⚠️ ШІ відхилив новину (реклама або збій).")
-        return
-
     final_text = safe_caption(final_caption, max_len=1024) if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     media_group = []
@@ -554,10 +552,6 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
         return
 
     final_caption = process_admin_post_with_ai(caption) if caption else ""
-    if caption and not final_caption:
-        send_admin_reply(chat_id, "⚠️ ШІ відхилив новину (реклама або збій).")
-        return
-
     final_text = safe_caption(final_caption, max_len=1024) if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     success = False
@@ -581,10 +575,6 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
 
 def publish_text_post(chat_id: int, text: str):
     final_text = process_admin_post_with_ai(text)
-    if not final_text:
-        send_admin_reply(chat_id, "⚠️ ШІ відхилив новину (реклама або збій).")
-        return
-
     full_post = f"{final_text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     res = requests.post(
@@ -767,6 +757,7 @@ def run_scanner_loop():
         try:
             recent_posts = sync_channel_history(CHANNEL_USERNAME)
             published = 0
+            ai_eval_count = 0
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [СКАНЕР]: Починаю обхід 23 донорів...", flush=True)
 
             for ch in DONOR_CHANNELS:
@@ -775,7 +766,7 @@ def run_scanner_loop():
 
                 posts = fetch_posts(ch, session=session)
                 for p in posts:
-                    if published >= MAX_POSTS_PER_RUN:
+                    if published >= MAX_POSTS_PER_RUN or ai_eval_count >= 3:
                         break
 
                     text = p["text"]
@@ -789,7 +780,9 @@ def run_scanner_loop():
                         register_post_id(p_id)
                         continue
 
-                    # Редагування строго через нейромережу у нашому стилі
+                    # Пауза 1.5 сек між запитами до ШІ для захисту від ліміту 429
+                    time.sleep(1.5)
+                    ai_eval_count += 1
                     ai = process_news_with_ai(text, recent_posts)
                     if not ai:
                         register_post_id(p_id)
