@@ -36,6 +36,7 @@ AI_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY") or os.getenv(
 MAX_POSTS_PER_RUN = 2
 DELAY_BETWEEN_POSTS = 25
 
+# 23 перевірені канали-донори
 DONOR_CHANNELS = [
     "u_now",
     "uniannet",
@@ -64,7 +65,6 @@ DONOR_CHANNELS = [
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOPICS_FILE = os.path.join(BASE_DIR, "published_topics.json")
-PROCESSED_IDS_FILE = os.path.join(BASE_DIR, "processed_ids.json")
 
 # ==================== JSON ХЕЛПЕРИ ====================
 def load_json(path: str) -> list:
@@ -83,17 +83,12 @@ def save_json(path: str, data: list):
     except Exception:
         pass
 
-# ==================== ФІЛЬТРИ ====================
-def is_routine_siren_alert(text: str) -> bool:
+# ==================== ПРОСТІ ФІЛЬТРИ ====================
+def is_routine_siren(text: str) -> bool:
     t = text.lower()
-    has_siren_signal = any(w in t for w in [
-        "оголошена тривога", "оголошено тривогу", "повітряна тривога", "відбій тривоги",
-        "відбій повітряної", "карта тривог", "загроза бпла", "надіслати новину"
-    ])
-    has_real_impact = any(w in t for w in [
-        "вибух", "прильот", "влучан", "збит", "пожеж", "руйнув", "постражд", "загинул", "уражен", "наслідк", "пошкодж"
-    ])
-    return has_siren_signal and not has_real_impact
+    has_siren = any(w in t for w in ["оголошена тривога", "оголошено тривогу", "повітряна тривога", "відбій тривоги", "відбій повітряної", "карта тривог"])
+    has_impact = any(w in t for w in ["вибух", "прильот", "влучан", "збит", "пожеж", "руйнув", "постражд", "загинул", "уражен", "наслідк", "пошкодж"])
+    return has_siren and not has_impact
 
 def is_ad(text: str) -> bool:
     t = text.lower()
@@ -136,7 +131,7 @@ def safe_caption(text: str, max_len: int = 1024) -> str:
     avail = max_len - len(sig) - 3
     return f"{text[:avail]}...{sig}"
 
-# ==================== АНТИДУБЛІКАТ (ПРОСТИЙ ТА НАДІЙНИЙ) ====================
+# ==================== АНТИДУБЛІКАТ ====================
 def is_topic_already_covered(text: str) -> bool:
     topics = load_json(TOPICS_FILE)
     clean = re.sub(r"[^\w\s]", " ", text.lower())
@@ -148,8 +143,8 @@ def is_topic_already_covered(text: str) -> bool:
         t_words = set(t.get("stems", []))
         if words and t_words:
             overlap = len(words.intersection(t_words)) / len(words.union(t_words))
-            # Дубль фіксується ТІЛЬКИ якщо текст збігається майже наполовину
-            if overlap >= 0.45:
+            # Дубль фіксується ТІЛЬКИ якщо текст збігається більш ніж наполовину
+            if overlap >= 0.50:
                 return True
     return False
 
@@ -163,17 +158,6 @@ def register_published_topic(headline: str, text: str):
         "timestamp": time.time()
     })
     save_json(TOPICS_FILE, topics[-200:])
-
-def register_post_id(post_id: str):
-    if not post_id: return
-    ids = load_json(PROCESSED_IDS_FILE)
-    if post_id not in ids:
-        ids.append(post_id)
-        save_json(PROCESSED_IDS_FILE, ids[-400:])
-
-def is_post_id_processed(post_id: str) -> bool:
-    ids = set(load_json(PROCESSED_IDS_FILE))
-    return post_id in ids
 
 # ==================== СИНХРОНІЗАЦІЯ КАНАЛУ ====================
 def sync_channel_history(channel_username: str) -> List[str]:
@@ -206,7 +190,7 @@ def sync_channel_history(channel_username: str) -> List[str]:
 
     return recent_texts
 
-# ==================== НАШ ФІРМОВИЙ СТИЛЬ GROQ ====================
+# ==================== ФІРМОВИЙ СТИЛЬ GROQ ====================
 SYSTEM_PROMPT = """Ти — професійний український редактор новинного каналу "NEWS УКРАЇНА 365".
 Твоє завдання — перетворити вхідну інформацію на якісний, лаконічний новинний пост у нашому фірмовому стилі.
 
@@ -218,11 +202,11 @@ SYSTEM_PROMPT = """Ти — професійний український ред
 «Завдяки чітким діям розвідки наступ ворога повністю зірвано», — зазначили в командуванні.
 
 ПРАВИЛА:
-1. Заголовок: перший рядок обов'язково жирним <b>...</b> з 1 тематичним емодзі.
+1. Заголовок: перший рядок обов'язково жирним <b>...</b> з 1 тематичним емодзі на початку.
 2. Тіло: 1-2 чіткі фактичні абзаци. Важливі цифри, прізвища та міста виділяй <b>жирним</b>.
 3. Пряму мову загортай у <blockquote>.
 4. Жодних чужих каналів («Труха», «УС», «ексклюзивно для»).
-5. Якщо це порожнє сповіщення про сирену тривоги або реклама — поверни "is_ad": true!
+5. Якщо це реклама або порожня тривога без наслідків — поверни "is_ad": true!
 6. Якщо подія вже є в списку каналу — поверни "is_duplicate": true!
 
 Формат відповіді СТРОГО JSON:
@@ -310,7 +294,7 @@ def process_admin_post_with_ai(raw_text: str) -> str:
         except Exception:
             pass
 
-    # ДЛЯ ВАШИХ ПЕРЕСИЛАНЬ: якщо ШІ недоступний — публікуємо без відхилень!
+    # ДЛЯ ВАШИХ ПЕРЕСИЛАНЬ: якщо ШІ тимчасово зайнятий — публікуємо без відхилень!
     lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
     if lines:
         head = f"⚡️ <b>{lines[0]}</b>"
@@ -621,6 +605,9 @@ def keepalive_pinger(server_url: str):
             print(f"[KEEPALIVE]: Помилка пінгу: {e}", flush=True)
 
 # ==================== АВТОНОМНИЙ СКАНЕР ====================
+# Пам'ять поточної сесії — НЕ блокує свіжі пости з минулих запусків!
+seen_session_post_ids = set()
+
 def fetch_posts(channel: str, session: requests.Session = None) -> List[Dict]:
     url = f"https://t.me/s/{channel}"
     req_obj = session or requests
@@ -631,19 +618,20 @@ def fetch_posts(channel: str, session: requests.Session = None) -> List[Dict]:
             return posts
 
         blocks = r.text.split('<div class="tgme_widget_message_wrap')
-        for b in blocks[1:][-5:]:
+        # Беремо останні 8 повідомлень каналу
+        for b in blocks[1:][-8:]:
             p_id = re.search(r'data-post="([^"]+)"', b)
             if not p_id: continue
             post_id = p_id.group(1)
 
-            if is_post_id_processed(post_id):
+            if post_id in seen_session_post_ids:
                 continue
 
             t_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.DOTALL)
             raw_text = html.unescape(re.sub(r"<[^>]+>", " ", t_match.group(1))).strip() if t_match else ""
 
-            if is_routine_siren_alert(raw_text) or is_ad(raw_text):
-                register_post_id(post_id)
+            if is_routine_siren(raw_text) or is_ad(raw_text):
+                seen_session_post_ids.add(post_id)
                 continue
 
             p_match = re.search(r'background-image:\s*url\([\'"]?(https?://[^\'")\s]+)[\'"]?\)', b)
@@ -667,12 +655,7 @@ def fetch_posts(channel: str, session: requests.Session = None) -> List[Dict]:
     return posts
 
 def run_scanner_loop():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [АВТОНОМНІСТЬ]: Автономний сканер запущено!", flush=True)
-
-    # Очищуємо старий накопичений хвіст ID, щоб свіжі новини пішли одразу
-    ids = load_json(PROCESSED_IDS_FILE)
-    if len(ids) > 60:
-        save_json(PROCESSED_IDS_FILE, ids[-60:])
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [АВТОНОМНІСТЬ]: Автономний сканер запущено з чистим кешем!", flush=True)
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
@@ -695,28 +678,29 @@ def run_scanner_loop():
                     text = p["text"]
                     p_id = p["post_id"]
 
-                    if is_routine_siren_alert(text) or is_ad(text):
-                        register_post_id(p_id)
+                    if is_routine_siren(text) or is_ad(text):
+                        seen_session_post_ids.add(p_id)
                         continue
 
+                    # Якщо новина вже є в @kropivnit — не дублюємо
                     if is_topic_already_covered(text):
-                        register_post_id(p_id)
+                        seen_session_post_ids.add(p_id)
                         continue
 
                     ai = process_news_with_ai(text, recent_posts)
                     if not ai:
-                        register_post_id(p_id)
+                        seen_session_post_ids.add(p_id)
                         continue
 
                     post_text = ai.get("telegram_post", "")
                     if len(post_text) < 25 or is_topic_already_covered(post_text):
-                        register_post_id(p_id)
+                        seen_session_post_ids.add(p_id)
                         continue
 
                     sent = send_telegram_post(post_text, p["photo_url"], p["video_url"])
                     if sent:
                         published += 1
-                        register_post_id(p_id)
+                        seen_session_post_ids.add(p_id)
                         head = post_text.splitlines()[0][:70]
                         register_published_topic(head, post_text)
                         recent_posts.insert(0, head)
