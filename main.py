@@ -22,7 +22,6 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
 CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit"
@@ -65,9 +64,8 @@ MAX_POST_AGE_HOURS = 4.0
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOPICS_FILE = os.path.join(BASE_DIR, "published_topics.json")
 PROCESSED_IDS_FILE = os.path.join(BASE_DIR, "processed_ids.json")
-MEDIA_HASH_FILE = os.path.join(BASE_DIR, "media_hashes.json")
 
-# ==================== ДОПОМІЖНІ ФУНКЦІЇ ДЛЯ JSON ====================
+# ==================== JSON ХЕЛПЕРИ ====================
 def load_json(path: str) -> list:
     if os.path.exists(path):
         try:
@@ -84,7 +82,7 @@ def save_json(path: str, data: list):
     except Exception:
         pass
 
-# ==================== ОЧИЩЕННЯ ТА АНТИКАЛЬКА ====================
+# ==================== ОЧИЩЕННЯ ТА КАЛЬКИ ====================
 COMMON_STOP_WORDS = {
     "сьогодні", "зараз", "вчора", "цього", "після", "також", "було", "проти", "може",
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
@@ -118,7 +116,6 @@ def strip_foreign_signatures(text: str) -> str:
 
 # ==================== АНТИДУБЛІКАТ ====================
 def extract_entities_and_stems(text: str) -> Tuple[Set[str], Set[str]]:
-    # Власні назви та абревіатури
     caps_raw = set(re.findall(r"\b[А-ЯІЇЄҐA-Z]{2,}\b|\b[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{2,}\b", text))
     capitals = set()
     for c in caps_raw:
@@ -138,7 +135,7 @@ def is_topic_already_covered(text: str) -> bool:
     topics = load_json(TOPICS_FILE)
     cur_caps, cur_stems = extract_entities_and_stems(text)
     now = time.time()
-    min_time = now - (36 * 3600)  # перевірка за останні 36 годин
+    min_time = now - (36 * 3600)
 
     for t in topics:
         if t.get("timestamp", 0) < min_time:
@@ -146,23 +143,17 @@ def is_topic_already_covered(text: str) -> bool:
         prev_caps = set(t.get("capitals", []))
         prev_stems = set(t.get("stems", []))
 
-        # 1. Збіг 2 географічних або власних назв
         common_caps = cur_caps.intersection(prev_caps)
         if len(common_caps) >= 2:
-            print(f"[АНТИДУБЛЬ ГЕО]: Збіг сутностей {common_caps} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
             return True
 
-        # 2. Збіг 4+ значущих слів-коренів
         common_stems = cur_stems.intersection(prev_stems)
         if len(common_stems) >= 4:
-            print(f"[АНТИДУБЛЬ СЕНСУ]: Збіг слів {common_stems} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
             return True
 
-        # 3. Лексична схожість за Жаккаром
         if cur_stems and prev_stems:
             overlap = len(common_stems) / len(cur_stems.union(prev_stems))
             if overlap >= 0.25:
-                print(f"[АНТИДУБЛЬ JACCARD]: Схожість {overlap:.2f} з постом '{t.get('headline', '')[:35]}...'. ВІДХИЛЕНО!")
                 return True
 
     return False
@@ -170,7 +161,6 @@ def is_topic_already_covered(text: str) -> bool:
 def register_published_topic(headline: str, text: str):
     topics = load_json(TOPICS_FILE)
     caps, stems = extract_entities_and_stems(headline + " " + text)
-    # Перевірка на дублікат самого запису в списку
     for item in topics[-50:]:
         if item.get("headline") == headline:
             return
@@ -193,7 +183,7 @@ def is_post_id_processed(post_id: str) -> bool:
     ids = set(load_json(PROCESSED_IDS_FILE))
     return post_id in ids
 
-# ==================== СИНХРОНІЗАЦІЯ З КАНАЛОМ ====================
+# ==================== СИНХРОНІЗАЦІЯ КАНАЛУ ====================
 def sync_channel_history(channel_username: str) -> List[str]:
     clean_name = channel_username.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip("/")
     recent_texts = []
@@ -219,9 +209,8 @@ def sync_channel_history(channel_username: str) -> List[str]:
                     head = clean.splitlines()[0][:70]
                     register_published_topic(head, clean)
                     recent_texts.insert(0, head)
-            print(f"[СИНХРОНІЗАЦІЯ]: Успішно зчитано {len(seen)} свіжих постів з @{clean_name}.")
     except Exception as e:
-        print(f"[СИНХРОНІЗАЦІЯ]: Помилка читання @{clean_name}: {e}")
+        print(f"[СИНХРОНІЗАЦІЯ]: Помилка: {e}")
 
     return recent_texts
 
@@ -230,11 +219,10 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
 Твоє завдання — перекласти та оформити новину ЧИСТОЮ СОЛОВ'ЇНОЮ МОВОЮ без води, емоцій та маніпуляцій.
 
 ПРАВИЛА:
-1. АНТИДУБЛІКАТ: Якщо ця подія, заява чи звіт ВЖЕ описані в списку публікацій каналу (навіть іншими словами або з новими цитатами) — негайно поверни "is_duplicate": true!
+1. АНТИДУБЛІКАТ: Якщо ця подія, заява чи звіт ВЖЕ описані в списку публікацій каналу — поверни "is_duplicate": true!
 2. Жодних тривог, сирен, польотів дронів без влучань/збиття (це рутина, став "is_ad": true).
-3. Жодних неперевірених чуток та чорного піару.
-4. Оформлення:
-   - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі на початку.
+3. Оформлення:
+   - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі.
    - 1-2 чіткі абзаци з головними фактами.
    - Важливі акценти (прізвища, назви, цифри) виділяй <b>жирним</b>. Пряму мову — в <blockquote>.
 
@@ -286,13 +274,58 @@ def process_news_with_ai(raw_text: str, recent_channel_posts: List[str]) -> Opti
             continue
     return None
 
-# ==================== ПУБЛІКАЦІЯ В TELEGRAM ====================
+# ==================== ВІДПРАВКА В TELEGRAM ====================
+def send_admin_reply(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN or not chat_id: return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+def download_tg_file(file_id: str) -> Optional[bytes]:
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}", timeout=10).json()
+        if r.get("ok"):
+            f_path = r["result"]["file_path"]
+            dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{f_path}"
+            dl_resp = requests.get(dl_url, timeout=40)
+            if dl_resp.status_code == 200:
+                return dl_resp.content
+    except Exception as e:
+        print(f"[TG GETFILE]: {e}")
+    return None
+
+def extract_media_from_embed(channel_username: str, msg_id: int) -> Tuple[Optional[bytes], Optional[str]]:
+    try:
+        url = f"https://t.me/{channel_username}/{msg_id}?embed=1"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            v_match = re.search(r'<video[^>]+src="([^"]+)"', r.text)
+            if v_match:
+                vid_url = v_match.group(1)
+                v_resp = requests.get(vid_url, headers=headers, timeout=45)
+                if v_resp.status_code == 200 and len(v_resp.content) > 1000:
+                    return v_resp.content, "video"
+            p_match = re.search(r'background-image:\s*url\([\'"]?(https?://[^\'")\s]+)[\'"]?\)', r.text)
+            if p_match:
+                img_url = p_match.group(1)
+                p_resp = requests.get(img_url, headers=headers, timeout=20)
+                if p_resp.status_code == 200 and len(p_resp.content) > 5000:
+                    return p_resp.content, "photo"
+    except Exception as e:
+        print(f"[EMBED EXTRACT]: {e}")
+    return None, None
+
 def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
         return False
 
     final_text = f"{text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
-
     try:
         if video_url:
             r_vid = requests.get(video_url, timeout=30)
@@ -317,10 +350,198 @@ def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) 
         ).json()
         return res.get("ok", False)
     except Exception as e:
-        print(f"[TELEGRAM SEND]: Помилка відправки: {e}")
+        print(f"[TELEGRAM SEND]: {e}")
         return False
 
-# ==================== ПАРСИНГ ДОНОРІВ ====================
+# ==================== VIP ADMIN ОБРОБНИКИ ====================
+album_buffer = {}
+album_lock = threading.Lock()
+
+def process_vip_album(media_group_id: str):
+    time.sleep(2.0)
+    with album_lock:
+        data = album_buffer.pop(media_group_id, None)
+
+    if not data or not data["items"]: return
+    chat_id = data["chat_id"]
+    caption = data.get("caption", "")
+
+    ai = process_news_with_ai(caption, sync_channel_history(CHANNEL_USERNAME)) if caption else None
+    final_caption = ai.get("telegram_post", caption) if ai else strip_foreign_signatures(caption)
+    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+
+    media_group = []
+    files = {}
+    for i, it in enumerate(data["items"]):
+        m_type = it["type"]
+        f_name = f"file_{i}.{'mp4' if m_type == 'video' else 'jpg'}"
+        mime = "video/mp4" if m_type == "video" else "image/jpeg"
+        files[f_name] = (f_name, it["bytes"], mime)
+        entry = {"type": m_type, "media": f"attach://{f_name}"}
+        if i == 0:
+            entry["caption"] = final_text
+            entry["parse_mode"] = "HTML"
+        media_group.append(entry)
+
+    res = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
+        data={"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media_group)},
+        files=files,
+        timeout=60
+    ).json()
+
+    if res.get("ok"):
+        head = final_caption.splitlines()[0][:70] if final_caption else "Альбом"
+        register_published_topic(head, final_caption)
+        send_admin_reply(chat_id, f"🚀 Успішно опубліковано альбом у {TELEGRAM_CHANNEL_ID}!")
+    else:
+        send_admin_reply(chat_id, "❌ Помилка надсилання альбому в канал.")
+
+def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[bytes], media_type: str, fwd_channel: str = None, fwd_msg_id: int = None):
+    if not media_bytes and fwd_channel and fwd_msg_id:
+        media_bytes, detected_type = extract_media_from_embed(fwd_channel, fwd_msg_id)
+        if detected_type:
+            media_type = detected_type
+
+    if not media_bytes:
+        send_admin_reply(chat_id, "❌ Не вдалося отримати медіафайл.")
+        return
+
+    ai = process_news_with_ai(caption, sync_channel_history(CHANNEL_USERNAME)) if caption else None
+    final_caption = ai.get("telegram_post", caption) if ai else strip_foreign_signatures(caption)
+    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+
+    success = False
+    if media_type == "video":
+        files = {"video": ("video.mp4", media_bytes, "video/mp4")}
+        data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": final_text, "parse_mode": "HTML"}
+        res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=60).json()
+        success = res.get("ok", False)
+    else:
+        files = {"photo": ("photo.jpg", media_bytes, "image/jpeg")}
+        data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": final_text, "parse_mode": "HTML"}
+        res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=35).json()
+        success = res.get("ok", False)
+
+    if success:
+        head = final_caption.splitlines()[0][:70] if final_caption else "Пост"
+        register_published_topic(head, final_caption)
+        send_admin_reply(chat_id, f"🚀 Успішно опубліковано у {TELEGRAM_CHANNEL_ID}!")
+    else:
+        send_admin_reply(chat_id, "❌ Помилка публікації в канал.")
+
+def publish_text_post(chat_id: int, text: str):
+    ai = process_news_with_ai(text, sync_channel_history(CHANNEL_USERNAME))
+    final_text = ai.get("telegram_post", text) if ai else strip_foreign_signatures(text)
+    full_post = f"{final_text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+
+    res = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={"chat_id": TELEGRAM_CHANNEL_ID, "text": full_post, "parse_mode": "HTML", "disable_web_page_preview": False},
+        timeout=15
+    ).json()
+
+    if res.get("ok"):
+        head = final_text.splitlines()[0][:70]
+        register_published_topic(head, final_text)
+        send_admin_reply(chat_id, f"🚀 Успішно опубліковано у {TELEGRAM_CHANNEL_ID}!")
+    else:
+        send_admin_reply(chat_id, "❌ Помилка публікації в канал.")
+
+def handle_admin_message(msg: dict):
+    chat_id = msg.get("chat", {}).get("id")
+    if not chat_id: return
+
+    mg_id = msg.get("media_group_id")
+    caption = msg.get("caption") or msg.get("text") or ""
+
+    fwd_chat = msg.get("forward_from_chat", {})
+    fwd_channel = fwd_chat.get("username")
+    fwd_msg_id = msg.get("forward_from_message_id")
+
+    # 1. АЛЬБОМ
+    if mg_id:
+        file_id, m_type = None, "photo"
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]
+            m_type = "photo"
+        elif msg.get("video"):
+            file_id = msg["video"]["file_id"]
+            m_type = "video"
+
+        f_bytes = None
+        if file_id:
+            f_bytes = download_tg_file(file_id)
+        if not f_bytes and fwd_channel and fwd_msg_id:
+            f_bytes, detected_type = extract_media_from_embed(fwd_channel, fwd_msg_id)
+            if detected_type: m_type = detected_type
+
+        if f_bytes:
+            with album_lock:
+                is_first = mg_id not in album_buffer
+                if is_first:
+                    album_buffer[mg_id] = {"items": [], "chat_id": chat_id, "caption": caption}
+                    send_admin_reply(chat_id, "⏳ Збираю альбом і оформлюю пост для каналу...")
+                    threading.Thread(target=process_vip_album, args=(mg_id,), daemon=True).start()
+
+                if caption and not album_buffer[mg_id]["caption"]:
+                    album_buffer[mg_id]["caption"] = caption
+
+                album_buffer[mg_id]["items"].append({"type": m_type, "bytes": f_bytes})
+        return
+
+    # 2. ОДИНОЧНЕ ФОТО
+    if msg.get("photo"):
+        send_admin_reply(chat_id, "⏳ Оформлюю та публікую пост у канал...")
+        file_id = msg["photo"][-1]["file_id"]
+        f_bytes = download_tg_file(file_id)
+        publish_single_media_post(chat_id, caption, f_bytes, "photo", fwd_channel, fwd_msg_id)
+        return
+
+    # 3. ОДИНОЧНЕ ВІДЕО
+    if msg.get("video"):
+        send_admin_reply(chat_id, "⏳ Оформлюю та публікую відео у канал...")
+        file_id = msg["video"]["file_id"]
+        f_bytes = download_tg_file(file_id)
+        publish_single_media_post(chat_id, caption, f_bytes, "video", fwd_channel, fwd_msg_id)
+        return
+
+    # 4. ЧИСТИЙ ТЕКСТ АБО ПОСИЛАННЯ
+    if caption:
+        send_admin_reply(chat_id, "⏳ Оформлюю текстовий пост для каналу...")
+        publish_text_post(chat_id, caption)
+        return
+
+# ==================== WEBHOOK СЕРВЕР ====================
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        post_data = self.rfile.read(content_len)
+        try:
+            update = json.loads(post_data.decode("utf-8"))
+
+            if "channel_post" in update:
+                cp = update["channel_post"]
+                t = cp.get("text") or cp.get("caption") or ""
+                if t:
+                    register_published_topic(t.splitlines()[0][:70], t)
+
+            msg = update.get("message")
+            if msg and msg.get("chat", {}).get("type") == "private":
+                threading.Thread(target=handle_admin_message, args=(msg,), daemon=True).start()
+        except Exception:
+            pass
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_webhook_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
+    server.serve_forever()
+
+# ==================== АВТОНОМНИЙ СКАНЕР ====================
 def fetch_posts(channel: str) -> List[Dict]:
     url = f"https://t.me/s/{channel}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -360,96 +581,6 @@ def fetch_posts(channel: str) -> List[Dict]:
         pass
     return posts
 
-# ==================== VIP ADMIN WEBHOOK & АЛЬБОМИ ====================
-album_buffer = {}
-album_lock = threading.Lock()
-
-def process_vip_album(media_group_id: str):
-    time.sleep(2.0)
-    with album_lock:
-        items = album_buffer.pop(media_group_id, [])
-
-    if not items: return
-    caption = ""
-    for it in items:
-        if it.get("caption"):
-            caption = it["caption"]
-            break
-
-    ai = process_news_with_ai(caption, sync_channel_history(CHANNEL_USERNAME)) if caption else None
-    final_caption = ai.get("telegram_post", caption) if ai else strip_foreign_signatures(caption)
-    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
-
-    media_group = []
-    files = {}
-    for i, it in enumerate(items):
-        m_type = it["type"]
-        f_bytes = it["bytes"]
-        f_name = f"file_{i}.{'mp4' if m_type == 'video' else 'jpg'}"
-        files[f_name] = f_bytes
-        entry = {"type": m_type, "media": f"attach://{f_name}"}
-        if i == 0:
-            entry["caption"] = final_text
-            entry["parse_mode"] = "HTML"
-        media_group.append(entry)
-
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
-        data={"chat_id": TELEGRAM_CHANNEL_ID, "media": json.dumps(media_group)},
-        files=files,
-        timeout=60
-    )
-
-class WebhookHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        content_len = int(self.headers.get("Content-Length", 0))
-        post_data = self.rfile.read(content_len)
-        try:
-            update = json.loads(post_data.decode("utf-8"))
-            # 1. Фіксуємо публікації з каналу, щоб вони миттєво ставали антидублікатами
-            if "channel_post" in update:
-                cp = update["channel_post"]
-                t = cp.get("text") or cp.get("caption") or ""
-                if t:
-                    register_published_topic(t.splitlines()[0][:70], t)
-
-            # 2. Пересилання від адміна
-            msg = update.get("message")
-            if msg:
-                mg_id = msg.get("media_group_id")
-                caption = msg.get("caption") or msg.get("text") or ""
-                # Обробка фото/відео
-                file_id = None
-                m_type = "photo"
-                if msg.get("photo"):
-                    file_id = msg["photo"][-1]["file_id"]
-                    m_type = "photo"
-                elif msg.get("video"):
-                    file_id = msg["video"]["file_id"]
-                    m_type = "video"
-
-                if file_id and mg_id:
-                    f_info = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}").json()
-                    if f_info.get("ok"):
-                        f_path = f_info["result"]["file_path"]
-                        f_bytes = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{f_path}").content
-                        with album_lock:
-                            if mg_id not in album_buffer:
-                                album_buffer[mg_id] = []
-                                threading.Thread(target=process_vip_album, args=(mg_id,), daemon=True).start()
-                            album_buffer[mg_id].append({"type": m_type, "bytes": f_bytes, "caption": caption})
-        except Exception:
-            pass
-
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def start_webhook_server():
-    server = HTTPServer(("0.0.0.0", 10000), WebhookHandler)
-    server.serve_forever()
-
-# ==================== ГОЛОВНИЙ ЦИКЛ СКАНУВАННЯ ====================
 def run_scanner_loop():
     while True:
         try:
@@ -491,17 +622,26 @@ def run_scanner_loop():
                         time.sleep(DELAY_BETWEEN_POSTS)
 
         except Exception as e:
-            print(f"[ЦИКЛ]: Помилка: {e}")
+            print(f"[СКАНЕР]: Помилка: {e}")
 
         time.sleep(20)
 
+# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
-    if TELEGRAM_BOT_TOKEN and RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/tg-webhook"
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
-            json={"url": webhook_url, "allowed_updates": ["message", "channel_post", "edited_channel_post"]}
-        )
+    if TELEGRAM_BOT_TOKEN:
+        render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or os.getenv("RENDER_EXTERNAL_URL") or "my-tg-news-bot-53bh.onrender.com"
+        render_url = render_host if render_host.startswith("http") else f"https://{render_host}"
+        webhook_url = f"{render_url.rstrip('/')}/tg-webhook"
+        print(f"[WEBHOOK]: Реєстрація: {webhook_url}")
+        try:
+            res = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+                json={"url": webhook_url, "allowed_updates": ["message", "channel_post", "edited_channel_post"], "drop_pending_updates": False},
+                timeout=15
+            ).json()
+            print(f"[WEBHOOK STATUS]: {res}")
+        except Exception as e:
+            print(f"[WEBHOOK ERROR]: {e}")
 
     t_web = threading.Thread(target=start_webhook_server, daemon=True)
     t_web.start()
