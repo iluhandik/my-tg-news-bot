@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-# Вимикаємо буферизацію для миттєвих логів у Render
 sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 
@@ -24,6 +23,9 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+
+RENDER_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME") or os.getenv("RENDER_EXTERNAL_URL") or "my-tg-news-bot-53bh.onrender.com"
+RENDER_URL = RENDER_HOST if RENDER_HOST.startswith("http") else f"https://{RENDER_HOST}"
 
 CHANNEL_NAME = "NEWS УКРАЇНА 365"
 CHANNEL_USERNAME = TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID.startswith("@") else "@kropivnit"
@@ -83,7 +85,7 @@ def save_json(path: str, data: list):
     except Exception:
         pass
 
-# ==================== ОЧИЩЕННЯ ТА КАЛЬКИ ====================
+# ==================== СТОП-СЛОВА ТА БІЛИЙ СПИСОК ====================
 COMMON_STOP_WORDS = {
     "сьогодні", "зараз", "вчора", "цього", "після", "також", "було", "проти", "може",
     "через", "буде", "тільки", "цьому", "коли", "якщо", "були", "вони", "яких", "який",
@@ -92,9 +94,17 @@ COMMON_STOP_WORDS = {
     "внаслідок", "відповідно", "разом", "перший", "другий", "можуть", "бути", "своїх"
 }
 
-GENERIC_STOP_ENTITIES = {
-    "украї", "росі", "сша", "київ", "києв", "москв", "зсу", "рф", "єс", "оон",
-    "донба", "кремл", "вашин", "прези", "новий", "перши"
+# Слова з великої літери, які НЕ МОЖУТЬ блокувати новини як дублікат
+EXCLUDED_FROM_ENTITY_MATCH = {
+    # Країни та столиці
+    "украї", "украи", "росі", "росси", "сша", "київ", "киев", "москв", "рф", "єс", "оон", "вашин", "брюсс",
+    # ЗМІ та агентства (новини від The Economist більше не блокують одна одну)
+    "the", "econo", "reute", "bloom", "finan", "times", "bild", "polit", "washi", "post", "nytim", "bbc", "cnn", "isw", "deeps",
+    # Політики та посадовці
+    "зелен", "трамп", "путін", "путин", "байден", "єрмак", "будан", "сирсь", "умеро", "шольц", "макро",
+    # Військові та державні структури
+    "геншт", "штаб", "сили", "оборо", "зсу", "гурма", "сбу", "дбр", "набу", "офіс", "прези", "мініс", "уряд", "рада", "верхо",
+    "дснс", "укрен", "поліц", "захис", "окупа", "ворог", "новий", "перши", "повідо", "згідн"
 }
 
 def fix_ukrainian_calques(text: str) -> str:
@@ -120,6 +130,13 @@ def strip_foreign_signatures(text: str) -> str:
     for p in patterns:
         cleaned = re.sub(p, "", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+def safe_caption(text: str, max_len: int = 1024) -> str:
+    sig = f"\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+    if len(text) + len(sig) <= max_len:
+        return f"{text}{sig}"
+    avail = max_len - len(sig) - 3
+    return f"{text[:avail]}...{sig}"
 
 def translate_fallback_api(text: str) -> str:
     try:
@@ -169,26 +186,26 @@ def is_topic_already_covered(text: str) -> bool:
     now = time.time()
     min_time = now - (36 * 3600)
 
-    # Виключаємо загальновживані слова (Україна, Росія, Київ), щоб не блокувати різні новини
-    specific_cur_caps = {c for c in cur_caps if not any(c.startswith(g) for g in GENERIC_STOP_ENTITIES)}
+    # Виключаємо ЗМІ, політиків, загальні назви, щоб вони не спричиняли хибних блокувань
+    specific_cur_caps = {c for c in cur_caps if not any(c.startswith(g) for g in EXCLUDED_FROM_ENTITY_MATCH)}
 
     for t in topics:
         if t.get("timestamp", 0) < min_time:
             continue
 
         prev_caps = set(t.get("capitals", []))
-        specific_prev_caps = {c for c in prev_caps if not any(c.startswith(g) for g in GENERIC_STOP_ENTITIES)}
+        specific_prev_caps = {c for c in prev_caps if not any(c.startswith(g) for g in EXCLUDED_FROM_ENTITY_MATCH)}
 
-        # Збіг 2+ конкретних локацій або специфічних назв
+        # Збіг 2+ конкретних локацій (наприклад: Виледь + Архангельськ, Бердянськ + Рубікон)
         common_specific = specific_cur_caps.intersection(specific_prev_caps)
         if len(common_specific) >= 2:
             return True
 
-        # Загальна схожість усього тексту (Jaccard > 40%)
+        # Висока лексична схожість тексту (Jaccard > 42%)
         prev_stems = set(t.get("stems", []))
         if cur_stems and prev_stems:
             overlap = len(cur_stems.intersection(prev_stems)) / len(cur_stems.union(prev_stems))
-            if overlap >= 0.40:
+            if overlap >= 0.42:
                 return True
 
     return False
@@ -256,7 +273,7 @@ def process_admin_post_with_ai(raw_text: str) -> str:
 
     prompt = f"""Ти — український редактор новин. ПЕРЕКЛАДИ ТА ОФОРМИ цю новину ЧИСТОЮ СОЛОВ'ЇНОЮ УКРАЇНСЬКОЮ МОВОЮ для Telegram-каналу.
 ВИМОГИ:
-- Жодного слова російською!
+- Жодного слова російською! Тільки бездоганна українська мова!
 - Перший рядок: лаконічний заголовок <b>жирним</b> з 1 тематичним емодзі.
 - Далі: 1-2 чіткі фактичні абзаци. Прізвища, цифри та назви виділяй <b>жирним</b>, пряму мову — в <blockquote>.
 - Жодних підписів.
@@ -411,32 +428,55 @@ def send_telegram_post(text: str, photo_url: str = None, video_url: str = None) 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
         return False
 
-    final_text = f"{text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
-    try:
-        if video_url:
-            r_vid = requests.get(video_url, timeout=30)
-            if r_vid.status_code == 200:
-                files = {"video": ("video.mp4", r_vid.content, "video/mp4")}
-                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": final_text, "parse_mode": "HTML"}
-                res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=60).json()
-                if res.get("ok"): return True
+    caption = safe_caption(text, max_len=1024)
+    full_msg = f"{text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
-        if photo_url:
+    if video_url:
+        try:
+            r_vid = requests.get(video_url, timeout=20)
+            if r_vid.status_code == 200 and len(r_vid.content) > 1000:
+                files = {"video": ("video.mp4", r_vid.content, "video/mp4")}
+                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+                res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=50).json()
+                if res.get("ok"): return True
+                data["parse_mode"] = ""
+                data["caption"] = re.sub(r"<[^>]+>", "", caption)
+                res2 = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files={"video": ("video.mp4", r_vid.content, "video/mp4")}, timeout=50).json()
+                if res2.get("ok"): return True
+        except Exception as e:
+            print(f"[SEND VIDEO ERR]: {e}", flush=True)
+
+    if photo_url:
+        try:
             r_img = requests.get(photo_url, timeout=15)
-            if r_img.status_code == 200:
+            if r_img.status_code == 200 and len(r_img.content) > 1000:
                 files = {"photo": ("photo.jpg", r_img.content, "image/jpeg")}
-                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": final_text, "parse_mode": "HTML"}
+                data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
                 res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=30).json()
                 if res.get("ok"): return True
+                data["parse_mode"] = ""
+                data["caption"] = re.sub(r"<[^>]+>", "", caption)
+                res2 = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files={"photo": ("photo.jpg", r_img.content, "image/jpeg")}, timeout=30).json()
+                if res2.get("ok"): return True
+        except Exception as e:
+            print(f"[SEND PHOTO ERR]: {e}", flush=True)
 
+    try:
         res = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHANNEL_ID, "text": final_text, "parse_mode": "HTML", "disable_web_page_preview": False},
+            json={"chat_id": TELEGRAM_CHANNEL_ID, "text": full_msg, "parse_mode": "HTML", "disable_web_page_preview": False},
             timeout=15
         ).json()
-        return res.get("ok", False)
+        if res.get("ok"): return True
+        plain = re.sub(r"<[^>]+>", "", full_msg)
+        res_plain = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHANNEL_ID, "text": plain, "disable_web_page_preview": False},
+            timeout=15
+        ).json()
+        return res_plain.get("ok", False)
     except Exception as e:
-        print(f"[TELEGRAM SEND]: {e}", flush=True)
+        print(f"[SEND MSG ERR]: {e}", flush=True)
         return False
 
 # ==================== VIP ADMIN ====================
@@ -454,10 +494,10 @@ def process_vip_album(media_group_id: str):
 
     final_caption = process_admin_post_with_ai(caption) if caption else ""
     if caption and not final_caption:
-        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію російською скасовано для захисту чистоти каналу.")
+        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію скасовано.")
         return
 
-    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>" if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+    final_text = safe_caption(final_caption, max_len=1024) if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     media_group = []
     files = {}
@@ -498,10 +538,10 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
 
     final_caption = process_admin_post_with_ai(caption) if caption else ""
     if caption and not final_caption:
-        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію російською скасовано для захисту чистоти каналу.")
+        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію скасовано.")
         return
 
-    final_text = f"{final_caption}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>" if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
+    final_text = safe_caption(final_caption, max_len=1024) if final_caption else f"👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
 
     success = False
     if media_type == "video":
@@ -525,7 +565,7 @@ def publish_single_media_post(chat_id: int, caption: str, media_bytes: Optional[
 def publish_text_post(chat_id: int, text: str):
     final_text = process_admin_post_with_ai(text)
     if not final_text:
-        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію російською скасовано.")
+        send_admin_reply(chat_id, "⚠️ ШІ не зміг коректно перекласти текст на українську мову. Публікацію скасовано.")
         return
 
     full_post = f"{final_text}\n\n👉 <a href=\"{CHANNEL_INVITE_LINK}\">{CHANNEL_NAME} | Підписатися</a>"
@@ -605,8 +645,12 @@ def handle_admin_message(msg: dict):
 
 # ==================== WEBHOOK СЕРВЕР ====================
 class WebhookHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
-        # Відповідаємо Render Health Check, щоб статус завжди був 200 OK
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -638,6 +682,18 @@ def start_webhook_server():
     port = int(os.getenv("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     server.serve_forever()
+
+# ==================== АВТОПІНГЕР ====================
+def keepalive_pinger(server_url: str):
+    time.sleep(30)
+    print(f"[KEEPALIVE]: Автопінгер запущено для адреси: {server_url}", flush=True)
+    while True:
+        time.sleep(480)
+        try:
+            r = requests.get(server_url, timeout=15)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [KEEPALIVE]: Статус {r.status_code} — сервіс активний", flush=True)
+        except Exception as e:
+            print(f"[KEEPALIVE]: Помилка пінгу: {e}", flush=True)
 
 # ==================== АВТОНОМНИЙ СКАНЕР ====================
 def fetch_posts(channel: str, session: requests.Session = None) -> List[Dict]:
@@ -697,6 +753,9 @@ def run_scanner_loop():
                     break
 
                 posts = fetch_posts(ch, session=session)
+                if posts:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔎 @{ch}: знайдено {len(posts)} нових постів", flush=True)
+
                 for p in posts:
                     if published >= MAX_POSTS_PER_RUN:
                         break
@@ -705,6 +764,7 @@ def run_scanner_loop():
                     p_id = p["post_id"]
 
                     if is_topic_already_covered(text):
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏩ Пропущено дубль: {p_id}", flush=True)
                         register_post_id(p_id)
                         continue
 
@@ -718,16 +778,21 @@ def run_scanner_loop():
                         register_post_id(p_id)
                         continue
 
-                    if send_telegram_post(post_text, p["photo_url"], p["video_url"]):
-                        published += 1
-                        head = post_text.splitlines()[0][:70]
-                        register_published_topic(head, post_text)
+                    try:
+                        sent = send_telegram_post(post_text, p["photo_url"], p["video_url"])
+                        if sent:
+                            published += 1
+                            head = post_text.splitlines()[0][:70]
+                            register_published_topic(head, post_text)
+                            recent_posts.insert(0, head)
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...", flush=True)
+                            time.sleep(DELAY_BETWEEN_POSTS)
+                        else:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Помилка надсилання поста {p_id} в Telegram", flush=True)
+                    finally:
                         register_post_id(p_id)
-                        recent_posts.insert(0, head)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ [АВТОНОМНІСТЬ]: Опубліковано з @{ch}: {head[:45]}...", flush=True)
-                        time.sleep(DELAY_BETWEEN_POSTS)
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [СКАНЕР]: Цикл завершено. Опубліковано: {published}. Очікування 30 сек...", flush=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [СКАНЕР]: Обхід завершено. Опубліковано: {published}. Пауза 30 сек...", flush=True)
 
         except Exception as e:
             print(f"[СКАНЕР]: Помилка: {e}", flush=True)
@@ -737,9 +802,7 @@ def run_scanner_loop():
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN:
-        render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or os.getenv("RENDER_EXTERNAL_URL") or "my-tg-news-bot-53bh.onrender.com"
-        render_url = render_host if render_host.startswith("http") else f"https://{render_host}"
-        webhook_url = f"{render_url.rstrip('/')}/tg-webhook"
+        webhook_url = f"{RENDER_URL.rstrip('/')}/tg-webhook"
         print(f"[WEBHOOK]: Реєстрація: {webhook_url}", flush=True)
         try:
             res = requests.post(
@@ -751,9 +814,10 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WEBHOOK ERROR]: {e}", flush=True)
 
-    # 1. Запуск автономного сканера 24/7 у фоні
     t_scanner = threading.Thread(target=run_scanner_loop, daemon=True)
     t_scanner.start()
 
-    # 2. Запуск вебхука для миттєвих ручних пересилань та відповідей Render
+    t_pinger = threading.Thread(target=keepalive_pinger, args=(RENDER_URL,), daemon=True)
+    t_pinger.start()
+
     start_webhook_server()
