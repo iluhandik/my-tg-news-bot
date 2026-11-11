@@ -7,6 +7,7 @@ import logging
 import hashlib
 import threading
 import urllib.request
+import urllib.error
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -24,34 +25,15 @@ WEBHOOK_SECRET = hashlib.md5((TELEGRAM_BOT_TOKEN + "safe_secret").encode()).hexd
 WEBHOOK_PATH = f"/tg-webhook-{WEBHOOK_SECRET}"
 
 DONOR_CHANNELS = [
-    "insiderUKR",
-    "truexanewsua",
-    "u_now",
-    "nefedoov365",
-    "lachentyt",
-    "voynareal",
-    "RBC_ua_news",
-    "suspilnenews",
-    "uniannet",
-    "ukrpravda_news",
-    "babel",
-    "hromadske_ua",
-    "nvua_official",
-    "tsnua",
-    "znua_live",
-    "gruntmedia",
-    "operativnoZSU",
-    "Tsaplienko",
-    "DeepStateUA",
-    "kpszsu",
-    "supernova_plus",
-    "exilenova_plus",
-    "mysiagin"
+    "insiderUKR", "truexanewsua", "u_now", "nefedoov365", "lachentyt",
+    "voynareal", "RBC_ua_news", "suspilnenews", "uniannet", "ukrpravda_news",
+    "babel", "hromadske_ua", "nvua_official", "tsnua", "znua_live",
+    "gruntmedia", "operativnoZSU", "Tsaplienko", "DeepStateUA", "kpszsu",
+    "supernova_plus", "exilenova_plus", "mysiagin"
 ]
 
 STATE_FILE = "bot_state.json"
 
-# --- STATE MANAGEMENT ---
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -99,49 +81,28 @@ def extract_canonical_roots(text):
         roots.add(root)
     return roots
 
-# --- ФІЛЬТР ЗБОЇВ ШІ (ЗАХИСТ ВІД «I AM SORRY» ТА ЗАСИЛЛЯ ПОВТОРІВ) ---
 MALFORMED_PATTERNS = [
     r"(?i)\bi('m| am) sorry\b",
     r"(?i)\bi (can't|cannot)\b",
     r"(?i)\bas an ai\b",
     r"(?i)\bвідповідь на ваш запит\b",
     r"(?i)\bоформіть новину\b",
-    r"(?i)\bтільки готовий пост\b",
-    r"(?i)\bформат поста\b",
-    r"(?i)\bредакторські правила\b",
-    r"(?i)\bнова тема для каналу\b"
+    r"(?i)\bтільки готовий пост\b"
 ]
 
 def is_malformed_ai_output(text: str) -> bool:
     if not text or len(text) < 25:
         return True
-    
-    # 1. Захист від відмов англійською та витоків системного промпту
     for pat in MALFORMED_PATTERNS:
         if re.search(pat, text):
-            logger.warning(f"Rejected malformed/refusal AI text: {text[:60]}")
             return True
-
-    # 2. Захист від зациклення (якщо одне слово повторюється 3+ разів поспіль)
-    if re.search(r'(\b\w{3,}\b)(?:\s+\1){2,}', text, flags=re.IGNORECASE):
-        logger.warning(f"Rejected stuttering loop AI text: {text[:60]}")
-        return True
-
-    # 3. Захист від повторення однакових рядків
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if len(lines) >= 4 and len(set(lines)) <= len(lines) // 2:
-        logger.warning(f"Rejected duplicate line loop text: {text[:60]}")
-        return True
-
     return False
 
-# --- БЕЗПЕЧНЕ ВИДАЛЕННЯ ЧУЖИХ ПІДПИСІВ ТА КОПІРАЙТІВ ФОТО ---
 def strip_foreign_signatures(text):
     if not text:
         return ""
     lines = text.strip().split('\n')
     cleaned = []
-    
     photo_credit_pattern = r'(?i)^\s*фото\s*:\s*.*(?:\/Facebook|\/Instagram|\/Telegram|Reuters|Getty|EPA|Укрінформ|ДСНС|соцмереж).*$'
     promo_patterns = [
         r'(?i)(підписатися|підписатись|подписаться|прислать контент|надіслати новину|джерело:?|джерело)',
@@ -173,27 +134,17 @@ def append_channel_signature(text):
         clean_text = clean_text[:max_text_len].rsplit(' ', 1)[0] + '...'
     return clean_text + signature
 
-def get_working_groq_model():
-    # Залізно використовуємо перевірену швидку модель, яка не глючить
-    return "llama-3.1-8b-instant"
-
-# --- AI РЕДАКТУРА ---
-def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_headlines=[]):
+def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     clean_input = strip_foreign_signatures(text)
     if not GROQ_API_KEY or not clean_input or len(clean_input) < 15:
         return clean_input if is_admin_forward else None
 
     lower_raw = clean_input.lower()
-
     if not is_admin_forward:
-        digest_markers = ["важливе за день", "головне за день", "підсумки дня", "дайджест"]
-        if any(d in lower_raw for d in digest_markers):
+        if any(d in lower_raw for d in ["важливе за день", "головне за день", "підсумки дня", "дайджест", "хвилина мовчання"]):
             return "SKIP"
 
-        if any(m in lower_raw for m in ["хвилина мовчання", "пам'яті геро", "загинув у 2022", "загинув у 2023"]):
-            return "SKIP"
-
-    context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:15], 1)]) if recent_headlines else ""
+    context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:12], 1)]) if recent_headlines else ""
 
     system_prompt = (
         "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
@@ -201,10 +152,7 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
         "ПРОФЕСІЙНІ РЕДАКТОРСЬКІ ПРАВИЛА:\n"
         "1. ЧИСТА УКРАЇНСЬКА МОВА: Російський текст обов'язково перекласти літературною українською мовою. Жодного російського слова!\n"
         "2. БЕЗ ТЕХНІЧНИХ КОПІРАЙТІВ ФОТО: Не пиши в кінці «Фото: Facebook / Reuters». Лишай тільки сам текст новини!\n"
-        "3. НОВИНИ ПРОТИ СИРЕН: Окремі фрази про сирени без наслідків — пиши SKIP. А якщо є робота ППО, збиття чи влучання — публікуй обов'язково!\n"
-        "4. БЕЗ ПАНІКИ: Якщо новина — подробиці старої трагедії, пиши «Розкрито подробиці», а не «Стався теракт».\n"
-        "5. ЗВЕРНЕННЯ ТА ЗАЯВИ: Різні теми одного звернення Зеленського чи посадовців публікувати окремими постами!\n"
-        "6. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
+        "3. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Короткий влучний заголовок</b>\n\n"
         "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
@@ -227,16 +175,17 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code != 200:
+            logger.warning(f"Groq API Error {resp.status_code}: {resp.text[:120]}")
             return clean_input if is_admin_forward else None
         raw_out = resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Groq Request Exception: {e}")
         return clean_input if is_admin_forward else None
 
     raw_out = re.sub(r'<think>.*?</think>', '', raw_out, flags=re.DOTALL).strip()
     if raw_out.upper() == "SKIP" or "SKIP" in raw_out[:10]:
         return "SKIP"
 
-    # Захист від збоїв ШІ
     if is_malformed_ai_output(raw_out):
         return clean_input if is_admin_forward else None
 
@@ -244,27 +193,13 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
     out = out.replace("<blockquote>", "").replace("</blockquote>", "")
 
-    if bool(re.search(r'[ыэъёЫЭЪЁ]', out)):
-        return None
-
     ru_fixes = {
-        r'\bекс-президент(а|у|ом|і)?\s+США\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 США \2Трамп\3',
         r'\bекс-президент(а|у|ом|і)?\s+США\b': r'Президент\1 США',
-        r'\bекс-президент(а|у|ом|і)?\s+(Дональд\s+)?Трамп(а|у|ом|і)?\b': r'Президент\1 \2Трамп\3',
-        r'\bколишн(ій|ього|ьому|ім)\s+президент(а|у|ом|і)?\s+США\b': r'Президент\2 США',
         r'\bУ\s+інтерв[\'’]ю\b': 'В інтерв\'ю',
-        r'\bу\s+інтерв[\'’]ю\b': 'в інтерв\'ю',
-        r'\b[иі]стека[а-я]* кров[\'’]ю\b': 'стікав кров\'ю',
-        r'\b[иі]стека[а-я]*\b': 'стікав',
         r'\bГСЧС\b': 'ДСНС',
-        r'\bгсчс\b': 'ДСНС',
         r'\bогромн(а|у|е|і|их|им|ому)\b': r'величезн\1',
         r'\bворонку\b': 'вирву',
-        r'\bворонка\b': 'вирва',
-        r'\bворонки\b': 'вирви',
-        r'\bукраїнські зсу\b': 'ЗСУ',
         r'\bтолп[а-я]*': 'натовп',
-        r'\bпозор[а-я]*': 'ганьба',
         r'\bВСУ\b': 'ЗСУ'
     }
     for r_pattern, replacement in ru_fixes.items():
@@ -272,7 +207,6 @@ def rewrite_news_for_channel(text, model_name, is_admin_forward=False, recent_he
 
     return out
 
-# --- ВИКАЧУВАННЯ ФАЙЛІВ З TELEGRAM ---
 def download_tg_file(file_id):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
@@ -290,7 +224,6 @@ def download_tg_file(file_id):
 def send_telegram_media_group(photos, videos, caption):
     media = []
     files = {}
-
     is_caption_attached = False
 
     for i, v_bytes in enumerate(videos):
@@ -318,7 +251,6 @@ def send_telegram_media_group(photos, videos, caption):
     r = requests.post(url, data=data, files=files, timeout=50)
     return r.json().get("ok", False)
 
-# --- РОЗУМНИЙ БУФЕР АЛЬБОМІВ ---
 album_buffers = {}
 album_lock = threading.Lock()
 
@@ -336,8 +268,7 @@ def process_buffered_album(media_group_id):
     if not text_content and not photos and not videos:
         return
 
-    model_name = get_working_groq_model()
-    rewritten = rewrite_news_for_channel(text_content, model_name, is_admin_forward=True) if text_content else ""
+    rewritten = rewrite_news_for_channel(text_content, is_admin_forward=True) if text_content else ""
     if not rewritten or rewritten == "SKIP":
         rewritten = strip_foreign_signatures(text_content)
 
@@ -374,7 +305,6 @@ def process_buffered_album(media_group_id):
             "parse_mode": "HTML"
         })
 
-# --- ОБРОБКА ПЕРЕСИЛАНЬ ВІД ВЛАСНИКА ---
 def handle_incoming_admin_update(update):
     try:
         msg = update.get("message")
@@ -382,37 +312,19 @@ def handle_incoming_admin_update(update):
             return
 
         chat_id = msg.get("chat", {}).get("id")
-        chat_type = msg.get("chat", {}).get("type")
-
-        if chat_type != "private":
+        if msg.get("chat", {}).get("type") != "private":
             return
 
         media_group_id = msg.get("media_group_id")
         text_content = msg.get("text") or msg.get("caption") or ""
 
-        fwd_chat = msg.get("forward_from_chat", {})
-        fwd_username = fwd_chat.get("username")
-        fwd_id = msg.get("forward_from_message_id")
-
         photo_bytes = None
         video_bytes = None
 
-        if fwd_username and fwd_id and not media_group_id:
-            v_url, p_urls = fetch_media_from_embed(fwd_username, fwd_id)
-            if v_url:
-                v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-                if v_resp.status_code == 200:
-                    video_bytes = v_resp.content
-            elif p_urls:
-                p_resp = requests.get(p_urls[0], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if p_resp.status_code == 200:
-                    photo_bytes = p_resp.content
-
-        if not video_bytes and not photo_bytes:
-            if "video" in msg:
-                video_bytes = download_tg_file(msg["video"]["file_id"])
-            elif "photo" in msg:
-                photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
+        if "video" in msg:
+            video_bytes = download_tg_file(msg["video"]["file_id"])
+        elif "photo" in msg:
+            photo_bytes = download_tg_file(msg["photo"][-1]["file_id"])
 
         if media_group_id:
             with album_lock:
@@ -427,15 +339,11 @@ def handle_incoming_admin_update(update):
                     })
                 
                 buf = album_buffers[media_group_id]
-                if photo_bytes:
-                    buf["photos"].append(photo_bytes)
-                if video_bytes:
-                    buf["videos"].append(video_bytes)
-                if text_content:
-                    buf["text"] = text_content
+                if photo_bytes: buf["photos"].append(photo_bytes)
+                if video_bytes: buf["videos"].append(video_bytes)
+                if text_content: buf["text"] = text_content
 
-                if buf["timer"]:
-                    buf["timer"].cancel()
+                if buf["timer"]: buf["timer"].cancel()
                 buf["timer"] = threading.Timer(2.0, process_buffered_album, args=(media_group_id,))
                 buf["timer"].start()
             return
@@ -452,28 +360,13 @@ def handle_incoming_admin_update(update):
             "text": "⏳ Отримав! Оформлюю через AI та публікую в канал..."
         })
 
-        link_match = re.search(r't\.me/([^/]+)/(\d+)', text_content)
-        if link_match:
-            ch_name = link_match.group(1)
-            m_id = link_match.group(2)
-            v_url, p_urls = fetch_media_from_embed(ch_name, m_id)
-            if v_url:
-                v_resp = requests.get(v_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-                if v_resp.status_code == 200:
-                    video_bytes = v_resp.content
-            elif p_urls:
-                p_resp = requests.get(p_urls[0], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if p_resp.status_code == 200:
-                    photo_bytes = p_resp.content
-
-        model_name = get_working_groq_model()
-        rewritten = rewrite_news_for_channel(text_content, model_name, is_admin_forward=True)
+        rewritten = rewrite_news_for_channel(text_content, is_admin_forward=True)
         if not rewritten or rewritten == "SKIP":
             rewritten = strip_foreign_signatures(text_content)
 
         caption = append_channel_signature(rewritten)
-
         published = False
+
         if video_bytes:
             files = {"video": ("video.mp4", video_bytes, "video/mp4")}
             data_post = {"chat_id": TELEGRAM_CHANNEL_ID}
@@ -510,16 +403,9 @@ def handle_incoming_admin_update(update):
                 "text": f"🚀 <b>Успішно опубліковано в @kropivnit!</b>\n\n{headline}",
                 "parse_mode": "HTML"
             })
-        else:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "❌ Не вдалося опублікувати. Перевірте формат повідомлення."
-            })
-
     except Exception as e:
         logger.warning(f"Error handling admin forward: {e}")
 
-# --- HEALTH CHECK ТА WEBHOOK СЕРВЕР ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
@@ -538,10 +424,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 content_len = int(self.headers.get('Content-Length', 0))
                 post_body = self.rfile.read(content_len)
                 update = json.loads(post_body.decode('utf-8'))
-                
                 self.send_response(200)
                 self.end_headers()
-                
                 threading.Thread(target=handle_incoming_admin_update, args=(update,), daemon=True).start()
                 return
             except Exception as e:
@@ -580,15 +464,25 @@ def run_keep_alive():
         except Exception as e:
             logger.warning(f"Keep-alive ping error: {e}")
 
-# --- SCRAPER & EMBED UTILITIES ---
+# --- БЕЗПЕЧНИЙ СКРЕЙПЕР З РОЗУМНОЮ ПАУЗОЮ ТА ЛОГУВАННЯМ ---
 def scrape_channel(channel_name):
     url = f"https://t.me/s/{channel_name.lstrip('@')}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8"
+    }
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=8) as response:
             html_content = response.read().decode('utf-8', errors='ignore')
-    except Exception:
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            logger.warning(f"Telegram 429 Too Many Requests on @{channel_name}! Робимо паузу...")
+        else:
+            logger.warning(f"Telegram HTTP Error {e.code} on @{channel_name}")
+        return []
+    except Exception as e:
+        logger.warning(f"Telegram scrape error on @{channel_name}: {e}")
         return []
 
     messages = []
@@ -683,7 +577,7 @@ def get_channel_recent_posts(target_channel):
 def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
     if len(candidate_roots) < 2:
         return False
-    update_markers = ["повторн", "новий удар", "обвалив", "зруйновано повністю", "кількість зросла", "підтвердив генштаб", "указ", "нагородив", "орден"]
+    update_markers = ["повторн", "новий удар", "обвалив", "зруйновано повністю", "кількість зросла", "підтвердив генштаб", "указ", "нагородив"]
     if any(m in raw_text.lower() for m in update_markers):
         return False
     for p in recent_posts[:25]:
@@ -693,7 +587,6 @@ def is_blatant_duplicate(candidate_roots, raw_text, recent_posts):
             return True
     return False
 
-# ТОЧКОВИЙ ЗАХИСТ: перевірка згенерованого заголовка на збіг (щоб не було дублів як з Абу-Дабі)
 def is_generated_headline_duplicate(rewritten_text, recent_posts):
     if not rewritten_text:
         return False
@@ -728,8 +621,8 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
                 r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo", data=data, files=files, timeout=45)
                 if r.json().get("ok"):
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Video publish error: {e}")
 
     if photo_urls:
         for p_url in photo_urls[:1]:
@@ -744,8 +637,8 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
                     r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data, files=files, timeout=25)
                     if r.json().get("ok"):
                         return True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Photo publish error: {e}")
 
     if caption:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -754,37 +647,44 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
         return r.json().get("ok", False)
     return False
 
-# --- ГОЛОВНИЙ АВТОНОМНИЙ ЦИКЛ ---
+# --- ГОЛОВНИЙ ЦИКЛ З БЕЗПЕЧНИМИ ТАЙМІНГАМИ ---
 def main_loop():
-    logger.info("Initializing Pure Autonomous Pipeline...")
+    logger.info("🚀 Pure Autonomous Pipeline запущено...")
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
     if not app_state.get("recent_published_posts"):
         app_state["recent_published_posts"] = channel_posts[:60]
 
     if not app_state.get("posted_hashes"):
+        logger.info("Первинне заповнення бази хешів...")
         for ch in DONOR_CHANNELS:
             msgs = scrape_channel(ch)
             for m in msgs:
                 if m["hash"]:
                     app_state["posted_hashes"].append(m["hash"])
+            time.sleep(1.0)
         save_state(app_state)
+        logger.info(f"Базу ініціалізовано: {len(app_state['posted_hashes'])} постів у пам'яті.")
 
     loop_count = 0
     while True:
         try:
-            model_name = get_working_groq_model()
-            if loop_count % 12 == 0:
+            loop_count += 1
+            logger.info(f"--- Сканування донорів (Коло #{loop_count}) ---")
+
+            if loop_count % 10 == 0:
                 channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
                 for p in channel_posts[:20]:
                     if p not in app_state["recent_published_posts"]:
                         app_state["recent_published_posts"].insert(0, p)
                 app_state["recent_published_posts"] = app_state["recent_published_posts"][:100]
-            loop_count += 1
 
             recent_headlines = [p.strip().split('\n')[0][:90] for p in app_state["recent_published_posts"][:15] if p]
 
+            new_candidates = 0
             for channel in DONOR_CHANNELS:
                 items = scrape_channel(channel)
+                time.sleep(1.2)  # Безпечна пауза, щоб Telegram не банив IP
+
                 for item in items[-3:]:
                     item_hash = item["hash"]
                     if not item_hash or item_hash in app_state["posted_hashes"]:
@@ -799,15 +699,18 @@ def main_loop():
                         save_state(app_state)
                         continue
 
-                    rewritten = rewrite_news_for_channel(raw_text, model_name, is_admin_forward=False, recent_headlines=recent_headlines)
+                    new_candidates += 1
+                    logger.info(f"Знайдено нову новину в @{channel}: {raw_text[:50]}...")
+
+                    rewritten = rewrite_news_for_channel(raw_text, is_admin_forward=False, recent_headlines=recent_headlines)
                     if not rewritten or rewritten == "SKIP":
+                        logger.info(f"Пропущено AI або збій: {raw_text[:40]}")
                         app_state["posted_hashes"].append(item_hash)
                         save_state(app_state)
                         continue
 
-                    # Блокуємо дублікат або збійний текст від ШІ
                     if is_generated_headline_duplicate(rewritten, app_state["recent_published_posts"]):
-                        logger.info(f"Skipped identical headline: {rewritten.split(chr(10))[0][:40]}")
+                        logger.info(f"Пропущено схожий заголовок: {rewritten.split(chr(10))[0][:40]}")
                         app_state["posted_hashes"].append(item_hash)
                         save_state(app_state)
                         continue
@@ -815,7 +718,7 @@ def main_loop():
                     success = publish_post_with_real_media(item["donor_channel"], item["msg_id"], rewritten)
                     if success:
                         headline = rewritten.split('\n')[0]
-                        logger.info(f"Published auto-post: {headline}")
+                        logger.info(f"✅ Успішно опубліковано: {headline}")
                         app_state["posted_hashes"].append(item_hash)
                         app_state["recent_published_posts"].insert(0, rewritten)
                         if len(app_state["recent_published_posts"]) > 100:
@@ -823,14 +726,14 @@ def main_loop():
                         if len(app_state["posted_hashes"]) > 2500:
                             app_state["posted_hashes"] = app_state["posted_hashes"][-2000:]
                         save_state(app_state)
-                        time.sleep(10)
+                        time.sleep(15)
 
-                time.sleep(0.3)
+            logger.info(f"Коло завершено. Нових кандидатів опрацьовано: {new_candidates}. Пауза 60 сек...")
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
 
-        time.sleep(20)
+        time.sleep(60)
 
 if __name__ == "__main__":
     t_http = threading.Thread(target=run_http_server, daemon=True)
