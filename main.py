@@ -199,6 +199,19 @@ def is_air_tracking_alert(text: str) -> bool:
 # ОЧИЩЕННЯ ВІД СУРЖИКУ ТА ПАФОСУ
 # ---------------------------------------------------------
 SURZHYK_MAP = [
+    (r'\bзамглавы\b', 'заступник керівника'),
+    (r'\bзапасаемся\b', 'запасаємося'),
+    (r'\bготовимся\b', 'готуємося'),
+    (r'\bдлительной войне\b', 'тривалої війни'),
+    (r'\bдлительной войны\b', 'тривалої війни'),
+    (r'\bдлительную войну\b', 'тривалу війну'),
+    (r'\bвойне\b', 'війні'),
+    (r'\bвойны\b', 'війни'),
+    (r'\bвойну\b', 'війну'),
+    (r'\bвойна\b', 'війна'),
+    (r'\bводой\b', 'водою'),
+    (r'\bводы\b', 'води'),
+    (r'\bводу\b', 'воду'),
     (r'\bв октябр[іе]\b', 'у жовтні'),
     (r'\bв ноябр[іе]\b', 'у листопаді'),
     (r'\bв декабр[іе]\b', 'у грудні'),
@@ -233,6 +246,21 @@ def clean_surzhyk_and_russian(text: str) -> str:
         cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
     return cleaned
 
+DONOR_CHANNEL_TAGS = [
+    r"insider\s*ua", r"інсайдер\s*ua", r"инсайдер\s*ua", r"інсайдер", r"инсайдер",
+    r"труха\s*украина", r"труха\s*україна", r"труха", r"truexa",
+    r"реальная\s*война", r"реальна\s*війна",
+    r"украина\s*сейчас", r"україна\s*зараз", r"u_now",
+    r"ус:\s*украина", r"ус\s*новини", r"ус",
+    r"уніан", r"униан", r"unian",
+    r"рбк[- ]украина", r"рбк[- ]україна", r"rbc",
+    r"цензор\.нет", r"цензор",
+    r"бабель", r"babel", r"лачен", r"lachen",
+    r"deepstate", r"оперативно\s*зсу", r"повітряні\s*сили",
+    r"exilenova", r"invasion", r"хамелеон", r"чп\s*захід", r"радник"
+]
+DONOR_TAG_PATTERN = r"(?i)\s*[,—–-]\s*(?:" + "|".join(DONOR_CHANNEL_TAGS) + r")[^\n]*$"
+
 def strip_donor_artifacts(text: str) -> str:
     cleaned = re.sub(r"https?://(?:t|telegram)\.me/[A-Za-z0-9_+/]+", "", text, flags=re.IGNORECASE)
     cleaned = re.sub(r"t\.me/[A-Za-z0-9_+/]+", "", cleaned, flags=re.IGNORECASE)
@@ -244,7 +272,8 @@ def strip_donor_artifacts(text: str) -> str:
         l_str = l.strip().lower()
         if any(w in l_str for w in ["підписатися", "подписаться", "підпишись", "подпишись", "приєднатися", "читати далі", "долучайтесь"]):
             continue
-        filtered_lines.append(l)
+        cleaned_l = re.sub(DONOR_TAG_PATTERN, "", l).rstrip(" ,—–-")
+        filtered_lines.append(cleaned_l)
     cleaned = "\n".join(filtered_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -266,24 +295,22 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
 
 ЗАЛІЗНІ ПРАВИЛА РЕДАКЦІЇ:
 
-1. СУВОРА ФАКТИЧНІСТЬ (КАТЕГОРИЧНО ЗАБОРОНЕНО ДОДУМУВАТИ ФАКТИ!):
-   - Працюй ВИКЛЮЧНО з фактами, які є у вихідному тексті.
-   - СУВОРО ЗАБОРОНЕНО вигадувати: точний час події (наприклад, «о 10:23»), кількість постраждалих чи загиблих, масштаби руйнувань чи реакцію служб («патрульна поліція розпочала розслідування»), якщо про це НЕ написано в оригіналі!
-   - Якщо новина коротка (наприклад, підпис до відео на один рядок: «Удар БпЛА по Сарнах») — пост має бути коротким (1–2 чіткі речення). Заборонено штучно роздувати текст вигаданими подробицями!
-   - Якщо в оригіналі немає цифр чи постраждалих — НЕ вигадуй їх! Пиши лише те, що реально відомо.
+1. ЗМІСТ ТА ЛОГІКА (НЕ СПОТВОРЮВАТИ ФАКТИ ТА РОЛІ):
+   - Уважно вчитуйся в суть події! Не плутай, хто що робив (наприклад, якщо люди намагалися відбити чоловіка у ТЦК — так і пиши, що люди відбивали його, а не «били його лопатою»).
+   - Не вживай безглуздих механічних фраз (жодних «бій за ноги»). Пиши як професійний український журналіст.
+   - Не вигадуй факти, яких немає (час доби на кшталт «о 10:23», неіснуючих загиблих). Якщо подія коротка — пиши чітко й по суті, без вигадок.
 
-2. ТОЧНІСТЬ ТОПОНІМІВ ТА ІМЕН В УКРАЇНІ:
-   - Не перекручуй назви та статус населених пунктів: Сарни — це місто на Рівненщині (у місті Сарни, по Сарнах), а не «село Сарна»!
-   - Правильно відмінюй українські топоніми у множині (Сарни -> у Сарнах; Бровари -> у Броварах; Черкаси -> у Черкасах; Ромни -> у Ромнах).
-   - Точність імен: Мединський — Володимир; Сирський — Олександр; Умєров — Рустем; Буданов — Кирило.
+2. ЗАГОЛОВОК (ОБОВ'ЯЗКОВО В **ЖИРНОМУ** З ЕМОДЗІ):
+   - Перший рядок — ЗАВЖДИ жирний заголовок з емодзі: **🤯 Скандал із ТЦК у Нововолинську: місцеві з лопатами відбивали чоловіка**
+   - ДЖЕРЕЛО В КІНЦІ ЗАГОЛОВКА (наприклад, `, — Reuters`, `, — Генштаб`, `, — Зеленський`): вказуй ТІЛЬКИ якщо є реальне міжнародне ЗМІ або офіційна особа.
+   - КАТЕГОРИЧНО ЗАБОРОНЕНО ставити безглузді приписки (жодних «– ТЦК, Нововолинськ») та заборонено вказувати чужі телеграм-канали («– Труха», «– INSIDER UA»)! Якщо це відео чи побутова сутичка — заголовок закінчується БЕЗ джерела.
 
-3. ЗАГОЛОВОК (ОБОВ'ЯЗКОВО В **ЖИРНОМУ**):
-   - Перший рядок — жирний заголовок з емодзі: **⚡️ Заголовок новини** або **«Влучна цитата», — прізвище**.
-   - Якщо є першоджерело (Reuters, Генштаб, місцеві пабліки, ОВА) — вказуй у кінці заголовка: `, — джерело`.
+3. ТІЛО ПОСТА (1–2 ДИНАМІЧНІ АБЗАЦИ):
+   - Чітко й грамотно виклади суть. Обов'язково виділяй **жирним** головні ключові факти (місто, учасників, ключову дію).
+   - Жодних матюків, без слів «дивитися до кінця», без посилань на ботів.
 
-4. ЖИВИЙ СТИЛЬ БЕЗ КАНЦЕЛЯРЩИНИ:
-   - Пиши сучасно, без радянських штампів («у зв'язку з», «для реалізації потрібно», «основним приводом названо»).
-   - Виділяй **жирним** головні ключові слова, які РЕАЛЬНО є в тексті (прізвища, підтверджені цифри, назви міст).
+4. СУВОРО 100% ДЕРЖАВНА УКРАЇНСЬКА МОВА:
+   - Якщо новина російською мовою — ПОВНІСТЮ переклади заголовок і весь текст чистою солов'їною українською. Жодного російського слова («Запасаємося», «Заступниця керівника ОП»).
 
 5. ЧИСТОТА ВІД ЧУЖОГО СПАМУ:
    - Видаляй назви чужих каналів («УС», «Труха», «Інсайдер»), посилання t.me та чужі заклики підписатися.
@@ -314,7 +341,7 @@ def _parse_retry_after_seconds(err_text: str) -> int:
         return max(30, min(int(mins * 60 + secs), 3600))
     return 120
 
-def call_groq_with_fallback(messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_tokens: int = 2048) -> str:
     if not GROQ_API_KEY:
         logger.error("GROQ_API_KEY не задано!")
         return ""
@@ -381,19 +408,18 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 1. Якщо це ТА САМА подія, що вже була у списку — напиши тільки DUPLICATE.
 2. Якщо це ДАЙДЖЕСТ (підсумок дня/вечора, перелік кількох подій) — напиши SKIP.
 3. Якщо це прихований піар, реклама чи пустий саркастичний мем — напиши SKIP.
-4. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ СВОЇМИ СЛОВАМИ:
-   - Перший рядок: **Емодзі + Заголовок**, — джерело
-   - Тіло: спирайся СУТО на факти з новини. КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати час («о 10:23»), постраждалих чи подробиці, яких немає в оригіналі!
-   - Якщо новина коротка (наприклад, підпис до відео) — пиши коротко (1–2 речення). Не роздувай штучно!
-   - Сарни — це місто (у Сарнах, по Сарнах), а не «село Сарна».
-   - Виділяй **жирним** ключові підтверджені слова, без канцеляризмів та без згадок чужих каналів («УС», «Труха» тощо)."""
+4. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ ДИНАМІЧНИЙ РЕРАЙТ:
+   - Рядок 1: **Емодзі + чіткий інформативний заголовок** (джерело вказуй ТІЛЬКИ якщо це Reuters/Генштаб/чиновник; для відео з соцмереж жодних приписок типу «- ТЦК» не став!).
+   - Тіло: 1–2 грамотні динамічні абзаци з обов'язковим виділенням **жирним** ключових слів.
+   - Зберігай точний зміст події: не перекручуй, хто кого бив або захищав! Жодних абсурдних фраз типу «бій за ноги».
+   - Без матюків, без канцеляризмів та без згадок чужих каналів («УС», «Труха» тощо)."""
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt}
     ]
 
-    content = call_groq_with_fallback(messages, temperature=0.2, max_tokens=2048)
+    content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
     if not content:
         return ""
 
@@ -418,19 +444,18 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365" (@kropivnit).
 Користувач надіслав новину для публікації.
 ЗРОБИ СТИЛЬНИЙ ДИНАМІЧНИЙ РЕРАЙТ ЗА ПРАВИЛАМИ КАНАЛУ:
-- Рядок 1: **Емодзі + Заголовок**, — джерело (до 7–10 слів)
+- Рядок 1: **Емодзі + чіткий змістовний заголовок** (джерело вказуй лише для заяв посадовців або світових ЗМІ; жодних фейкових джерел на кшталт «- ТЦК»).
 - Порожній рядок
-- Тіло: спирайся ВИКЛЮЧНО на факти з тексту! Категорично заборонено додумувати час, кількість постраждалих чи версії слідства!
-- Якщо новина коротка — роби рерайт коротким (1–2 речення), не висмоктуй подробиці з пальця.
-- Сарни — це місто (у Сарнах, по Сарнах), а не «село Сарна».
-- Жодних канцеляризмів. Пиши сучасно, просто, динамічно.
+- Тіло: 1–2 динамічні живі абзаци з **жирним виділенням** ключових слів.
+- Точно передавай зміст події, не плутай ролі учасників і не вигадуй зайвого.
+- Жодних канцеляризмів і без цензурних лайок. Пиши грамотно, сучасно та цікаво.
 - Видаляй назви чужих каналів («УС», «Труха»), посилання t.me та чужі підписи.
 
 Ось вихідний текст:
 {cleaned_input}"""
 
     messages = [{"role": "user", "content": prompt}]
-    content = call_groq_with_fallback(messages, temperature=0.2, max_tokens=2048)
+    content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
     if not content:
         return cleaned_input
 
@@ -445,6 +470,101 @@ def clean_html_text(raw_html: str) -> str:
     text = re.sub(r'<[^>]+>', '', text)
     text = html.unescape(text)
     return text.strip()
+
+PUBLISHED_HISTORY_FILE = "published_history.json"
+MAX_PUBLISHED_HISTORY = 60
+
+STOP_WORDS = {
+    'про', 'що', 'для', 'але', 'або', 'який', 'яка', 'яке', 'які', 'його',
+    'її', 'їх', 'було', 'буде', 'були', 'був', 'була', 'коли', 'якщо', 'після',
+    'через', 'цього', 'цьому', 'також', 'може', 'можуть', 'тому', 'більш',
+    'менш', 'дуже', 'цього', 'року', 'році', 'років', 'сьогодні', 'повідомляє',
+    'повідомив', 'заявив', 'заявила', 'заявили', 'словами', 'джерело', 'фото',
+    'відео', 'канал', 'підписатися', 'деталі', 'відомо', 'зараз', 'наразі',
+    'новини', 'знову', 'такі', 'інші', 'саме', 'лише', 'поки', 'что', 'или',
+    'было', 'будет', 'были', 'когда', 'если', 'после', 'этого', 'этому',
+    'также', 'может', 'могут', 'более', 'менее', 'очень', 'сообщает', 'сообщил'
+}
+
+def stem_ru_ukr(word: str) -> str:
+    w = word.lower().strip()
+    w = re.sub(r"['’`\-]", "", w)
+    if len(w) <= 3:
+        return w
+    w = w.replace("ы", "и").replace("э", "е").replace("ё", "е").replace("ъ", "")
+    w_norm = w.replace("і", "и").replace("ї", "и")
+
+    if "войн" in w_norm or "вийн" in w_norm:
+        return "войн"
+    if "вод" in w_norm:
+        return "вод"
+    if "запас" in w_norm:
+        return "запас"
+    if "готов" in w_norm or "готув" in w_norm:
+        return "готов"
+    if "тривал" in w_norm or "длител" in w_norm:
+        return "тривал"
+
+    endings = [
+        "ості", "ости", "остях", "івського", "івському", "ського", "ському",
+        "івська", "івське", "івські", "ення", "ання", "инна", "иння",
+        "яться", "ються", "ється", "итися", "атися", "уться", "ются", "ется",
+        "емся", "етесь", "итесь", "ались", "ились", "елись",
+        "ного", "ному", "ними", "них", "ний", "ним", "ною", "ній",
+        "ому", "ого", "его", "ему", "ими", "ыми", "ою", "ею", "ей", "ой", "ях", "ах", "ів", "ям", "ам",
+        "ами", "ями", "ові", "еві", "єві", "ий", "ій", "ый", "ать", "ить", "еть",
+        "а", "е", "є", "и", "і", "о", "у", "ю", "я"
+    ]
+    for end in endings:
+        if w_norm.endswith(end) and len(w_norm) - len(end) >= 3:
+            return w_norm[:-len(end)]
+    return w_norm
+
+def extract_keywords_stemmed(text: str) -> set:
+    words = re.findall(r'[а-яіїєґa-z0-9]{3,}', text.lower())
+    stems = set()
+    for w in words:
+        if w in STOP_WORDS:
+            continue
+        st = stem_ru_ukr(w)
+        if len(st) >= 3 and st not in STOP_WORDS:
+            stems.add(st)
+    return stems
+
+def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.35) -> bool:
+    new_kw = extract_keywords_stemmed(new_text)
+    if len(new_kw) < 3:
+        return False
+
+    for item in published_history:
+        old_kw = set(item.get("stems", []))
+        if not old_kw:
+            continue
+        common = new_kw & old_kw
+        smaller_len = min(len(new_kw), len(old_kw))
+        score = len(common) / smaller_len if smaller_len > 0 else 0
+        if score >= threshold:
+            logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, спільні корені: {common}")
+            return True
+    return False
+
+def load_published_history() -> list:
+    if os.path.exists(PUBLISHED_HISTORY_FILE):
+        try:
+            with open(PUBLISHED_HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            logger.warning(f"Не вдалося завантажити {PUBLISHED_HISTORY_FILE}: {e}")
+    return []
+
+def save_published_history(history: list):
+    try:
+        with open(PUBLISHED_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-MAX_PUBLISHED_HISTORY:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Не вдалося зберегти {PUBLISHED_HISTORY_FILE}: {e}")
 
 def scrape_channel(channel: str, seen_set: set) -> list:
     url = f"https://t.me/s/{channel}"
@@ -739,6 +859,14 @@ def handle_incoming_update(update: dict):
         if len(global_published_titles) > 30:
             global_published_titles.pop(0)
 
+        h = load_published_history()
+        h.append({
+            "headline": first_line,
+            "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
+            "timestamp": time.time()
+        })
+        save_published_history(h)
+
         if chat_id:
             requests.post(f"{base_api}/sendMessage", json={
                 "chat_id": chat_id,
@@ -787,6 +915,13 @@ def bot_worker_loop():
 
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
     global_published_titles = fetch_own_channel_history(TELEGRAM_CHANNEL_ID)
+    published_history = load_published_history()
+    # Синхронізуємо історію каналу
+    for t in global_published_titles:
+        st = extract_keywords_stemmed(t)
+        if st and not any(h.get("headline") == t for h in published_history):
+            published_history.append({"headline": t, "stems": list(st), "timestamp": time.time()})
+    save_published_history(published_history)
 
     # 2. ЗАХИСТ ВІД СТАРТОВОЇ ЛАВИНИ:
     logger.info(f"Ініціалізація {len(DONOR_CHANNELS)} донорів: фіксуємо старий беклог, щоб не спамити...")
@@ -849,6 +984,12 @@ def bot_worker_loop():
                         if time_since_last < REGULAR_COOLDOWN:
                             continue
 
+                    # АЛГОРИТМІЧНИЙ ЗАХИСТ ВІД ПОВТОРІВ (ДО ЗАПИТУ В GROQ):
+                    if is_duplicate_news(raw_text, published_history):
+                        logger.info(f"Алгоритмічний фільтр відхилив повтор новини: {raw_text[:60]}...")
+                        seen_set.add(post_id)
+                        continue
+
                     logger.info(f"Обробка поста {post_id} (Терміново: {is_breaking})...")
                     rewritten = rewrite_news(raw_text, global_published_titles)
 
@@ -865,6 +1006,13 @@ def bot_worker_loop():
                         current_t = time.time()
                         first_line = rewritten.split('\n')[0].replace('*', '').strip()
                         global_published_titles.append(first_line)
+                        published_history.append({
+                            "headline": first_line,
+                            "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
+                            "timestamp": current_t
+                        })
+                        save_published_history(published_history)
+
                         if len(global_published_titles) > 30:
                             global_published_titles.pop(0)
 
