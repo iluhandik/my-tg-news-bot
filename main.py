@@ -415,7 +415,7 @@ def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
         return True
 
     # 2. Перевірка штучного роздування короткого тексту
-    if len(source_text.strip()) < 160 and len(output_text.strip()) > max(260, len(source_text.strip()) * 2.5 + 80):
+    if len(source_text.strip()) < 160 and len(output_text.strip()) > max(360, len(source_text.strip()) * 3 + 120):
         logger.warning(f"Штучне роздування короткої новини ({len(source_text)} -> {len(output_text)} символів)")
         return True
 
@@ -456,7 +456,6 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
         "Content-Type": "application/json"
     }
 
-    # Наша основна модель ЗАВЖДИ стоїть на 1-му місці!
     models_to_try = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
 
     now = time.time()
@@ -512,6 +511,45 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
     logger.error("Усі моделі Groq наразі вичерпали ліміти або не змогли відповісти.")
     return ""
 
+
+def has_russian_text(text: str) -> bool:
+    t = text.lower()
+    if any(ch in t for ch in ["ы", "э", "ё", "ъ"]):
+        return True
+    ru_markers = [
+        r"\bв киеве\b", r"\bв харькове\b", r"\bв одессе\b", r"\bв днепре\b",
+        r"\bпопадание\b", r"\bместные сми\b", r"\bсообщают\b", r"\bв результате\b",
+        r"\bпроизошел\b", r"\bпроизошла\b", r"\bсейчас\b", r"\bтакже\b", r"\bоднако\b"
+    ]
+    return any(re.search(p, t) for p in ru_markers)
+
+def translate_to_ukrainian(text: str) -> str:
+    if not GROQ_API_KEY or not text.strip():
+        return text
+    messages = [
+        {
+            "role": "system",
+            "content": "Ти — перекладач. Переклади текст чистою українською мовою. Повертай ТІЛЬКИ перекладений текст, без коментарів, без пояснень і без додавання нових фактів."
+        },
+        {"role": "user", "content": text}
+    ]
+    translated = call_groq_with_fallback(messages, temperature=0.1, max_tokens=1024)
+    if translated and not is_ai_refusal(translated):
+        return strip_donor_artifacts(clean_surzhyk_and_russian(translated))
+    return text
+
+def format_fallback_post(text: str) -> str:
+    if has_russian_text(text):
+        text = translate_to_ukrainian(text)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return ""
+    first_line = lines[0]
+    body = "\n\n".join(lines[1:])
+    starts_with_emoji = bool(re.match(r"^[‼️❗️⚡️🚨🔴👉⏩➡️▶️💥🔥🇺🇦🇷🇺🇺🇸🇪🇺🇬🇧]", first_line))
+    header = f"**{first_line}**" if starts_with_emoji else f"**⚡️ {first_line}**"
+    return f"{header}\n\n{body}" if body else header
+
 def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     is_short = len(cleaned_input) < 160
@@ -561,9 +599,10 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 
     content = clean_ai_fluff(content)
     content = clean_surzhyk_and_russian(content)
+    if has_russian_text(content):
+        content = translate_to_ukrainian(content)
     content = strip_donor_artifacts(content)
 
-    # Перевірка на галюцинації: якщо модель щось довигадала — робимо 1 сувору спробу з temperature=0.1
     if has_hallucinated_facts(cleaned_input, content):
         strict_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -615,13 +654,13 @@ def rewrite_news_for_admin(raw_text: str) -> str:
         if retry_content and not is_ai_refusal(retry_content) and not has_hallucinated_facts(cleaned_input, retry_content):
             content = retry_content
         else:
-            logger.warning("Модель вигадала факти або відмовилась. Оформлюємо чистий оригінал без домислів.")
-            first_line = cleaned_input.split('\n')[0].strip()
-            body = '\n'.join(cleaned_input.split('\n')[1:]).strip()
-            return f"**⚡️ {first_line}**\n\n{body}" if body else f"**⚡️ {first_line}**"
+            logger.warning("Модель вигадала факти або відмовилась. Оформлюємо чистий переклад без домислів.")
+            return format_fallback_post(cleaned_input)
 
     content = clean_ai_fluff(content)
     content = clean_surzhyk_and_russian(content)
+    if has_russian_text(content):
+        content = translate_to_ukrainian(content)
     content = strip_donor_artifacts(content)
     return content
 
