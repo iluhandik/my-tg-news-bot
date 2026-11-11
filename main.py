@@ -28,17 +28,15 @@ DONOR_CHANNELS = [
     "insiderUKR", "u_now", "lachentyt", "RBC_ua_news", 
     "suspilnenews", "uniannet", "ukrpravda_news", 
     "tsnua", "znua_live", "gruntmedia", 
-    "operativnoZSU", "DeepStateUA", "kpszsu", "mysiagin"
+    "operativnoZSU", "DeepStateUA", "kpszsu"
 ]
 
-# Фільтр комерційної реклами, ставок та казино
 AD_KEYWORDS = [
     "метінвест", "ахметов", "favbet", "фавбет", "cosmolot", 
     "космолот", "слоти", "казино", "ставки", "промокод", "знижк", "розпродаж", 
     "найкращі роботодавці для жінок", "партнерський матеріал", "фонд ріната", "мікропозик"
 ]
 
-# ВАРІАНТ А: Фільтр радарних секундних тривог без наслідків
 ALERT_KEYWORDS = [
     "в укриття", "курс на", "рухається в напрямку", "повітряна тривога", 
     "відбій тривоги", "тривога по областях", "шахед над", "шахед на", 
@@ -144,12 +142,11 @@ def append_channel_signature(text):
     channel_user = TELEGRAM_CHANNEL_ID.lstrip('@')
     signature = f'\n\n👉 <a href="https://t.me/{channel_user}">NEWS УКРАЇНА 365 | Підписатися</a>'
     
-    # Максимум 1024 символи у підписі Telegram
     max_len = 1015 - len(signature)
     if len(clean_text) > max_len:
         sub = clean_text[:max_len]
         last_punct = max(sub.rfind('.'), sub.rfind('!'), sub.rfind('?'))
-        if last_punct > 200:
+        if last_punct > 180:
             clean_text = sub[:last_punct + 1]
         else:
             clean_text = sub.rsplit(' ', 1)[0] + '...'
@@ -157,27 +154,61 @@ def append_channel_signature(text):
     return clean_text + signature
 
 def get_working_groq_model():
-    fallback_models = [
-        "llama-3.3-70b-versatile",
-        "openai/gpt-oss-20b",
+    """Вибирає найбільш якісні та потужні моделі Groq"""
+    priority_models = [
         "openai/gpt-oss-120b",
-        "llama3-70b-8192"
+        "qwen/qwen3.8-27b",
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-20b"
     ]
     if not GROQ_API_KEY:
-        return fallback_models[0]
+        return priority_models[0]
     try:
         r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=6)
         if r.status_code == 200:
             available = [m["id"] for m in r.json().get("data", [])]
-            for m in fallback_models:
+            for m in priority_models:
                 if m in available:
                     return m
             text_models = [m for m in available if "whisper" not in m and "guard" not in m]
             if text_models:
                 return text_models[0]
     except Exception as e:
-        logger.warning(f"Error fetching groq models list: {e}")
-    return fallback_models[0]
+        logger.warning(f"Error fetching groq models: {e}")
+    return priority_models[0]
+
+def clean_surzhyk_and_russian(text: str) -> str:
+    """Виправляє автопереклад і суржик після ШІ"""
+    ru_fixes = {
+        r'\bгосстат\b': 'Держстат',
+        r'\bГосстат\b': 'Держстат',
+        r'\bв октябр[іе]\b': 'у жовтні',
+        r'\bв ноябр[іе]\b': 'у листопаді',
+        r'\bв декабр[іе]\b': 'у грудні',
+        r'\bв январ[іе]\b': 'у січні',
+        r'\bв феврал[іе]\b': 'у лютому',
+        r'\bв март[іе]\b': 'у березні',
+        r'\bв апрел[іе]\b': 'у квітні',
+        r'\bв ма[еє]\b': 'у травні',
+        r'\bв июн[іе]\b': 'у червні',
+        r'\bв июл[іе]\b': 'у липні',
+        r'\bв август[іе]\b': 'у серпні',
+        r'\bв сентябр[іе]\b': 'у вересні',
+        r'\bводоотведенн[яе]\b': 'водовідведення',
+        r'\bводоотведение\b': 'водовідведення',
+        r'\bпаливо і смазки\b': 'пальне та мастила',
+        r'\bтопливо\b': 'пальне',
+        r'\bпідросли\b': 'зросли в ціні',
+        r'\bекс-президент(а|у|ом|і)?\s+США\b': r'Президент\1 США',
+        r'\bГСЧС\b': 'ДСНС',
+        r'\bогромн(а|у|е|і|их|им|ому)\b': r'величезн\1',
+        r'\bворонку\b': 'вирву',
+        r'\bтолп[а-я]*': 'натовп',
+        r'\bВСУ\b': 'ЗСУ'
+    }
+    for pat, repl in ru_fixes.items():
+        text = re.sub(pat, repl, text, flags=re.IGNORECASE)
+    return text
 
 def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     clean_input = strip_foreign_signatures(text)
@@ -187,37 +218,34 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     lower_raw = clean_input.lower()
     
     if not is_admin_forward:
-        # 1. Фільтр реклами
         if any(ad in lower_raw for ad in AD_KEYWORDS):
             logger.info(f"Відхилено рекламу/джинсу: {clean_input[:50]}")
             return "SKIP"
 
-        # 2. Фільтр дайджестів
         if any(d in lower_raw for d in ["важливе за день", "головне за день", "підсумки дня", "вечірній дайджест", "хвилина мовчання"]):
             return "SKIP"
 
-        # 3. ВАРІАНТ А: Фільтр радарних тривог без наслідків
         has_alert_marker = any(al in lower_raw for al in ALERT_KEYWORDS)
         has_real_impact = any(imp in lower_raw for imp in ["вибух", "влучан", "приліт", "поранен", "загинув", "руйнуван", "збито", "пожеж"])
         if has_alert_marker and not has_real_impact:
-            logger.info(f"Пропущено радарне сповіщення про тривогу/БпЛА: {clean_input[:50]}")
+            logger.info(f"Пропущено радарну тривогу/БпЛА: {clean_input[:50]}")
             return "SKIP"
 
     context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:12], 1)]) if recent_headlines else ""
 
     system_prompt = (
-        "ТИ — ДОСВІДЧЕНИЙ РЕДАКТОР ТОПОВОГО УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
+        "ТИ — ГОЛОВНИЙ РЕДАКТОР ВЕДУЧОГО УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
-        "ПРАВИЛА ЖИВОЇ ТЕЛЕГРАМ-ПОДАЧІ:\n"
-        "1. ЖИВА МОВА ТА ЦІКАВИЙ СТИЛЬ: Пиши легко, цікаво та грамотно (як пишуть провідні канали на кшталт Лачена чи Інсайдера). Ніякої сухої радянської канцелярії, ніяких списків («1. », «2. »), ніяких примусових рамок!\n"
-        "2. ПРИРОДНИЙ ЗАГОЛОВОК: Заголовок має бути чітким та влучним. Заборонено ставити штучні безглузді приставки на кшталт «Київ: » у заголовку — пиши природно: «У Києві вимикають вуличне освітлення» або «Економіка України сповільниться у 2026 році».\n"
-        "3. ЗАКІНЧЕНІСТЬ ТА СТИСЛІСТЬ: Пост має складатися з 1-2 повних абзаців (від 300 до 600 символів). Кожне речення має бути закінченим, останнє речення ОБОВ'ЯЗКОВО завершується крапкою. Ніколи не обривай речення!\n"
-        "4. ФАКТИЧНА ТОЧНІСТЬ: Не вигадуй зайвих подробиць від себе. Зберігай суть новини.\n"
+        "СУВОРІ СТАНДАРТИ ТА ФОРМАТУВАННЯ:\n"
+        "1. ЧИСТА ЛІТЕРАТУРНА УКРАЇНСЬКА МОВА (БЕЗ СУРЖИКУ): Суворо заборонено писати кальки типу «в октябрі» (тільки «у жовтні»), «Госстат» (тільки «Держстат»), «паливо і смазки» (тільки «пальне»), «водоотведення» (тільки «водовідведення»)!\n"
+        "2. ЗРУЧНІСТЬ ЧИТАННЯ ТА СТРУКТУРА: Якщо в новині багато цифр/відсотків — НЕ ліпи все в один суцільний важкий абзац! Розбий на 2 зрозумілі абзаци або охайний список із маркерами «•».\n"
+        "3. ЛІМІТ ТА ЗАКІНЧЕНІСТЬ: Обсяг тексту разом із заголовком — 350-650 символів. Останнє речення ОБОВ'ЯЗКОВО закінчується крапкою!\n"
+        "4. ЗАГОЛОВОК: Без штучних слів «Київ:» чи «Економіка:». Пиши природно, наприклад: «⚡ <b>В Україні різко прискорилася інфляція</b>».\n"
         "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США.\n\n"
         "ФОРМАТ ПОСТА:\n"
-        "⚡ <b>Влучний динамічний заголовок</b>\n\n"
-        "1-2 живих змістовних абзаци. Ключові факти та цифри виділяй <b>жирним</b>.\n\n"
-        "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ БЕЗ ВСТУПНИХ СЛІВ АБО СЛОВО SKIP."
+        "⚡ <b>Влучний заголовок</b>\n\n"
+        "1-2 структуровані, легкочитні абзаци. Важливі цифри виділяй <b>жирним</b>.\n\n"
+        "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ БЕЗ ВСТУПІВ АБО СЛОВО SKIP."
     )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -228,17 +256,18 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Оформи цей текст як стильний пост для Telegram-каналу:\n\n{clean_input}"}
+            {"role": "user", "content": f"Оформи цей текст як якісний структурований пост для Telegram:\n\n{clean_input}"}
         ],
-        "temperature": 0.3,
-        "max_tokens": 550
+        "temperature": 0.2,
+        "max_tokens": 600
     }
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         if resp.status_code != 200:
+            logger.warning(f"Groq API Error {resp.status_code} on model {model_name}: {resp.text[:120]}")
             if resp.status_code == 404:
-                payload["model"] = "llama-3.3-70b-versatile"
+                payload["model"] = "openai/gpt-oss-120b"
                 resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code != 200:
                 return clean_input if is_admin_forward else None
@@ -261,11 +290,10 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
         first_line = lines[0]
         first_line = re.sub(r'^[⚡\s]+', '', first_line)
         first_line = re.sub(r'</?b>', '', first_line)
-        first_line = re.sub(r'^[А-Яа-яA-Za-z]+:\s*', '', first_line)  # Прибираємо "Київ: " на початку заголовка
+        first_line = re.sub(r'^[А-Яа-яA-Za-z]+:\s*', '', first_line)
         lines[0] = f"⚡ <b>{first_line}</b>"
         raw_out = "\n\n".join(lines)
 
-    # Якщо ШІ раптом забув крапку в кінці - просто доставляємо її
     if not raw_out.endswith((".", "!", "?", "»", "</b>", "</i>")):
         raw_out = raw_out.strip() + "."
 
@@ -273,17 +301,8 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
     out = out.replace("<blockquote>", "").replace("</blockquote>", "")
 
-    ru_fixes = {
-        r'\bекс-президент(а|у|ом|і)?\s+США\b': r'Президент\1 США',
-        r'\bУ\s+інтерв[\'’]ю\b': 'В інтерв\'ю',
-        r'\bГСЧС\b': 'ДСНС',
-        r'\bогромн(а|у|е|і|их|им|ому)\b': r'величезн\1',
-        r'\bворонку\b': 'вирву',
-        r'\bтолп[а-я]*': 'натовп',
-        r'\bВСУ\b': 'ЗСУ'
-    }
-    for r_pattern, replacement in ru_fixes.items():
-        out = re.sub(r_pattern, replacement, out, flags=re.IGNORECASE)
+    # Очищення від суржику та русизмів
+    out = clean_surzhyk_and_russian(out)
 
     return out
 
@@ -583,7 +602,8 @@ def scrape_channel(channel_name):
         if text_match:
             raw_text = text_match.group(1)
             raw_text = re.sub(r'<br\s*/?>', '\n', raw_text)
-            raw_text = re.sub(r'<a\b[^>]*>.*?</a>', '', raw_text)
+            # ВИПРАВЛЕНО: зберігаємо текст посилань, знімаємо лише HTML тег (більше не ріже на слові "новоріч")
+            raw_text = re.sub(r'<a\b[^>]*>(.*?)</a>', r'\1', raw_text)
             raw_text = re.sub(r'<[^>]+>', '', raw_text)
             raw_text = html.unescape(raw_text).strip()
 
