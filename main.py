@@ -290,8 +290,9 @@ def clean_ai_fluff(text: str) -> str:
 # ---------------------------------------------------------
 # GROQ API: СУЧАСНИЙ ДИНАМІЧНИЙ ТЕЛЕГРАМ-СТИЛЬ
 # ---------------------------------------------------------
-SYSTEM_PROMPT = """Ти — головний редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365" (@kropivnit).
-Твоє завдання — перетворювати новинні повідомлення на чіткі, стильні та динамічні пости для Telegram.
+SYSTEM_PROMPT = """Ти — головний редактор провідного українського новинного Telegram-каналу "NEWS УКРАЇНА 365" (@kropivnit).
+Твоє завдання — журналістська фіксація та обробка реальних суспільних подій, новин та інцидентів в Україні для інформування населення (включаючи надзвичайні події, роботу ТЦК, кримінальну хроніку, заяви та фронтові зведення).
+Це документальна робота преси. Викладай факти збалансовано, нейтрально та грамотною мовою новин, без пропаганди насильства.
 
 ЗАЛІЗНІ ПРАВИЛА РЕДАКЦІЇ:
 
@@ -316,21 +317,42 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
    - Видаляй назви чужих каналів («УС», «Труха», «Інсайдер»), посилання t.me та чужі заклики підписатися.
 """
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip()
+PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 
-# Пріоритетні моделі: спочатку потужні GPT-OSS та Qwen, а інші — лише як крайній резерв
-PREFERRED_GROQ_MODELS = [
-    "openai/gpt-oss-120b",
+# Резервні моделі — вмикаються ТІЛЬКИ якщо основна модель не пропустила новину (429 або цензура)
+BACKUP_GROQ_MODELS = [
     "qwen/qwen3.8-27b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
     "llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b",
 ]
 
-if GROQ_MODEL and GROQ_MODEL not in PREFERRED_GROQ_MODELS:
-    PREFERRED_GROQ_MODELS.insert(0, GROQ_MODEL)
+AI_REFUSAL_PATTERNS = [
+    r"i(?:'m| am)? sorry",
+    r"i cannot",
+    r"i can(?:'t|not)",
+    r"as an ai",
+    r"i am unable",
+    r"my apologies",
+    r"help with that",
+    r"language model",
+    r"safety guidelines",
+    r"вибачте",
+    r"я не можу"
+]
 
-# Тимчасовий кулдаун лише для конкретної моделі, яка повернула 429 (щоб не спамити в логи)
+def is_ai_refusal(text: str) -> bool:
+    if not text:
+        return True
+    t = text.strip()
+    t_lower = t.lower()
+    for p in AI_REFUSAL_PATTERNS:
+        if re.search(r"\b" + p + r"\b", t_lower, re.IGNORECASE):
+            return True
+    if len(t) < 80 and not (t.startswith("**") or t.startswith("<b>")):
+        if any(w in t_lower for w in ["sorry", "cannot", "can't", "unable", "help with that", "language model"]):
+            return True
+    return False
+
 model_cooldowns = {}
 
 def _parse_retry_after_seconds(err_text: str) -> int:
@@ -351,9 +373,18 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
         "Content-Type": "application/json"
     }
 
+    # Наша основна модель ЗАВЖДИ стоїть на 1-му місці!
+    models_to_try = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
+
     now = time.time()
-    for model_name in PREFERRED_GROQ_MODELS:
+    for model_name in models_to_try:
+        is_primary = (model_name == PRIMARY_GROQ_MODEL)
+
+        # Перевірка 429 кулдауну
         if now < model_cooldowns.get(model_name, 0):
+            wait_left = int(model_cooldowns[model_name] - now)
+            if is_primary:
+                logger.info(f"Основна модель {PRIMARY_GROQ_MODEL} ще чекає завершення ліміту ({wait_left}с). Тимчасово використовуємо резерв...")
             continue
 
         payload = {
@@ -372,12 +403,18 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
             if resp.status_code == 200:
                 res_json = resp.json()
                 content = res_json["choices"][0]["message"]["content"].strip()
-                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
-                return content.strip()
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                if is_ai_refusal(content):
+                    logger.warning(f"Модель {model_name} видала safety refusal: {content[:100]}. Для цієї новини перемикаюсь на резервну...")
+                    continue
+
+                if not is_primary:
+                    logger.info(f"Новину успішно оброблено резервною {model_name}. На наступну новину бот автоматично повертається на нашу основну {PRIMARY_GROQ_MODEL}!")
+                return content
             elif resp.status_code == 429:
                 wait_sec = _parse_retry_after_seconds(resp.text)
                 model_cooldowns[model_name] = time.time() + wait_sec
-                logger.warning(f"Модель {model_name} досягла ліміту (429), пауза для неї {wait_sec}с. Перемикаюсь на іншу...")
+                logger.warning(f"Модель {model_name} вперлася в ліміт (429), пауза {wait_sec}с. Перемикаюсь на резерв...")
                 continue
             elif resp.status_code in (400, 404):
                 model_cooldowns[model_name] = time.time() + 3600
@@ -390,7 +427,7 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
             logger.error(f"Виняток Groq {model_name}: {e}")
             continue
 
-    logger.error("Усі моделі Groq тимчасово вичерпали ліміт.")
+    logger.error("Усі моделі Groq наразі вичерпали ліміти або не змогли відповісти.")
     return ""
 
 def rewrite_news(raw_text: str, published_titles: list) -> str:
@@ -420,7 +457,8 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     ]
 
     content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
-    if not content:
+    if not content or is_ai_refusal(content):
+        logger.warning("Groq не повернув валідного рерайту або видав відмову. Пропуск.")
         return ""
 
     if "DUPLICATE" in content.upper()[:15]:
@@ -456,7 +494,8 @@ def rewrite_news_for_admin(raw_text: str) -> str:
 
     messages = [{"role": "user", "content": prompt}]
     content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
-    if not content:
+    if not content or is_ai_refusal(content):
+        logger.warning("Groq видав відмову для ручного повідомлення адміна. Публікуємо оригінал.")
         return cleaned_input
 
     content = clean_ai_fluff(content)
