@@ -134,6 +134,31 @@ def append_channel_signature(text):
         clean_text = clean_text[:max_text_len].rsplit(' ', 1)[0] + '...'
     return clean_text + signature
 
+def get_working_groq_model():
+    """Динамічно визначає актуальну модель для вашого Groq API ключа"""
+    fallback_models = [
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "llama3-70b-8192",
+        "llama3-8b-8192"
+    ]
+    if not GROQ_API_KEY:
+        return fallback_models[0]
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=6)
+        if r.status_code == 200:
+            available = [m["id"] for m in r.json().get("data", [])]
+            for m in fallback_models:
+                if m in available:
+                    return m
+            text_models = [m for m in available if "whisper" not in m and "guard" not in m]
+            if text_models:
+                return text_models[0]
+    except Exception as e:
+        logger.warning(f"Error fetching groq models list: {e}")
+    return fallback_models[0]
+
 def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     clean_input = strip_foreign_signatures(text)
     if not GROQ_API_KEY or not clean_input or len(clean_input) < 15:
@@ -162,8 +187,10 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    model_name = get_working_groq_model()
+
     payload = {
-        "model": "llama-3.1-8b-instant",
+        "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Оформи новину для каналу:\n\n{clean_input}"}
@@ -173,10 +200,15 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp = requests.post(url, headers=headers, json=payload, timeout=18)
         if resp.status_code != 200:
-            logger.warning(f"Groq API Error {resp.status_code}: {resp.text[:120]}")
-            return clean_input if is_admin_forward else None
+            logger.warning(f"Groq API Error {resp.status_code} on model {model_name}: {resp.text[:120]}")
+            if resp.status_code == 404:
+                payload["model"] = "llama-3.3-70b-versatile"
+                resp = requests.post(url, headers=headers, json=payload, timeout=18)
+            if resp.status_code != 200:
+                return clean_input if is_admin_forward else None
+
         raw_out = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.warning(f"Groq Request Exception: {e}")
@@ -464,7 +496,6 @@ def run_keep_alive():
         except Exception as e:
             logger.warning(f"Keep-alive ping error: {e}")
 
-# --- БЕЗПЕЧНИЙ СКРЕЙПЕР З РОЗУМНОЮ ПАУЗОЮ ТА ЛОГУВАННЯМ ---
 def scrape_channel(channel_name):
     url = f"https://t.me/s/{channel_name.lstrip('@')}"
     headers = {
@@ -647,7 +678,6 @@ def publish_post_with_real_media(donor_channel, msg_id, text):
         return r.json().get("ok", False)
     return False
 
-# --- ГОЛОВНИЙ ЦИКЛ З БЕЗПЕЧНИМИ ТАЙМІНГАМИ ---
 def main_loop():
     logger.info("🚀 Pure Autonomous Pipeline запущено...")
     channel_posts = get_channel_recent_posts(TELEGRAM_CHANNEL_ID)
@@ -683,7 +713,7 @@ def main_loop():
             new_candidates = 0
             for channel in DONOR_CHANNELS:
                 items = scrape_channel(channel)
-                time.sleep(1.2)  # Безпечна пауза, щоб Telegram не банив IP
+                time.sleep(1.2)
 
                 for item in items[-3:]:
                     item_hash = item["hash"]
