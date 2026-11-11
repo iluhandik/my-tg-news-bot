@@ -8,6 +8,7 @@ import hashlib
 import threading
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone, timedelta
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -35,13 +36,6 @@ AD_KEYWORDS = [
     "метінвест", "ахметов", "favbet", "фавбет", "cosmolot", 
     "космолот", "слоти", "казино", "ставки", "промокод", "знижк", "розпродаж", 
     "найкращі роботодавці для жінок", "партнерський матеріал", "фонд ріната", "мікропозик"
-]
-
-ALERT_KEYWORDS = [
-    "в укриття", "курс на", "рухається в напрямку", "повітряна тривога", 
-    "відбій тривоги", "тривога по областях", "шахед над", "шахед на", 
-    "бпла над", "бпла на", "загроза застосування балісти", "активність ворожої авіації", 
-    "загроза бпла"
 ]
 
 STATE_FILE = "bot_state.json"
@@ -110,6 +104,20 @@ def is_malformed_ai_output(text: str) -> bool:
             return True
     return False
 
+# ВАРІАНТ А: Розумний фільтр радарних тривог і прольотів
+def is_air_tracking_alert(text: str) -> bool:
+    t = text.lower()
+    # Якщо є реальні наслідки або підсумки атаки — це новина
+    if any(imp in t for imp in ["влучан", "приліт", "поранен", "загинул", "жертв", "руйнуван", "пожеж", "пошкоджен", "збито"]):
+        return False
+        
+    target_words = ["бпла", "шахед", "дрон", "ракета", "ракет", "ціль", "балістик", "каб", "пуски", "авіаці"]
+    action_words = ["напрямк", "курс", "пройшов", "летить", "рух", "зафіксован", "проліт", "в бік", "повз", "укритт", "чисто", "тривог", "локаційн"]
+    
+    has_target = any(w in t for w in target_words)
+    has_action = any(w in t for w in action_words)
+    return has_target and has_action
+
 def strip_foreign_signatures(text):
     if not text:
         return ""
@@ -154,12 +162,10 @@ def append_channel_signature(text):
     return clean_text + signature
 
 def get_working_groq_model():
-    """Вибирає найбільш якісні та потужні моделі Groq"""
     priority_models = [
-        "openai/gpt-oss-120b",
         "qwen/qwen3.8-27b",
-        "llama-3.3-70b-versatile",
-        "openai/gpt-oss-20b"
+        "openai/gpt-oss-120b",
+        "llama-3.3-70b-versatile"
     ]
     if not GROQ_API_KEY:
         return priority_models[0]
@@ -178,7 +184,6 @@ def get_working_groq_model():
     return priority_models[0]
 
 def clean_surzhyk_and_russian(text: str) -> str:
-    """Виправляє автопереклад і суржик після ШІ"""
     ru_fixes = {
         r'\bгосстат\b': 'Держстат',
         r'\bГосстат\b': 'Держстат',
@@ -219,16 +224,15 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     
     if not is_admin_forward:
         if any(ad in lower_raw for ad in AD_KEYWORDS):
-            logger.info(f"Відхилено рекламу/джинсу: {clean_input[:50]}")
+            logger.info(f"Відхилено рекламу: {clean_input[:50]}")
             return "SKIP"
 
         if any(d in lower_raw for d in ["важливе за день", "головне за день", "підсумки дня", "вечірній дайджест", "хвилина мовчання"]):
             return "SKIP"
 
-        has_alert_marker = any(al in lower_raw for al in ALERT_KEYWORDS)
-        has_real_impact = any(imp in lower_raw for imp in ["вибух", "влучан", "приліт", "поранен", "загинув", "руйнуван", "збито", "пожеж"])
-        if has_alert_marker and not has_real_impact:
-            logger.info(f"Пропущено радарну тривогу/БпЛА: {clean_input[:50]}")
+        # Варіант А: відсікаємо радарні сповіщення
+        if is_air_tracking_alert(clean_input):
+            logger.info(f"Пропущено радарну тривогу: {clean_input[:50]}")
             return "SKIP"
 
     context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:12], 1)]) if recent_headlines else ""
@@ -236,15 +240,15 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     system_prompt = (
         "ТИ — ГОЛОВНИЙ РЕДАКТОР ВЕДУЧОГО УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
-        "СУВОРІ СТАНДАРТИ ТА ФОРМАТУВАННЯ:\n"
-        "1. ЧИСТА ЛІТЕРАТУРНА УКРАЇНСЬКА МОВА (БЕЗ СУРЖИКУ): Суворо заборонено писати кальки типу «в октябрі» (тільки «у жовтні»), «Госстат» (тільки «Держстат»), «паливо і смазки» (тільки «пальне»), «водоотведення» (тільки «водовідведення»)!\n"
-        "2. ЗРУЧНІСТЬ ЧИТАННЯ ТА СТРУКТУРА: Якщо в новині багато цифр/відсотків — НЕ ліпи все в один суцільний важкий абзац! Розбий на 2 зрозумілі абзаци або охайний список із маркерами «•».\n"
-        "3. ЛІМІТ ТА ЗАКІНЧЕНІСТЬ: Обсяг тексту разом із заголовком — 350-650 символів. Останнє речення ОБОВ'ЯЗКОВО закінчується крапкою!\n"
-        "4. ЗАГОЛОВОК: Без штучних слів «Київ:» чи «Економіка:». Пиши природно, наприклад: «⚡ <b>В Україні різко прискорилася інфляція</b>».\n"
+        "СУВОРІ СТАНДАРТИ РЕДАКТУРИ:\n"
+        "1. ЧИСТА ЛІТЕРАТУРНА МОВА: Жодного суржику (жовтень, а не октябрь; Держстат, а не Госстат; водовідведення, пальне).\n"
+        "2. ПОВНА ЗАКІНЧЕНІСТЬ ТЕКСТУ: Твій пост має містити повну закінчену думку на 2-3 абзаци (від 300 до 600 символів). Останнє речення ОБОВ'ЯЗКОВО закінчується крапкою!\n"
+        "3. БЕЗ ШТУЧНИХ СЛІВ У ЗАГОЛОВКУ: Не пиши приставки «Київ: » чи «Економіка: » на початку заголовка. Пиши природно і динамічно!\n"
+        "4. ПОТОЧНИЙ РІК — 2026: Не пиши старі новини з минулих років як сьогоднішні.\n"
         "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США.\n\n"
         "ФОРМАТ ПОСТА:\n"
         "⚡ <b>Влучний заголовок</b>\n\n"
-        "1-2 структуровані, легкочитні абзаци. Важливі цифри виділяй <b>жирним</b>.\n\n"
+        "1-2 структуровані легкі абзаци. Ключові факти та цифри виділяй <b>жирним</b>.\n\n"
         "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ БЕЗ ВСТУПІВ АБО СЛОВО SKIP."
     )
 
@@ -252,25 +256,22 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     model_name = get_working_groq_model()
 
+    # Даємо моделі 2048 токенів, щоб роздуми reasoning не з'їдали текст
     payload = {
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Оформи цей текст як якісний структурований пост для Telegram:\n\n{clean_input}"}
+            {"role": "user", "content": f"Оформи цей текст як стильний пост для Telegram:\n\n{clean_input}"}
         ],
         "temperature": 0.2,
-        "max_tokens": 600
+        "max_tokens": 2048
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        resp = requests.post(url, headers=headers, json=payload, timeout=25)
         if resp.status_code != 200:
-            logger.warning(f"Groq API Error {resp.status_code} on model {model_name}: {resp.text[:120]}")
-            if resp.status_code == 404:
-                payload["model"] = "openai/gpt-oss-120b"
-                resp = requests.post(url, headers=headers, json=payload, timeout=20)
-            if resp.status_code != 200:
-                return clean_input if is_admin_forward else None
+            logger.warning(f"Groq API Error {resp.status_code}: {resp.text[:120]}")
+            return clean_input if is_admin_forward else None
 
         raw_out = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
@@ -284,7 +285,6 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     if is_malformed_ai_output(raw_out):
         return clean_input if is_admin_forward else None
 
-    # Примусове правильне оформлення заголовка
     lines = [l.strip() for l in raw_out.split('\n') if l.strip()]
     if lines:
         first_line = lines[0]
@@ -300,8 +300,6 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
     out = out.replace("<blockquote>", "").replace("</blockquote>", "")
-
-    # Очищення від суржику та русизмів
     out = clean_surzhyk_and_russian(out)
 
     return out
@@ -585,7 +583,21 @@ def scrape_channel(channel_name):
 
     messages = []
     blocks = re.findall(r'(<div class="tgme_widget_message\b.*?)(?=<div class="tgme_widget_message\b|$)', html_content, re.DOTALL)
+    now_utc = datetime.now(timezone.utc)
+
     for block in blocks:
+        # ФІЛЬТР ДАТИ: ігноруємо старі закрепи з 2024 року
+        time_match = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', block)
+        if time_match:
+            try:
+                dt_str = time_match.group(1).replace('Z', '+00:00')
+                p_dt = datetime.fromisoformat(dt_str)
+                # Якщо новина старша за 24 години — відкидаємо
+                if (now_utc - p_dt) > timedelta(hours=24):
+                    continue
+            except Exception:
+                pass
+
         post_match = re.search(r'data-post=["\']([^"\']+)["\']', block)
         if not post_match:
             continue
@@ -602,7 +614,7 @@ def scrape_channel(channel_name):
         if text_match:
             raw_text = text_match.group(1)
             raw_text = re.sub(r'<br\s*/?>', '\n', raw_text)
-            # ВИПРАВЛЕНО: зберігаємо текст посилань, знімаємо лише HTML тег (більше не ріже на слові "новоріч")
+            # Зберігаємо текст посилань без HTML тегів
             raw_text = re.sub(r'<a\b[^>]*>(.*?)</a>', r'\1', raw_text)
             raw_text = re.sub(r'<[^>]+>', '', raw_text)
             raw_text = html.unescape(raw_text).strip()
