@@ -25,11 +25,17 @@ WEBHOOK_SECRET = hashlib.md5((TELEGRAM_BOT_TOKEN + "safe_secret").encode()).hexd
 WEBHOOK_PATH = f"/tg-webhook-{WEBHOOK_SECRET}"
 
 DONOR_CHANNELS = [
-    "insiderUKR", "truexanewsua", "u_now", "nefedoov365", "lachentyt",
-    "voynareal", "RBC_ua_news", "suspilnenews", "uniannet", "ukrpravda_news",
-    "babel", "hromadske_ua", "nvua_official", "tsnua", "znua_live",
-    "gruntmedia", "operativnoZSU", "Tsaplienko", "DeepStateUA", "kpszsu",
-    "supernova_plus", "exilenova_plus", "mysiagin"
+    "insiderUKR", "u_now", "lachentyt", "RBC_ua_news", 
+    "suspilnenews", "uniannet", "ukrpravda_news", "babel",
+    "tsnua", "znua_live", "gruntmedia", 
+    "operativnoZSU", "DeepStateUA", "kpszsu", "mysiagin"
+]
+
+# Фільтр тільки для комерційного піару, казино та ставок
+AD_KEYWORDS = [
+    "метінвест", "ахметов", "favbet", "фавбет", "cosmolot", 
+    "космолот", "слоти", "казино", "ставки", "промокод", "знижк", "розпродаж", 
+    "найкращі роботодавці для жінок", "партнерський матеріал", "фонд ріната", "мікропозик"
 ]
 
 STATE_FILE = "bot_state.json"
@@ -129,19 +135,25 @@ def append_channel_signature(text):
         return ""
     channel_user = TELEGRAM_CHANNEL_ID.lstrip('@')
     signature = f'\n\n👉 <a href="https://t.me/{channel_user}">NEWS УКРАЇНА 365 | Підписатися</a>'
+    
+    # Максимальний ліміт опису Telegram - 1024 символи
     max_text_len = 1015 - len(signature)
     if len(clean_text) > max_text_len:
-        clean_text = clean_text[:max_text_len].rsplit(' ', 1)[0] + '...'
+        sub = clean_text[:max_text_len]
+        last_punct = max(sub.rfind('.'), sub.rfind('!'), sub.rfind('?'))
+        if last_punct > 150:
+            clean_text = sub[:last_punct + 1]
+        else:
+            clean_text = sub.rsplit(' ', 1)[0] + '...'
+            
     return clean_text + signature
 
 def get_working_groq_model():
-    """Динамічно визначає актуальну модель для вашого Groq API ключа"""
     fallback_models = [
         "llama-3.3-70b-versatile",
         "openai/gpt-oss-20b",
         "openai/gpt-oss-120b",
-        "llama3-70b-8192",
-        "llama3-8b-8192"
+        "llama3-70b-8192"
     ]
     if not GROQ_API_KEY:
         return fallback_models[0]
@@ -165,8 +177,14 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
         return clean_input if is_admin_forward else None
 
     lower_raw = clean_input.lower()
+    
+    # Фільтрація комерційного спаму та багатосторінкових дайджестів
     if not is_admin_forward:
-        if any(d in lower_raw for d in ["важливе за день", "головне за день", "підсумки дня", "дайджест", "хвилина мовчання"]):
+        if any(ad in lower_raw for ad in AD_KEYWORDS):
+            logger.info(f"Відхилено рекламу/джинсу: {clean_input[:50]}")
+            return "SKIP"
+
+        if any(d in lower_raw for d in ["важливе за день", "головне за день", "підсумки дня", "вечірній дайджест", "хвилина мовчання"]):
             return "SKIP"
 
     context_str = "\n".join([f"{i}. {h}" for i, h in enumerate(recent_headlines[:12], 1)]) if recent_headlines else ""
@@ -174,15 +192,16 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
     system_prompt = (
         "ТИ — ГОЛОВНИЙ РЕДАКТОР УКРАЇНСЬКОГО ТЕЛЕГРАМ-КАНАЛУ «NEWS УКРАЇНА 365» (@kropivnit).\n\n"
         f"ОСТАННІ ОПУБЛІКОВАНІ ТЕМИ:\n{context_str}\n\n"
-        "ПРОФЕСІЙНІ РЕДАКТОРСЬКІ ПРАВИЛА:\n"
-        "1. ЧИСТА УКРАЇНСЬКА МОВА: Російський текст обов'язково перекласти літературною українською мовою. Жодного російського слова!\n"
-        "2. БЕЗ ТЕХНІЧНИХ КОПІРАЙТІВ ФОТО: Не пиши в кінці «Фото: Facebook / Reuters». Лишай тільки сам текст новини!\n"
-        "3. СТАТУС ТРАМПА: Дональд Трамп є Президентом США (НЕ «екс-президент»!).\n\n"
+        "СУВОРІ СТАНДАРТИ ТА РОЗРАХУНОК ЛІМІТУ TELEGRAM:\n"
+        "1. РОЗРАХУНОК ЛІМІТУ (КРИТИЧНО): Твій текст разом із заголовком ОБОВ'ЯЗКОВО повинен мати обсяг від 450 до 850 символів (до 100 слів)! Це суворий ліміт Telegram підпису під фото. Не роби простирадло тексту, але збережи всі ключові факти.\n"
+        "2. ЗБЕРЕЖЕННЯ СЕНСУ ТА МІСТА: Обов'язково вказуй конкретне МІСТО чи область, де сталася подія! Збережи суть: що сталося, де, наслідки, цифри.\n"
+        "3. БЕЗ ПОВТОРІВ ТА ВОДИ: Не дублюй однакові фрази та не пиши по три рази однакові цитати.\n"
+        "4. ЗАКІНЧЕНІСТЬ: Усі речення повинні бути повними, останнє речення ОБОВ'ЯЗКОВО закінчується крапкою.\n"
+        "5. СТАТУС ТРАМПА: Дональд Трамп є Президентом США.\n\n"
         "ФОРМАТ ПОСТА:\n"
-        "⚡ <b>Короткий влучний заголовок</b>\n\n"
-        "1-2 фактичні абзаци. Ключові дані виділяй <b>жирним</b>.\n"
-        "Цитати: «Текст», — <b>Прізвище</b>.\n\n"
-        "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ АБО СЛОВО SKIP."
+        "⚡ <b>Влучний заголовок із назвою міста або ключової події</b>\n\n"
+        "1-2 ємні фактичні абзаци. Ключові цифри та імена виділяй <b>жирним</b>.\n\n"
+        "ВІДПОВІДЬ: ТІЛЬКИ ГОТОВИЙ ПОСТ БЕЗ ВСТУПНИХ СЛІВ АБО СЛОВО SKIP."
     )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -193,19 +212,18 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Оформи новину для каналу:\n\n{clean_input}"}
+            {"role": "user", "content": f"Стисни та адаптуй текст під ліміт Telegram (до 800 символів), зберігши всі факти та місто:\n\n{clean_input}"}
         ],
         "temperature": 0.2,
-        "max_tokens": 700
+        "max_tokens": 650
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=18)
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
         if resp.status_code != 200:
-            logger.warning(f"Groq API Error {resp.status_code} on model {model_name}: {resp.text[:120]}")
             if resp.status_code == 404:
                 payload["model"] = "llama-3.3-70b-versatile"
-                resp = requests.post(url, headers=headers, json=payload, timeout=18)
+                resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code != 200:
                 return clean_input if is_admin_forward else None
 
@@ -220,6 +238,21 @@ def rewrite_news_for_channel(text, is_admin_forward=False, recent_headlines=[]):
 
     if is_malformed_ai_output(raw_out):
         return clean_input if is_admin_forward else None
+
+    # Примусове правильне оформлення заголовка
+    lines = [l.strip() for l in raw_out.split('\n') if l.strip()]
+    if lines:
+        first_line = lines[0]
+        first_line = re.sub(r'^[⚡\s]+', '', first_line)
+        first_line = re.sub(r'</?b>', '', first_line)
+        lines[0] = f"⚡ <b>{first_line}</b>"
+        raw_out = "\n\n".join(lines)
+
+    # Примусова перевірка на крапку в кінці
+    if not raw_out.endswith((".", "!", "?", "»", "</b>", "</i>")):
+        last_dot = max(raw_out.rfind("."), raw_out.rfind("!"), raw_out.rfind("?"))
+        if last_dot > 40:
+            raw_out = raw_out[:last_dot + 1]
 
     out = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', raw_out)
     out = re.sub(r'__([\s\S]*?)__', r'<i>\1</i>', out)
@@ -730,11 +763,11 @@ def main_loop():
                         continue
 
                     new_candidates += 1
-                    logger.info(f"Знайдено нову новину в @{channel}: {raw_text[:50]}...")
+                    logger.info(f"Знайдено новину в @{channel}: {raw_text[:50]}...")
 
                     rewritten = rewrite_news_for_channel(raw_text, is_admin_forward=False, recent_headlines=recent_headlines)
                     if not rewritten or rewritten == "SKIP":
-                        logger.info(f"Пропущено AI або збій: {raw_text[:40]}")
+                        logger.info(f"Пропущено (реклама / дайджест / збій): {raw_text[:40]}")
                         app_state["posted_hashes"].append(item_hash)
                         save_state(app_state)
                         continue
@@ -758,7 +791,7 @@ def main_loop():
                         save_state(app_state)
                         time.sleep(15)
 
-            logger.info(f"Коло завершено. Нових кандидатів опрацьовано: {new_candidates}. Пауза 60 сек...")
+            logger.info(f"Коло завершено. Опрацьовано новинок: {new_candidates}. Пауза 60 сек...")
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
