@@ -25,39 +25,63 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
-# ПАУЗА ТА ЛІМІТИ (стосуються ТІЛЬКИ звичайних новин!):
-# Для звичайних новин: пауза 3 хвилини (180 с), щоб не спамити стрічку
+# ПАУЗА ТА ЛІМІТИ (стосуються ТІЛЬКИ звичайних новин зі скрапера!):
 REGULAR_COOLDOWN = int(os.getenv("REGULAR_COOLDOWN", "180"))
-# Ліміт на годину для звичайних новин (термінові виходять БЕЗ лімітів!)
 MAX_REGULAR_PER_HOUR = int(os.getenv("MAX_REGULAR_PER_HOUR", "8"))
 
+# ПОВНИЙ СПИСОК КАНАЛІВ-ДОНОРІВ (24 БАЗОВІ + 10 ДОДАНИХ ВАМИ):
 DEFAULT_DONORS = [
-    "insiderUKR",
-    "voynareal",
-    "u_now",
-    "uniannet",
-    "RBC_ua_news",
-    "oko_ukr",
-    "suspilnenews",
-    "truexanewsua",
-    "babel"
+    # Загальнонаціональні оперативні медіа та офіційні структури:
+    "insiderUKR",            # Інсайдер UA
+    "voynareal",             # Реальна Війна
+    "u_now",                 # Україна Зараз
+    "uniannet",              # УНІАН
+    "RBC_ua_news",           # РБК-Україна
+    "oko_ua",                # Всевидящее ОКО: Україна | Політика
+    "suspilnenews",          # Суспільне Новини
+    "truexanewsua",          # Труха Україна
+    "babel",                 # Бабель
+    "lachentyt",             # Лачен пише
+    "Tsaplienko",            # Андрій Цаплієнко
+    "operativnoZSU",         # Оперативно ЗСУ
+    "kpszsu",                # Повітряні Сили ЗСУ
+    "DeepStateUA",           # DeepState
+    "novynylive",            # Новини.LIVE
+    "hromadske_ua",          # Громадське
+    "radiosvoboda",          # Радіо Свобода
+    "censor_net",            # Цензор.НЕТ
+    "espresotv",             # Еспресо
+    "focus_ua",              # Фокус
+    "znua_live",             # Дзеркало тижня (ZN.UA)
+    "interfaxua",            # Інтерфакс-Україна
+    "ukrpravda_news",        # Українська правда
+    "liganet",               # ЛІГА.net
+
+    # Канали, додані користувачем:
+    "exilenova_plus",        # Exilenova+ (фільтруємо дрібниці та не-новини)
+    "UaOnlii",               # Україна Online: Новини | Політика
+    "ukrinform_1",           # UKR INFORM 🇺🇦 Новини Україна
+    "zsuwar",                # Збройні Сили України. Війна з окупантами
+    "radnyknews",            # Радник
+    "insider_zsy",           # Інсайдер ЗСУ
+    "inslandd",              # INVASION (очищаємо від сарказму / меми пропускаємо)
+    "nefedovv365",           # 365.nefed
+    "xameleon_ua",           # ✙ Хамелеон
+    "chp_zahid"              # ЧП Захід | НОВИНИ 24/7
 ]
 
 DONOR_CHANNELS = [ch.strip().replace("@", "") for ch in os.getenv("DONOR_CHANNELS", "").split(",") if ch.strip()] or DEFAULT_DONORS
 
 SEEN_POSTS_FILE = "seen_posts.txt"
-MAX_SEEN_POSTS = 2000
+MAX_SEEN_POSTS = 3000
 
 recent_regular_post_timestamps = []
+global_published_titles = []
 
 # ---------------------------------------------------------
 # ЗЧИТУВАННЯ ВЛАСНОГО КАНАЛУ (ЗАХИСТ ПРИ ПЕРЕЗАПУСКУ НА RENDER)
 # ---------------------------------------------------------
 def fetch_own_channel_history(channel_username: str) -> list:
-    """
-    Зчитує останні пости з самого каналу @kropivnit, щоб після рестарту на Render
-    бот ТОЧНО знав, які теми вже є в каналі, і передавав їх у Groq для уникнення дублів.
-    """
     ch = channel_username.replace("@", "").strip()
     url = f"https://t.me/s/{ch}"
     headers = {
@@ -76,7 +100,7 @@ def fetch_own_channel_history(channel_username: str) -> list:
             logger.info(f"Завантажено {len(history)} останніх заголовків із каналу @{ch}")
     except Exception as e:
         logger.warning(f"Не вдалося зчитати історію @{ch}: {e}")
-    return history[-25:]
+    return history[-30:]
 
 # ---------------------------------------------------------
 # ВИЗНАЧЕННЯ ТЕРМІНОВОСТІ (ЕКСКЛЮЗИВ / МЕГА ВАЖЛИВЕ)
@@ -212,40 +236,43 @@ SYSTEM_PROMPT = """Ти — професійний редактор провід
    - Якщо текст є самопіаром персони, бізнесмена чи політика, промо-кампанією приватного закладу чи фонду (наприклад: промо-кампанії Ківалова, реклама курсів, товарів чи казино) — відповідай ТІЛЬКИ ОДНИМ СЛОВОМ: SKIP
    - Офіційні новини держави (рішення Кабміну, ВР, президента, державні реформи та загальнонаціональні виплати/стипендії) — це НЕ джинса, це повноцінні новини, їх ПУБЛІКУВАТИ!
 
-3. ЖОДНОЇ ВОДИ, ПАФОСУ ТА ПОВЧАНЬ:
+3. ФІЛЬТРАЦІЯ МЕМІВ, САРКАЗМУ ТА НЕ-НОВИН (ДЛЯ КАНАЛІВ EXILENOVA+ ТА INVASION):
+   - Якщо вхідний пост — це чистий сарказм, глузування, жарт, мем, суб'єктивні матюки/емоції автора без чіткого факту новини, або побутовий непотрібний флуд — відповідай ТІЛЬКИ ОДНИМ СЛОВОМ: SKIP
+   - Якщо в пості є реальний важливий факт (наприклад: ураження ворожого об'єкта чи НПЗ, заява, вибух), але автор подав його з їдким сарказмом чи сленгом — ПОВНІСТЮ ОЧИСТИ його від сарказму, емоцій та лайки і перепиши як суху, серйозну інформативну новину.
+
+4. ЖОДНОЇ ВОДИ, ПАФОСУ ТА ПОВЧАНЬ:
    - КАТЕГОРИЧНО ЗАБОРОНЕНО писати штучні пафосні висновки: «Це свідчить про те, що...», «Це черговий доказ нашої сили...», «Так тримати!», «Це вкотре доводить...», «Ворог продовжує...».
    - Тільки сухі перевірені факти, без особистих емоцій чи моралізаторства.
 
-4. ЖОДНИХ ПІДРУЧНИКОВИХ ПОЯСНЕНЬ ТА «ВІКІПЕДІЇ»:
+5. ЖОДНИХ ПІДРУЧНИКОВИХ ПОЯСНЕНЬ ТА «ВІКІПЕДІЇ»:
    - Заборонено писати банальні технічні пояснення на зразок: «Використання реактивних двигунів дозволяє розвивати більшу швидкість...». Новини не повинні бути лекціями!
 
-5. ПРОПОРЦІЙНІСТЬ ОБСЯГУ:
+6. ПРОПОРЦІЙНІСТЬ ОБСЯГУ:
    - Якщо вхідний текст короткий (1-2 речення, коротка цитата) — твій пост має бути ТАКИМ ЖЕ КОРОТКИМ:
      **Жирний заголовок**
      
      «Текст цитати або короткої новини», — спікер / джерело.
    - Якщо новина велика — стисни її до 1–2 лаконічних інформативних абзаців.
 
-6. ФАКТИЧНА ТОЧНІСТЬ:
+7. ФАКТИЧНА ТОЧНІСТЬ:
    - Не вигадуй назв зброї чи моделей техніки. Не приписуй подію іншим силам, якщо в першоджерелі цього немає.
 
-7. ФОРМАТУВАННЯ:
+8. ФОРМАТУВАННЯ:
    - Рядок 1: інформативний жирний заголовок (**Заголовок новини**).
    - Порожній рядок.
    - Тіло новини: 1–2 лаконічні абзаци з ключовими словами, виділеними **жирним** (міста, прізвища, важливі цифри). Без підписів і хештегів.
 
-8. МОВА:
+9. МОВА:
    - Тільки чиста українська мова без суржику та русизмів.
-
-Якщо текст є спамом, непотрібним побутовим дріб'язком або рекламою — відповідай: SKIP.
 """
 
 def get_best_groq_model() -> str:
-    candidate_models = [
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.8-27b",
-        "meta-llama/llama-3.3-70b-instruct",
-        "llama-3.3-70b-versatile"
+    candidates = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+        "mixtral-8x7b-32768",
+        "llama-3.1-8b-instant"
     ]
     try:
         resp = requests.get(
@@ -255,7 +282,7 @@ def get_best_groq_model() -> str:
         )
         if resp.status_code == 200:
             available_ids = [m["id"] for m in resp.json().get("data", [])]
-            for cand in candidate_models:
+            for cand in candidates:
                 if cand in available_ids:
                     return cand
             for m_id in available_ids:
@@ -263,7 +290,7 @@ def get_best_groq_model() -> str:
                     return m_id
     except Exception as e:
         logger.warning(f"Помилка запиту моделей Groq: {e}")
-    return "openai/gpt-oss-120b"
+    return "llama-3.3-70b-versatile"
 
 def rewrite_news(raw_text: str, published_titles: list) -> str:
     if not GROQ_API_KEY:
@@ -281,8 +308,8 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 {raw_text}
 
 Якщо ця новина описує ТУ САМУ ПОДІЮ, що вже є в списку вище — напиши тільки DUPLICATE.
-Якщо це прихований піар особи/закладу чи реклама — напиши SKIP.
-Якщо це окрема, інша подія або важлива новина — перепиши якісно згідно з правилами."""
+Якщо це прихований піар, реклама, саркастичний мем, матюки чи пост без реальної новини — напиши SKIP.
+Якщо це окрема, інша подія або важлива новина — перепиши якісно згідно з правилами (повністю очистивши від сарказму та емоцій)."""
 
     payload = {
         "model": model,
@@ -318,7 +345,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
             return ""
 
         if content.upper() == "SKIP" or "SKIP" in content[:10]:
-            logger.info("Groq відхилив новину як піар/рекламу/дрібниці (SKIP)")
+            logger.info("Groq відхилив новину як піар/рекламу/мем/дрібниці (SKIP)")
             return ""
 
         content = clean_ai_fluff(content)
@@ -328,6 +355,45 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     except Exception as e:
         logger.error(f"Виняток під час виклику Groq: {e}")
         return ""
+
+def rewrite_news_for_admin(raw_text: str) -> str:
+    if not GROQ_API_KEY:
+        return raw_text
+
+    model = get_best_groq_model()
+    prompt = f"""Ти — професійний редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365" (@kropivnit).
+Користувач (адміністратор каналу) особисто надіслав новину для публікації.
+Твоє завдання — переписати її чистою літературною українською мовою у сухому телеграмному стилі:
+- Перший рядок: **Жирний інформативний заголовок**
+- Порожній рядок
+- Тіло новини: 1–2 лаконічні інформативні абзаци без води, без пафосу, без вигадок, без суржику.
+- Не додавай підпис каналу, хештеги чи посилання.
+
+Ось новина від адміністратора:
+{raw_text}"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 2048
+            },
+            timeout=25
+        )
+        if resp.status_code == 200:
+            res_json = resp.json()
+            content = res_json["choices"][0]["message"]["content"].strip()
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+            content = clean_ai_fluff(content)
+            content = clean_surzhyk_and_russian(content)
+            return content
+    except Exception as e:
+        logger.error(f"Помилка Groq для адмін-поста: {e}")
+    return raw_text
 
 # ---------------------------------------------------------
 # ПАРСИНГ ТЕЛЕГРАМ-КАНАЛІВ
@@ -360,7 +426,6 @@ def scrape_channel(channel: str, seen_set: set) -> list:
         now = datetime.datetime.now(datetime.timezone.utc)
         results = []
 
-        # Беремо тільки найсвіжіші 5 постів каналу
         for chunk in message_chunks[-5:]:
             id_match = re.search(r'data-post="([^"]+)"', chunk)
             if not id_match:
@@ -532,18 +597,133 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) ->
         return False
 
 # ---------------------------------------------------------
+# ОБРОБКА ПОВІДОМЛЕНЬ ВІД КОРИСТУВАЧА (В ПРИВАТНІ ПОВІДОМЛЕННЯ)
+# ---------------------------------------------------------
+def handle_incoming_update(update: dict):
+    msg = update.get("message")
+    if not msg:
+        return
+
+    chat_id = msg.get("chat", {}).get("id")
+    raw_text = msg.get("text") or msg.get("caption") or ""
+
+    if not raw_text and msg.get("forward_from_chat"):
+        raw_text = msg.get("caption") or msg.get("text") or ""
+
+    photo = msg.get("photo")
+    video = msg.get("video")
+
+    photo_url = None
+    video_url = None
+
+    base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    file_base = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
+
+    if photo:
+        try:
+            best_photo = photo[-1]
+            file_id = best_photo["file_id"]
+            res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+            if res.get("ok"):
+                photo_url = f"{file_base}/{res['result']['file_path']}"
+        except Exception as e:
+            logger.error(f"Помилка отримання фото від користувача: {e}")
+
+    if video:
+        try:
+            file_id = video["file_id"]
+            res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+            if res.get("ok"):
+                video_url = f"{file_base}/{res['result']['file_path']}"
+        except Exception as e:
+            logger.error(f"Помилка отримання відео від користувача: {e}")
+
+    if not raw_text and not photo_url and not video_url:
+        return
+
+    if raw_text.strip() == "/start":
+        if chat_id:
+            requests.post(f"{base_api}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "👋 Привіт! Надішли мені новину (текст, фото або відео з описом), і я відредагую її та опублікую в каналі NEWS УКРАЇНА 365."
+            })
+        return
+
+    logger.info(f"Отримано новину від користувача (chat_id: {chat_id}): {raw_text[:50]}...")
+
+    if chat_id:
+        requests.post(f"{base_api}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": "⏳ Обробляю новину та готую публікацію..."
+        })
+
+    rewritten = rewrite_news_for_admin(raw_text)
+    if not rewritten:
+        rewritten = raw_text
+
+    success = post_to_telegram(
+        text=rewritten,
+        photo_url=photo_url,
+        video_url=video_url
+    )
+
+    if success:
+        first_line = rewritten.split('\n')[0].replace('*', '').strip()
+        global_published_titles.append(first_line)
+        if len(global_published_titles) > 30:
+            global_published_titles.pop(0)
+
+        if chat_id:
+            requests.post(f"{base_api}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"✅ <b>Новину опубліковано в каналі!</b>\n\n<b>Заголовок:</b> {first_line}",
+                "parse_mode": "HTML"
+            })
+        logger.info(f"Новину від користувача опубліковано: {first_line}")
+    else:
+        if chat_id:
+            requests.post(f"{base_api}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "❌ Помилка під час публікації. Перевірте статус бота."
+            })
+
+# ---------------------------------------------------------
+# TELEGRAM POLLING LOOP (ЯКЩО ВЕБХУК НЕ НАЛАШТОВАНО)
+# ---------------------------------------------------------
+def telegram_polling_loop():
+    logger.info("Запуск Telegram Polling для прийому ручних новин...")
+    offset = 0
+    base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    while True:
+        try:
+            resp = requests.get(f"{base_api}/getUpdates?offset={offset}&timeout=20", timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        threading.Thread(target=handle_incoming_update, args=(update,), daemon=True).start()
+            elif resp.status_code == 409:
+                time.sleep(60)
+            else:
+                time.sleep(5)
+        except Exception:
+            time.sleep(5)
+
+# ---------------------------------------------------------
 # ГОЛОВНИЙ ЦИКЛ БОТА ІЗ РОЗУМНИМ КОНТРОЛЕМ
 # ---------------------------------------------------------
 def bot_worker_loop():
+    global global_published_titles
     logger.info("Запуск бота...")
     seen_set = set()
     last_regular_post_time = 0
 
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
-    published_titles = fetch_own_channel_history(TELEGRAM_CHANNEL_ID)
+    global_published_titles = fetch_own_channel_history(TELEGRAM_CHANNEL_ID)
 
     # 2. ЗАХИСТ ВІД СТАРТОВОЇ ЛАВИНИ:
-    logger.info("Ініціалізація донорів: фіксуємо старий беклог, щоб не спамити...")
+    logger.info(f"Ініціалізація {len(DONOR_CHANNELS)} донорів: фіксуємо старий беклог, щоб не спамити...")
     for ch in DONOR_CHANNELS:
         try:
             url = f"https://t.me/s/{ch}"
@@ -554,15 +734,29 @@ def bot_worker_loop():
                     seen_set.add(pid)
         except Exception:
             pass
-        time.sleep(0.8)
+        time.sleep(0.4)
     logger.info(f"Ініціалізацію завершено. Зафіксовано {len(seen_set)} існуючих постів. Бот чекає свіжих новин!")
+
+    # 3. Реєстрація вебхука або запуск polling для прийому новин від адміна в ПП
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
+        try:
+            w_res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_url}", timeout=10)
+            logger.info(f"Встановлення Webhook на {webhook_url}: {w_res.text}")
+        except Exception as e:
+            logger.error(f"Помилка setWebhook: {e}")
+    else:
+        try:
+            requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
+        except Exception:
+            pass
+        threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
     while True:
         try:
             now = time.time()
 
             recent_regular_post_timestamps[:] = [t for t in recent_regular_post_timestamps if now - t < 3600]
-
             regular_limit_reached = len(recent_regular_post_timestamps) >= MAX_REGULAR_PER_HOUR
             posted_in_this_cycle = False
 
@@ -578,7 +772,7 @@ def bot_worker_loop():
                     is_breaking = is_breaking_news(raw_text)
 
                     # --- ЛОГІКА РОЗПОДІЛУ ТЕМПУ ---
-                    # Якщо новина МЕГА ВАЖЛИВА (термінова) -> ЛІМІТИ НЕ ДІЮТЬ! Вона публікується ОДРАЗУ!
+                    # Якщо новина МЕГА ВАЖЛИВА (термінова) -> ЛІМІТИ НЕ ДІЮТЬ! Публікується ОДРАЗУ!
                     # Якщо новина ЗВИЧАЙНА -> діє пауза 3 хвилини і годинний ліміт
                     if not is_breaking:
                         if posted_in_this_cycle:
@@ -592,14 +786,13 @@ def bot_worker_loop():
                         if time_since_last < REGULAR_COOLDOWN:
                             continue
 
-                    # Семантична перевірка на повтор через Groq
+                    # Семантична перевірка на повтор та фільтрація через Groq
                     logger.info(f"Обробка поста {post_id} (Терміново: {is_breaking})...")
-                    rewritten = rewrite_news(raw_text, published_titles)
+                    rewritten = rewrite_news(raw_text, global_published_titles)
 
                     if not rewritten:
                         continue
 
-                    # Публікація в канал
                     success = post_to_telegram(
                         text=rewritten,
                         photo_url=item.get("photo_url"),
@@ -609,9 +802,9 @@ def bot_worker_loop():
                     if success:
                         current_t = time.time()
                         first_line = rewritten.split('\n')[0].replace('*', '').strip()
-                        published_titles.append(first_line)
-                        if len(published_titles) > 30:
-                            published_titles.pop(0)
+                        global_published_titles.append(first_line)
+                        if len(global_published_titles) > 30:
+                            global_published_titles.pop(0)
 
                         if is_breaking:
                             logger.info(f"🚨 МЕГА ВАЖЛИВА НОВИНА ОПУБЛІКОВАНА НЕГАЙНО: {first_line}")
@@ -622,17 +815,17 @@ def bot_worker_loop():
                             logger.info(f"📰 Звичайна новина опублікована: {first_line}. Пауза 3 хв.")
                             break
 
-                time.sleep(1.5)
+                time.sleep(0.8)
 
             # Пауза між колами перевірки каналів
-            time.sleep(40)
+            time.sleep(25)
 
         except Exception as e:
             logger.error(f"Помилка в головному циклі: {e}", exc_info=True)
-            time.sleep(25)
+            time.sleep(20)
 
 # ---------------------------------------------------------
-# ВЕБ-СЕРВЕР ДЛЯ RENDER ТА KEEP-ALIVE
+# ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH CHECK ТА WEBHOOK ДЛЯ ПОВІДОМЛЕНЬ)
 # ---------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -642,16 +835,30 @@ class HealthHandler(BaseHTTPRequestHandler):
         response = json.dumps({
             "status": "healthy",
             "service": "NEWS УКРАЇНА 365 Bot",
+            "donor_channels_count": len(DONOR_CHANNELS),
             "regular_posts_last_hour": len(recent_regular_post_timestamps)
         })
         self.wfile.write(response.encode("utf-8"))
+
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+        try:
+            update = json.loads(post_data.decode("utf-8"))
+            threading.Thread(target=handle_incoming_update, args=(update,), daemon=True).start()
+        except Exception as e:
+            logger.error(f"Помилка обробки вебхука від користувача: {e}")
 
     def log_message(self, format, *args):
         pass
 
 def start_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health check сервер слухає порт {PORT}")
+    logger.info(f"Health check та Webhook сервер слухає порт {PORT}")
     server.serve_forever()
 
 def keep_alive_pinger():
