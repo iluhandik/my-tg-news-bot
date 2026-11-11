@@ -324,10 +324,11 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
 
 ЗАЛІЗНІ ПРАВИЛА РЕДАКЦІЇ:
 
-1. ЗМІСТ ТА ЛОГІКА (НЕ СПОТВОРЮВАТИ ФАКТИ ТА РОЛІ):
-   - Уважно вчитуйся в суть події! Не плутай, хто що робив (наприклад, якщо люди намагалися відбити чоловіка у ТЦК — так і пиши, що люди відбивали його, а не «били його лопатою»).
-   - Не вживай безглуздих механічних фраз (жодних «бій за ноги»). Пиши як професійний український журналіст.
-   - Не вигадуй факти, яких немає (час доби на кшталт «о 10:23», неіснуючих загиблих). Якщо подія коротка — пиши чітко й по суті, без вигадок.
+1. СУВОРА ФАКТИЧНІСТЬ ТА ЛОГІКА (ЖОДНИХ ВИГАДОК!):
+   - Пиши ВИКЛЮЧНО за фактами, які є у вихідному тексті!
+   - КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати час (напр. «22:15»), пожежі, рятувальників, медиків, евакуацію, кількість жертв/постраждалих чи заяви ЗСУ, якщо цього НЕМАЄ в оригіналі!
+   - Якщо вихідна новина коротка (1–2 речення) — твій пост ТЕЖ має бути коротким (заголовок + 1 коротке речення). НІКОЛИ не роздувай коротке повідомлення!
+   - Уважно читай ролі учасників: не плутай, хто що робив, і не вживай абсурдних фраз.
 
 2. ЗАГОЛОВОК (ОБОВ'ЯЗКОВО В **ЖИРНОМУ** З ЕМОДЗІ):
    - Перший рядок — ЗАВЖДИ жирний заголовок з емодзі: **🤯 Скандал із ТЦК у Нововолинську: місцеві з лопатами відбивали чоловіка**
@@ -396,6 +397,45 @@ def is_ai_refusal(text: str) -> bool:
             return True
     return False
 
+def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
+    """
+    Програмна перевірка на вигадані нейромережею факти:
+    1) Вигаданий час (HH:MM), якого не було в оригіналі.
+    2) Штучне роздування короткого повідомлення у довгу статтю.
+    3) Вигадані жертви, пожежники, евакуація чи спростування, яких не було в оригіналі.
+    """
+    src_l = source_text.lower()
+    out_l = output_text.lower()
+
+    # 1. Перевірка часу (HH:MM)
+    out_times = set(re.findall(r"\b\d{1,2}:\d{2}\b", out_l))
+    src_times = set(re.findall(r"\b\d{1,2}:\d{2}\b", src_l))
+    if out_times - src_times:
+        logger.warning(f"Галюцинація часу! Вигадано: {out_times - src_times}")
+        return True
+
+    # 2. Перевірка штучного роздування короткого тексту
+    if len(source_text.strip()) < 160 and len(output_text.strip()) > max(260, len(source_text.strip()) * 2.5 + 80):
+        logger.warning(f"Штучне роздування короткої новини ({len(source_text)} -> {len(output_text)} символів)")
+        return True
+
+    # 3. Перевірка вигаданих трагічних/екстрених подробиць (укр + рос)
+    sensitive_groups = [
+        (["евакуац", "эвакуац"], ["евакуац", "эвакуац"]),
+        (["пожежник", "пожарн", "рятувальн", "спасател"], ["пожежник", "пожарн", "рятувальн", "спасател", "дснс", "гсчс"]),
+        (["медичн", "медик", "швидка", "скорая"], ["медичн", "медик", "швидк", "скорая", "лікар", "врач"]),
+        (["загибл", "погиб", "жертв", "смерт"], ["загибл", "загинул", "погиб", "жертв", "смерт", "труп", "200"]),
+        (["постраждал", "поранен", "пострадав", "ранен", "травм"], ["постраждал", "поранен", "пострадав", "ранен", "травм", "ушкодж"]),
+        (["заперечил", "спростувал", "опроверг"], ["заперечил", "спростувал", "опроверг", "фейк"]),
+        (["запалені будівл", "районному сектору"], ["будівл", "здани", "дом", "сектор"]),
+    ]
+    for out_markers, src_markers in sensitive_groups:
+        if any(m in out_l for m in out_markers) and not any(m in src_l for m in src_markers):
+            logger.warning(f"Галюцинація фактів! Знайдено {out_markers}, яких немає в оригіналі.")
+            return True
+
+    return False
+
 model_cooldowns = {}
 
 def _parse_retry_after_seconds(err_text: str) -> int:
@@ -423,7 +463,6 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
     for model_name in models_to_try:
         is_primary = (model_name == PRIMARY_GROQ_MODEL)
 
-        # Перевірка 429 кулдауну
         if now < model_cooldowns.get(model_name, 0):
             wait_left = int(model_cooldowns[model_name] - now)
             if is_primary:
@@ -475,8 +514,15 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
 
 def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
+    is_short = len(cleaned_input) < 160
 
     recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-30:]]) if published_titles else "(ще немає публікацій)"
+
+    length_instruction = (
+        "- Це КОРОТКЕ повідомлення! Напиши ТІЛЬКИ заголовок + 1 коротке речення (або лише заголовок), суто за фактом оригіналу. НЕ роздувай текст і НЕ додавай жодних вигаданих подробиць!"
+        if is_short else
+        "- Тіло: 1–2 грамотні стислі абзаци з виділенням **жирним** ключових слів, суто за фактами оригіналу."
+    )
 
     user_prompt = f"""СПИСОК ОСТАННІХ ОПУБЛІКОВАНИХ НОВИН:
 {recent_titles_str}
@@ -489,10 +535,10 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 2. Якщо це ДАЙДЖЕСТ (підсумок дня/вечора, перелік кількох подій) — напиши SKIP.
 3. Якщо це ПОВІТРЯНА ТРИВОГА, загроза балістики/ракет/шахедів, радарне стеження чи попередження про небезпеку БЕЗ фактів реальних влучань, вибухів чи руйнувань — напиши тільки SKIP.
 4. Якщо це прихований піар, реклама чи пустий саркастичний мем — напиши SKIP.
-5. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ ДИНАМІЧНИЙ РЕРАЙТ:
-   - Рядок 1: **Емодзі + чіткий інформативний заголовок** (джерело вказуй ТІЛЬКИ якщо це Reuters/Генштаб/чиновник; для відео з соцмереж жодних приписок типу «- ТЦК» не став!).
-   - Тіло: 1–2 грамотні динамічні абзаци з обов'язковим виділенням **жирним** ключових слів.
-   - Зберігай точний зміст події: не перекручуй, хто кого бив або захищав! Жодних абсурдних фраз типу «бій за ноги».
+5. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ СУТО ЗА ФАКТАМИ ОРИГІНАЛУ:
+   - Рядок 1: **Емодзі + чіткий інформативний заголовок** (джерело вказуй ТІЛЬКИ якщо це Reuters/Генштаб/чиновник; для відео/повідомлень із соцмереж жодних приписок не став!).
+   {length_instruction}
+   - КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати час (22:15 тощо), постраждалих, пожежі, евакуацію чи заяви ЗСУ, якщо їх немає в оригіналі!
    - Без матюків, без канцеляризмів та без згадок чужих каналів («УС», «Труха» тощо)."""
 
     messages = [
@@ -500,7 +546,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
         {"role": "user", "content": user_prompt}
     ]
 
-    content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
+    content = call_groq_with_fallback(messages, temperature=0.35, max_tokens=2048)
     if not content or is_ai_refusal(content):
         logger.warning("Groq не повернув валідного рерайту або видав відмову. Пропуск.")
         return ""
@@ -516,12 +562,32 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     content = clean_ai_fluff(content)
     content = clean_surzhyk_and_russian(content)
     content = strip_donor_artifacts(content)
+
+    # Перевірка на галюцинації: якщо модель щось довигадала — робимо 1 сувору спробу з temperature=0.1
+    if has_hallucinated_facts(cleaned_input, content):
+        strict_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"ПЕРЕКЛАДИ ТА ОФОРМИ ЦЕЙ ТЕКСТ СУВОРО ПО ФАКТАХ, НІЧОГО НЕ ДОДАВАЙ ВІД СЕБЕ (ЖОДНОГО ЧАСУ, ЖЕРТВ, ПОЖЕЖ ЧИ ЕВАКУАЦІЇ):\n\n{cleaned_input}"}
+        ]
+        retry_content = call_groq_with_fallback(strict_messages, temperature=0.1, max_tokens=1024)
+        if not retry_content or is_ai_refusal(retry_content) or has_hallucinated_facts(cleaned_input, retry_content):
+            logger.warning("Повторна спроба також містила домисли. Пропускаємо пост, щоб не публікувати фейк.")
+            return ""
+        content = strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content)))
+
     return content
 
 def rewrite_news_for_admin(raw_text: str) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     if not GROQ_API_KEY:
         return cleaned_input
+
+    is_short = len(cleaned_input) < 160
+    length_instruction = (
+        "- Це КОРОТКЕ повідомлення! Напиши ТІЛЬКИ заголовок + 1 коротке речення (або лише заголовок) суто за фактом. КАТЕГОРИЧНО ЗАБОРОНЕНО роздувати текст чи вигадувати деталі!"
+        if is_short else
+        "- Тіло: 1–2 стислі динамічні абзаци суто по суті з **жирним виділенням** ключових слів."
+    )
 
     user_prompt = f"""ТЕРМІНОВЕ ПОВІДОМЛЕННЯ ДЛЯ ПУБЛІКАЦІЇ В КАНАЛ:
 {cleaned_input}
@@ -530,20 +596,29 @@ def rewrite_news_for_admin(raw_text: str) -> str:
 Зроби ГОТОВИЙ Telegram-пост (ніяких балачок, питань чи вступних слів!):
 - Рядок 1: **Емодзі + чіткий заголовок**
 - Порожній рядок
-- Тіло: 1–2 стислі динамічні абзаци по суті з **жирним виділенням** ключових слів.
-- Без Вікіпедії, без «води» про занепокоєння і без слова «конфлікт».
-- Якщо це коротка новина/блискавка — зроби короткий оперативний пост."""
+{length_instruction}
+- КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати час (напр. 22:15), постраждалих, пожежників, евакуацію чи заяви ЗСУ, яких немає в оригіналі!
+- Без Вікіпедії, без «води» про занепокоєння і без слова «конфлікт»."""
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt}
     ]
-    content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
-    if not content or is_ai_refusal(content):
-        logger.warning("Groq повернув пустий текст або відмову/балачки. Оформлюємо оригінал.")
-        first_line = cleaned_input.split('\n')[0].strip()
-        body = '\n'.join(cleaned_input.split('\n')[1:]).strip()
-        return f"**⚡️ {first_line}**\n\n{body}" if body else f"**⚡️ {first_line}**"
+    content = call_groq_with_fallback(messages, temperature=0.35, max_tokens=2048)
+
+    if not content or is_ai_refusal(content) or has_hallucinated_facts(cleaned_input, content):
+        strict_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"ПЕРЕКЛАДИ УКРАЇНСЬКОЮ ТА ОФОРМИ ПО ФАКТАХ ОРИГІНАЛУ, НІЧОГО НЕ ВИГАДУЙ І НЕ ДОДАВАЙ ВІД СЕБЕ:\n\n{cleaned_input}"}
+        ]
+        retry_content = call_groq_with_fallback(strict_messages, temperature=0.1, max_tokens=1024)
+        if retry_content and not is_ai_refusal(retry_content) and not has_hallucinated_facts(cleaned_input, retry_content):
+            content = retry_content
+        else:
+            logger.warning("Модель вигадала факти або відмовилась. Оформлюємо чистий оригінал без домислів.")
+            first_line = cleaned_input.split('\n')[0].strip()
+            body = '\n'.join(cleaned_input.split('\n')[1:]).strip()
+            return f"**⚡️ {first_line}**\n\n{body}" if body else f"**⚡️ {first_line}**"
 
     content = clean_ai_fluff(content)
     content = clean_surzhyk_and_russian(content)
