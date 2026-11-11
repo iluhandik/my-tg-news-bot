@@ -157,10 +157,6 @@ def is_digest_post(text: str) -> bool:
     return False
 
 def is_air_tracking_alert(text: str) -> bool:
-    """
-    Суворо відсікаємо радарні повідомлення про рух цілей,
-    якщо немає ПІДТВЕРДЖЕНИХ руйнувань, жертв або влучань.
-    """
     t = text.lower()
 
     impact_markers = [
@@ -309,43 +305,89 @@ SYSTEM_PROMPT = """Ти — провідний редактор українсь
 Тетяна Бережна заявила, що Кремль намагається промацати «червоні лінії» на світових майданчиках. Якщо світ допустить агресора до виставки в Белграді, це свідчитиме про звикання до війни.
 """
 
-def get_best_groq_model() -> str:
-    candidates = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "llama3-70b-8192",
-        "mixtral-8x7b-32768",
-        "llama-3.1-8b-instant"
-    ]
-    try:
-        resp = requests.get(
-            "https://api.groq.com/openai/v1/models",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            timeout=8
-        )
-        if resp.status_code == 200:
-            available_ids = [m["id"] for m in resp.json().get("data", [])]
-            for cand in candidates:
-                if cand in available_ids:
-                    return cand
-            for m_id in available_ids:
-                if "70b" in m_id or "120b" in m_id or "27b" in m_id:
-                    return m_id
-    except Exception as e:
-        logger.warning(f"Помилка запиту моделей Groq: {e}")
-    return "llama-3.3-70b-versatile"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip()
 
-def rewrite_news(raw_text: str, published_titles: list) -> str:
-    cleaned_input = strip_donor_artifacts(raw_text)
+# Пріоритетні моделі: спочатку потужні GPT-OSS та Qwen, а інші — лише як крайній резерв
+PREFERRED_GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "llama-3.3-70b-versatile",
+]
+
+if GROQ_MODEL and GROQ_MODEL not in PREFERRED_GROQ_MODELS:
+    PREFERRED_GROQ_MODELS.insert(0, GROQ_MODEL)
+
+# Тимчасовий кулдаун лише для конкретної моделі, яка повернула 429 (щоб не спамити в логи)
+model_cooldowns = {}
+
+def _parse_retry_after_seconds(err_text: str) -> int:
+    m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", err_text, re.IGNORECASE)
+    if m:
+        mins = int(m.group(1) or 0)
+        secs = float(m.group(2) or 0)
+        return max(30, min(int(mins * 60 + secs), 3600))
+    return 120
+
+def call_groq_with_fallback(messages: list, temperature: float = 0.4, max_tokens: int = 2048) -> str:
     if not GROQ_API_KEY:
         logger.error("GROQ_API_KEY не задано!")
         return ""
 
-    model = get_best_groq_model()
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-20:]]) if published_titles else "(ще немає опублікованих новин)"
+    now = time.time()
+    for model_name in PREFERRED_GROQ_MODELS:
+        if now < model_cooldowns.get(model_name, 0):
+            continue
 
-    user_prompt = f"""СПИСОК ОСТАННІХ ОПУБЛІКОВАНИХ НОВИН У КАНАЛІ:
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=25
+            )
+            if resp.status_code == 200:
+                res_json = resp.json()
+                content = res_json["choices"][0]["message"]["content"].strip()
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                return content.strip()
+            elif resp.status_code == 429:
+                wait_sec = _parse_retry_after_seconds(resp.text)
+                model_cooldowns[model_name] = time.time() + wait_sec
+                logger.warning(f"Модель {model_name} досягла ліміту (429), пауза для неї {wait_sec}с. Перемикаюсь на іншу...")
+                continue
+            elif resp.status_code in (400, 404):
+                model_cooldowns[model_name] = time.time() + 3600
+                logger.warning(f"Модель {model_name} недоступна ({resp.status_code}): {resp.text[:200]}")
+                continue
+            else:
+                logger.error(f"Помилка Groq {model_name} ({resp.status_code}): {resp.text[:300]}")
+                continue
+        except Exception as e:
+            logger.error(f"Виняток Groq {model_name}: {e}")
+            continue
+
+    logger.error("Усі моделі Groq тимчасово вичерпали ліміт.")
+    return ""
+
+def rewrite_news(raw_text: str, published_titles: list) -> str:
+    cleaned_input = strip_donor_artifacts(raw_text)
+
+    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-30:]]) if published_titles else "(ще немає публікацій)"
+
+    user_prompt = f"""СПИСОК ОСТАННІХ ОПУБЛІКОВАНИХ НОВИН:
 {recent_titles_str}
 
 НОВА НОВИНА ДЛЯ ОБРОБКИ:
@@ -355,63 +397,38 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 1. Якщо це ТА САМА подія, що вже була у списку — напиши тільки DUPLICATE.
 2. Якщо це ДАЙДЖЕСТ (підсумок дня/вечора, перелік кількох подій) — напиши SKIP.
 3. Якщо це прихований піар, реклама чи пустий саркастичний мем — напиши SKIP.
-4. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ ЗА ЗРАЗКОМ:
+4. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ СВОЇМИ СЛОВАМИ:
    - Перший рядок: **Емодзі + Заголовок**, — джерело
    - Тіло: 1–2 динамічні абзаци з обов'язковим виділенням **жирним** ключових цифр, дат та прізвищ.
    - Без канцеляризмів та без згадок чужих каналів («УС», «Труха» тощо)."""
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.4,
-        "max_tokens": 2048
-    }
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt}
+    ]
 
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=25
-        )
-        if resp.status_code != 200:
-            logger.error(f"Помилка Groq API ({resp.status_code}): {resp.text}")
-            return ""
-
-        res_json = resp.json()
-        content = res_json["choices"][0]["message"]["content"].strip()
-
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-
-        if "DUPLICATE" in content.upper()[:15]:
-            logger.info("Groq визначив новину як семантичний повтор (DUPLICATE)")
-            return ""
-
-        if content.upper() == "SKIP" or "SKIP" in content[:10]:
-            logger.info("Groq відхилив новину як дайджест/піар/рекламу/мем/дрібниці (SKIP)")
-            return ""
-
-        content = clean_ai_fluff(content)
-        content = clean_surzhyk_and_russian(content)
-        content = strip_donor_artifacts(content)
-
-        return content
-    except Exception as e:
-        logger.error(f"Виняток під час виклику Groq: {e}")
+    content = call_groq_with_fallback(messages, temperature=0.4, max_tokens=2048)
+    if not content:
         return ""
+
+    if "DUPLICATE" in content.upper()[:15]:
+        logger.info("Groq визначив новину як семантичний повтор (DUPLICATE)")
+        return ""
+
+    if content.upper() == "SKIP" or "SKIP" in content[:10]:
+        logger.info("Groq відхилив новину як дайджест/піар/рекламу/мем/дрібниці (SKIP)")
+        return ""
+
+    content = clean_ai_fluff(content)
+    content = clean_surzhyk_and_russian(content)
+    content = strip_donor_artifacts(content)
+    return content
 
 def rewrite_news_for_admin(raw_text: str) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     if not GROQ_API_KEY:
         return cleaned_input
 
-    model = get_best_groq_model()
     prompt = f"""Ти — редактор провідного українського Telegram-каналу "NEWS УКРАЇНА 365" (@kropivnit).
 Користувач надіслав новину для публікації.
 ЗРОБИ СТИЛЬНИЙ ДИНАМІЧНИЙ РЕРАЙТ ЗА ПРАВИЛАМИ КАНАЛУ:
@@ -424,29 +441,15 @@ def rewrite_news_for_admin(raw_text: str) -> str:
 Ось вихідний текст:
 {cleaned_input}"""
 
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.45,
-                "max_tokens": 2048
-            },
-            timeout=25
-        )
-        if resp.status_code == 200:
-            res_json = resp.json()
-            content = res_json["choices"][0]["message"]["content"].strip()
-            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-            content = clean_ai_fluff(content)
-            content = clean_surzhyk_and_russian(content)
-            content = strip_donor_artifacts(content)
-            return content
-    except Exception as e:
-        logger.error(f"Помилка Groq для адмін-поста: {e}")
-    return cleaned_input
+    messages = [{"role": "user", "content": prompt}]
+    content = call_groq_with_fallback(messages, temperature=0.45, max_tokens=2048)
+    if not content:
+        return cleaned_input
+
+    content = clean_ai_fluff(content)
+    content = clean_surzhyk_and_russian(content)
+    content = strip_donor_artifacts(content)
+    return content
 
 def clean_html_text(raw_html: str) -> str:
     text = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
@@ -553,7 +556,6 @@ def markdown_to_telegram_html(text: str) -> str:
     header = parts[0].strip()
     body = parts[1].strip() if len(parts) > 1 else ""
 
-    # Завжди робимо заголовок жирним, якщо він ще не обгорнутий
     if not (header.startswith("**") and header.endswith("**")) and not (header.startswith("<b>") and header.endswith("</b>")):
         m = re.match(r"^([‼️❗️⚡️🚨🔴👉⏩➡️▶️🇪🇺🇺🇦🇷🇺🇺🇸🇬🇧\s]+)(.*)$", header)
         if m and m.group(2).strip():
@@ -646,7 +648,7 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) ->
         except Exception as e:
             logger.error(f"Помилка фото: {e}")
 
-    # 3. Текст (вимикаємо прев'ю посилань, щоб не було великої плашки каналу знизу)
+    # 3. Текст
     try:
         full_text = formatted_text + signature
         res = requests.post(
@@ -707,11 +709,10 @@ def handle_incoming_update(update: dict):
 
     if video:
         try:
-            file_id = video["video"]["file_id"] if isinstance(video, dict) and "video" in video else (video.get("file_id") if isinstance(video, dict) else None)
-            if file_id:
-                res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
-                if res.get("ok"):
-                    video_url = f"{file_base}/{res['result']['file_path']}"
+            file_id = video["file_id"]
+            res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+            if res.get("ok"):
+                video_url = f"{file_base}/{res['result']['file_path']}"
         except Exception as e:
             logger.error(f"Помилка отримання відео від користувача: {e}")
 
@@ -848,9 +849,6 @@ def bot_worker_loop():
 
                     is_breaking = is_breaking_news(raw_text)
 
-                    # --- ЛОГІКА РОЗПОДІЛУ ТЕМПУ ---
-                    # Якщо новина МЕГА ВАЖЛИВА (термінова) -> ЛІМІТИ НЕ ДІЮТЬ! Публікується ОДРАЗУ!
-                    # Якщо новина ЗВИЧАЙНА -> діє пауза 3 хвилини і годинний ліміт
                     if not is_breaking:
                         if posted_in_this_cycle:
                             continue
@@ -863,7 +861,6 @@ def bot_worker_loop():
                         if time_since_last < REGULAR_COOLDOWN:
                             continue
 
-                    # Семантична перевірка на повтор та фільтрація через Groq
                     logger.info(f"Обробка поста {post_id} (Терміново: {is_breaking})...")
                     rewritten = rewrite_news(raw_text, global_published_titles)
 
@@ -894,7 +891,6 @@ def bot_worker_loop():
 
                 time.sleep(0.8)
 
-            # Пауза між колами перевірки каналів
             time.sleep(25)
 
         except Exception as e:
