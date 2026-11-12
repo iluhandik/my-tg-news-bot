@@ -476,9 +476,9 @@ PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "
 
 # Резервні моделі — вмикаються ТІЛЬКИ якщо основна модель не пропустила новину (429 або цензура)
 BACKUP_GROQ_MODELS = [
-    "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
     "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
     "qwen/qwen3-32b",
     "llama-3.1-8b-instant",
 ]
@@ -516,6 +516,39 @@ def is_ai_refusal(text: str) -> bool:
     if len(t) < 80 and not (t.startswith("**") or t.startswith("<b>")):
         if any(w in t_lower for w in ["sorry", "cannot", "can't", "unable", "help with that", "language model"]):
             return True
+    return False
+
+
+def is_corrupted_output(text: str) -> bool:
+    """
+    Виявляє збої генерації нейромережі: витік системних тегів (<parameter>, <tool_call>),
+    зациклення однакових рядків або уривчастий зламаний текст.
+    """
+    if not text or not text.strip():
+        return True
+    t_lower = text.lower()
+
+    leak_markers = [
+        "<parameter", "</parameter", "<tool_call", "</tool_call",
+        "<function", "</function", "<think>", "</think>",
+        "<|", "|>", "[inst]", "[/inst]", "</s>"
+    ]
+    if any(m in t_lower for m in leak_markers):
+        return True
+
+    # Перевірка на масове зациклення однакових рядків
+    non_empty_lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(non_empty_lines) >= 4:
+        counts = {}
+        for l in non_empty_lines:
+            counts[l] = counts.get(l, 0) + 1
+            if counts[l] >= 3:
+                return True
+
+    # Перевірка на висячі 1-літерні рядки (напр. обірване 'T')
+    if any(len(l) == 1 and l.isalpha() for l in non_empty_lines[1:]):
+        return True
+
     return False
 
 
@@ -628,6 +661,9 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
                 content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
                 if is_ai_refusal(content):
                     logger.warning(f"Модель {model_name} видала safety refusal: {content[:100]}. Для цієї новини перемикаюсь на резервну...")
+                    continue
+                if is_corrupted_output(content):
+                    logger.warning(f"Модель {model_name} видала зламаний текст/теги (<parameter> тощо). Перемикаюсь на наступну модель...")
                     continue
 
                 if not is_primary:
