@@ -81,7 +81,7 @@ global_published_titles = []
 # ---------------------------------------------------------
 # ЗЧИТУВАННЯ ВЛАСНОГО КАНАЛУ (ЗАХИСТ ПРИ ПЕРЕЗАПУСКУ НА RENDER)
 # ---------------------------------------------------------
-def fetch_own_channel_history(channel_username: str, pages: int = 3) -> tuple:
+def fetch_own_channel_history(channel_username: str, pages: int = 8) -> tuple:
     ch = channel_username.replace("@", "").strip()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
@@ -146,7 +146,7 @@ def fetch_own_channel_history(channel_username: str, pages: int = 3) -> tuple:
     except Exception as e:
         logger.warning(f"Не вдалося зчитати історію @{ch}: {e}")
 
-    return titles[-50:], full_posts[-80:]
+    return titles[-50:], full_posts[-200:]
 
 # ---------------------------------------------------------
 # ВИЗНАЧЕННЯ ТЕРМІНОВОСТІ (ЕКСКЛЮЗИВ / МЕГА ВАЖЛИВЕ)
@@ -892,7 +892,7 @@ def clean_html_text(raw_html: str) -> str:
     return text.strip()
 
 PUBLISHED_HISTORY_FILE = "published_history.json"
-MAX_PUBLISHED_HISTORY = 120
+MAX_PUBLISHED_HISTORY = 250
 
 STOP_WORDS = {
     'про', 'що', 'для', 'але', 'або', 'який', 'яка', 'яке', 'які', 'його',
@@ -965,7 +965,14 @@ def extract_keywords_stemmed(text: str) -> set:
             stems.add(st)
     return stems
 
-def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.35) -> bool:
+GENERIC_NEWS_STEMS = {
+    'украин', 'україн', 'роси', 'росі', 'сша', 'трамп', 'путин', 'путін',
+    'зеленськ', 'войн', 'військ', 'президент', 'министр', 'міністр', 'официальн',
+    'офіційн', 'заяв', 'повідом', 'сообщ', 'власт', 'влад', 'країн', 'стран',
+    'област', 'міст', 'город', 'люд', 'після', 'біл', 'щод', 'час', 'року'
+}
+
+def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.33) -> bool:
     new_kw = extract_keywords_stemmed(new_text)
     if len(new_kw) < 3:
         return False
@@ -977,8 +984,9 @@ def is_duplicate_news(new_text: str, published_history: list, threshold: float =
         common = new_kw & old_kw
         smaller_len = min(len(new_kw), len(old_kw))
         score = len(common) / smaller_len if smaller_len > 0 else 0
-        if score >= threshold:
-            logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, спільні корені: {common}")
+        rare_common = {w for w in common if len(w) >= 5 and w not in GENERIC_NEWS_STEMS}
+        if score >= threshold or len(rare_common) >= 3:
+            logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, рідкісні спільні корені: {rare_common or common}")
             return True
     return False
 
@@ -1468,7 +1476,7 @@ def bot_worker_loop():
     last_regular_post_time = 0
 
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
-    global_published_titles, own_full_posts = fetch_own_channel_history(TELEGRAM_CHANNEL_ID, pages=3)
+    global_published_titles, own_full_posts = fetch_own_channel_history(TELEGRAM_CHANNEL_ID, pages=8)
     published_history = load_published_history()
     # Синхронізуємо історію каналу (разом із текстом постів для точного пошуку дублікатів)
     for full_p in own_full_posts:
