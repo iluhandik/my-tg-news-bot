@@ -322,6 +322,40 @@ def clean_ai_fluff(text: str) -> str:
         cleaned = re.sub(p, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
     return cleaned.strip()
 
+def remove_redundant_body(text: str) -> str:
+    """
+    Якщо тіло поста просто дублює заголовок іншими словами (не додає нових фактів),
+    прибираємо зайве повторення і залишаємо лише чіткий заголовок.
+    """
+    parts = text.strip().split("\n", 1)
+    if len(parts) < 2:
+        return text.strip()
+
+    header = parts[0].strip()
+    body = parts[1].strip()
+    if not body:
+        return header
+
+    ignore = {'що', 'заявив', 'заявила', 'заявили', 'повідомив', 'повідомила', 'розповів', 'наголосив', 'підкреслив', 'додав', 'між', 'для', 'про'}
+
+    def content_words(s: str) -> set:
+        s_clean = re.sub(r"\*+", "", s.lower())
+        return {w for w in re.findall(r"[а-яіїєґa-z0-9]{3,}", s_clean) if w not in ignore}
+
+    h_words = content_words(header)
+    b_words = content_words(body)
+    if not h_words or not b_words:
+        return text.strip()
+
+    overlap = len(h_words & b_words) / max(1, min(len(h_words), len(b_words)))
+    new_words_in_body = len(b_words - h_words)
+
+    if overlap >= 0.72 and new_words_in_body <= 2:
+        logger.info("Прибрано дублювання заголовка в абзаці (нових фактів немає)")
+        return header
+
+    return text.strip()
+
 # ---------------------------------------------------------
 # GROQ API: СУЧАСНИЙ ДИНАМІЧНИЙ ТЕЛЕГРАМ-СТИЛЬ
 # ---------------------------------------------------------
@@ -366,7 +400,6 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
 
 PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 
-# Резервні моделі — вмикаються ТІЛЬКИ якщо основна модель не пропустила новину (429 або цензура)
 BACKUP_GROQ_MODELS = [
     "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
@@ -605,7 +638,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-30:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
-        "- Це КОРОТКЕ повідомлення! Напиши ТІЛЬКИ заголовок + 1 коротке речення (або лише заголовок), суто за фактом оригіналу. НЕ роздувай текст і НЕ додавай жодних вигаданих подробиць!"
+        "- Це КОРОТКЕ повідомлення! Якщо в тексті лише одна цитата чи один факт — напиши ТІЛЬКИ 1 рядок (сам заголовок) БЕЗ абзацу, щоб не повторювати заголовок двічі! Абзац пиши лише якщо є окремі нові деталі."
         if is_short else
         "- Тіло: 1–2 грамотні стислі абзаци з виділенням **жирним** ключових слів, суто за фактами оригіналу."
     )
@@ -650,6 +683,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     if has_russian_text(content):
         content = translate_to_ukrainian(content)
     content = strip_donor_artifacts(content)
+    content = remove_redundant_body(content)
 
     if has_hallucinated_facts(cleaned_input, content):
         strict_messages = [
@@ -660,7 +694,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
         if not retry_content or is_ai_refusal(retry_content) or has_hallucinated_facts(cleaned_input, retry_content):
             logger.warning("Повторна спроба також містила домисли. Пропускаємо пост, щоб не публікувати фейк.")
             return ""
-        content = strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content)))
+        content = remove_redundant_body(strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content))))
 
     return content
 
@@ -671,7 +705,7 @@ def rewrite_news_for_admin(raw_text: str) -> str:
 
     is_short = len(cleaned_input) < 160
     length_instruction = (
-        "- Це КОРОТКЕ повідомлення! Напиши ТІЛЬКИ заголовок + 1 коротке речення (або лише заголовок) суто за фактом. КАТЕГОРИЧНО ЗАБОРОНЕНО роздувати текст чи вигадувати деталі!"
+        "- Це КОРОТКЕ повідомлення! Якщо це одна цитата чи один факт — напиши ТІЛЬКИ заголовок БЕЗ другого абзацу! НЕ повторюй заголовок у тексті нижче!"
         if is_short else
         "- Тіло: 1–2 стислі динамічні абзаци суто по суті з **жирним виділенням** ключових слів."
     )
@@ -710,6 +744,7 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     if has_russian_text(content):
         content = translate_to_ukrainian(content)
     content = strip_donor_artifacts(content)
+    content = remove_redundant_body(content)
     return content
 
 def clean_html_text(raw_html: str) -> str:
