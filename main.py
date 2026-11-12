@@ -371,6 +371,8 @@ BACKUP_GROQ_MODELS = [
     "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
     "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
 ]
 
 AI_REFUSAL_PATTERNS = [
@@ -528,9 +530,16 @@ def has_russian_text(text: str) -> bool:
     ru_markers = [
         r"\bв киеве\b", r"\bв харькове\b", r"\bв одессе\b", r"\bв днепре\b",
         r"\bпопадание\b", r"\bместные сми\b", r"\bсообщают\b", r"\bв результате\b",
-        r"\bпроизошел\b", r"\bпроизошла\b", r"\bсейчас\b", r"\bтакже\b", r"\bоднако\b"
+        r"\bпроизошел\b", r"\bпроизошла\b", r"\bсейчас\b", r"\bтакже\b", r"\bоднако\b",
+        r"\bмид\b", r"\bсша\b", r"\bрасскажет\b", r"\bзаявил\b", r"\bпозицию\b"
     ]
-    return any(re.search(p, t) for p in ru_markers)
+    if any(re.search(p, t) for p in ru_markers):
+        return True
+    cyrillic_count = len(re.findall(r"[а-яА-ЯёЁ]", t))
+    has_ukr_letters = any(ch in t for ch in ["і", "ї", "є", "ґ"])
+    if cyrillic_count > 25 and not has_ukr_letters:
+        return True
+    return False
 
 def translate_to_ukrainian(text: str) -> str:
     if not GROQ_API_KEY or not text.strip():
@@ -550,6 +559,7 @@ def translate_to_ukrainian(text: str) -> str:
 def format_fallback_post(text: str) -> str:
     if has_russian_text(text):
         text = translate_to_ukrainian(text)
+    text = clean_surzhyk_and_russian(text)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if not lines:
         return ""
@@ -991,6 +1001,136 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) ->
         logger.error(f"Виняток sendMessage: {e}")
         return False
 
+def post_media_group_to_telegram(text: str, media_items: list) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID or not media_items:
+        return False
+
+    signature = '\n\n👉 <a href="https://t.me/kropivnit">NEWS УКРАЇНА 365 | Підписатися</a>'
+    if text and text.strip():
+        formatted_text = markdown_to_telegram_html(text)
+        caption = formatted_text + signature
+        if len(caption) > 1020:
+            max_body_len = 1020 - len(signature)
+            formatted_text = formatted_text[:max_body_len].rstrip()
+            caption = formatted_text + signature
+    else:
+        caption = '👉 <a href="https://t.me/kropivnit">NEWS УКРАЇНА 365 | Підписатися</a>'
+
+    base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    all_ok = True
+    for start in range(0, len(media_items), 10):
+        batch = media_items[start:start + 10]
+        media_payload = []
+        for idx, item in enumerate(batch):
+            entry = {
+                "type": item["type"],
+                "media": item["file_id"]
+            }
+            if start == 0 and idx == 0:
+                entry["caption"] = caption
+                entry["parse_mode"] = "HTML"
+            media_payload.append(entry)
+
+        try:
+            res = requests.post(
+                f"{base_api}/sendMediaGroup",
+                json={
+                    "chat_id": TELEGRAM_CHANNEL_ID,
+                    "media": media_payload
+                },
+                timeout=30
+            )
+            if res.status_code == 200:
+                logger.info(f"Альбом із {len(batch)} медіафайлів успішно опубліковано")
+            else:
+                logger.error(f"sendMediaGroup помилка: {res.text}")
+                all_ok = False
+        except Exception as e:
+            logger.error(f"Виняток sendMediaGroup: {e}")
+            all_ok = False
+
+    return all_ok
+
+media_group_buffer = {}
+media_group_lock = threading.Lock()
+
+def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = None, video_url: str = None, media_items: list = None):
+    base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    if chat_id:
+        requests.post(f"{base_api}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": "⏳ Обробляю новину та готую публікацію..."
+        })
+
+    rewritten = ""
+    if raw_text and raw_text.strip():
+        rewritten = rewrite_news_for_admin(raw_text)
+        if not rewritten:
+            rewritten = strip_donor_artifacts(raw_text)
+
+    if media_items and len(media_items) > 1:
+        success = post_media_group_to_telegram(text=rewritten, media_items=media_items)
+    else:
+        success = post_to_telegram(
+            text=rewritten,
+            photo_url=photo_url,
+            video_url=video_url
+        )
+
+    if success:
+        first_line = rewritten.split('\n')[0].replace('*', '').strip() if rewritten else "(медіа без тексту)"
+        if rewritten:
+            global_published_titles.append(first_line)
+            h = load_published_history()
+            h.append({
+                "headline": first_line,
+                "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
+                "timestamp": time.time()
+            })
+            save_published_history(h)
+            if len(global_published_titles) > 30:
+                global_published_titles.pop(0)
+
+        if chat_id:
+            requests.post(f"{base_api}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"✅ <b>Новину опубліковано в каналі!</b>\n\n<b>Заголовок:</b> {first_line}",
+                "parse_mode": "HTML"
+            })
+        logger.info(f"Новину від користувача опубліковано: {first_line}")
+    else:
+        if chat_id:
+            requests.post(f"{base_api}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "❌ Помилка під час публікації. Перевірте статус бота."
+            })
+
+def _flush_media_group(media_group_id: str):
+    time.sleep(2.2)
+    with media_group_lock:
+        group = media_group_buffer.pop(media_group_id, None)
+    if not group:
+        return
+
+    chat_id = group["chat_id"]
+    items = group["items"]
+    texts = [t for t in group["texts"] if t.strip()]
+    combined_text = "\n\n".join(texts).strip()
+
+    first_photo = next((i.get("photo_url") for i in items if i["type"] == "photo"), None)
+    first_video = next((i.get("video_url") for i in items if i["type"] == "video"), None)
+
+    logger.info(f"Зібрано альбом {media_group_id}: {len(items)} медіа, текст: {len(combined_text)} символів")
+    _process_and_publish_admin_post(
+        chat_id=chat_id,
+        raw_text=combined_text,
+        photo_url=first_photo,
+        video_url=first_video,
+        media_items=items
+    )
+
 # ---------------------------------------------------------
 # ОБРОБКА ПОВІДОМЛЕНЬ ВІД КОРИСТУВАЧА (В ПРИВАТНІ ПОВІДОМЛЕННЯ)
 # ---------------------------------------------------------
@@ -1007,88 +1147,75 @@ def handle_incoming_update(update: dict):
 
     photo = msg.get("photo")
     video = msg.get("video")
+    media_group_id = msg.get("media_group_id")
 
     photo_url = None
     video_url = None
+    media_item = None
 
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     file_base = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 
     if photo:
-        try:
-            best_photo = photo[-1]
-            file_id = best_photo["file_id"]
-            res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
-            if res.get("ok"):
-                photo_url = f"{file_base}/{res['result']['file_path']}"
-        except Exception as e:
-            logger.error(f"Помилка отримання фото від користувача: {e}")
+        file_id = photo[-1]["file_id"]
+        media_item = {"type": "photo", "file_id": file_id}
+        if not media_group_id:
+            try:
+                res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+                if res.get("ok"):
+                    photo_url = f"{file_base}/{res['result']['file_path']}"
+                    media_item["photo_url"] = photo_url
+            except Exception as e:
+                logger.error(f"Помилка отримання фото від користувача: {e}")
 
     if video:
-        try:
-            file_id = video["file_id"]
-            res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
-            if res.get("ok"):
-                video_url = f"{file_base}/{res['result']['file_path']}"
-        except Exception as e:
-            logger.error(f"Помилка отримання відео від користувача: {e}")
+        file_id = video["file_id"]
+        media_item = {"type": "video", "file_id": file_id}
+        if not media_group_id:
+            try:
+                res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+                if res.get("ok"):
+                    video_url = f"{file_base}/{res['result']['file_path']}"
+                    media_item["video_url"] = video_url
+            except Exception as e:
+                logger.error(f"Помилка отримання відео від користувача: {e}")
 
-    if not raw_text and not photo_url and not video_url:
+    if not raw_text and not media_item:
         return
 
     if raw_text.strip() == "/start":
         if chat_id:
             requests.post(f"{base_api}/sendMessage", json={
                 "chat_id": chat_id,
-                "text": "👋 Привіт! Надішли мені новину (текст, фото або відео з описом), і я відредагую її та опублікую в каналі NEWS УКРАЇНА 365."
+                "text": "👋 Привіт! Надішли мені новину (текст, фото, відео або альбом), і я відредагую її та опублікую в каналі NEWS УКРАЇНА 365."
             })
         return
 
+    if media_group_id and media_item:
+        is_first = False
+        with media_group_lock:
+            if media_group_id not in media_group_buffer:
+                media_group_buffer[media_group_id] = {
+                    "chat_id": chat_id,
+                    "items": [],
+                    "texts": []
+                }
+                is_first = True
+            media_group_buffer[media_group_id]["items"].append(media_item)
+            if raw_text.strip():
+                media_group_buffer[media_group_id]["texts"].append(raw_text.strip())
+
+        if is_first:
+            threading.Thread(target=_flush_media_group, args=(media_group_id,), daemon=True).start()
+        return
+
     logger.info(f"Отримано новину від користувача (chat_id: {chat_id}): {raw_text[:50]}...")
-
-    if chat_id:
-        requests.post(f"{base_api}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": "⏳ Обробляю новину та готую публікацію..."
-        })
-
-    rewritten = rewrite_news_for_admin(raw_text)
-    if not rewritten:
-        rewritten = strip_donor_artifacts(raw_text)
-
-    success = post_to_telegram(
-        text=rewritten,
+    _process_and_publish_admin_post(
+        chat_id=chat_id,
+        raw_text=raw_text,
         photo_url=photo_url,
         video_url=video_url
     )
-
-    if success:
-        first_line = rewritten.split('\n')[0].replace('*', '').strip()
-        global_published_titles.append(first_line)
-        if len(global_published_titles) > 30:
-            global_published_titles.pop(0)
-
-        h = load_published_history()
-        h.append({
-            "headline": first_line,
-            "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
-            "timestamp": time.time()
-        })
-        save_published_history(h)
-
-        if chat_id:
-            requests.post(f"{base_api}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": f"✅ <b>Новину опубліковано в каналі!</b>\n\n<b>Заголовок:</b> {first_line}",
-                "parse_mode": "HTML"
-            })
-        logger.info(f"Новину від користувача опубліковано: {first_line}")
-    else:
-        if chat_id:
-            requests.post(f"{base_api}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "❌ Помилка під час публікації. Перевірте статус бота."
-            })
 
 # ---------------------------------------------------------
 # TELEGRAM POLLING LOOP (ЯКЩО ВЕБХУК НЕ НАЛАШТОВАНО)
@@ -1125,7 +1252,6 @@ def bot_worker_loop():
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
     global_published_titles = fetch_own_channel_history(TELEGRAM_CHANNEL_ID)
     published_history = load_published_history()
-    # Синхронізуємо історію каналу
     for t in global_published_titles:
         st = extract_keywords_stemmed(t)
         if st and not any(h.get("headline") == t for h in published_history):
