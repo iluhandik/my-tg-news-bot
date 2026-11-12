@@ -541,19 +541,48 @@ def has_russian_text(text: str) -> bool:
         return True
     return False
 
+def _google_translate_ru_to_uk(text: str) -> str:
+    try:
+        resp = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": "ru",
+                "tl": "uk",
+                "dt": "t",
+                "q": text
+            },
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                translated = "".join(part[0] for part in data[0] if part and part[0])
+                if translated.strip():
+                    return translated.strip()
+    except Exception as e:
+        logger.warning(f"Помилка резервного перекладу Google Translate: {e}")
+    return ""
+
 def translate_to_ukrainian(text: str) -> str:
-    if not GROQ_API_KEY or not text.strip():
+    if not text.strip():
         return text
-    messages = [
-        {
-            "role": "system",
-            "content": "Ти — перекладач. Переклади текст чистою українською мовою. Повертай ТІЛЬКИ перекладений текст, без коментарів, без пояснень і без додавання нових фактів."
-        },
-        {"role": "user", "content": text}
-    ]
-    translated = call_groq_with_fallback(messages, temperature=0.1, max_tokens=1024)
-    if translated and not is_ai_refusal(translated):
-        return strip_donor_artifacts(clean_surzhyk_and_russian(translated))
+    if GROQ_API_KEY:
+        messages = [
+            {
+                "role": "system",
+                "content": "Ти — перекладач. Переклади текст чистою українською мовою. Повертай ТІЛЬКИ перекладений текст, без коментарів, без пояснень і без додавання нових фактів."
+            },
+            {"role": "user", "content": text}
+        ]
+        translated = call_groq_with_fallback(messages, temperature=0.1, max_tokens=1024)
+        if translated and not is_ai_refusal(translated):
+            return strip_donor_artifacts(clean_surzhyk_and_russian(translated))
+
+    gt = _google_translate_ru_to_uk(text)
+    if gt:
+        logger.info("Використано резервний переклад Google Translate (Groq недоступний)")
+        return strip_donor_artifacts(clean_surzhyk_and_russian(gt))
     return text
 
 def format_fallback_post(text: str) -> str:
