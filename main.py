@@ -122,13 +122,31 @@ def is_breaking_news(text: str) -> bool:
 # ---------------------------------------------------------
 STRICT_AD_KEYWORDS = [
     'favbet', 'фавбет', 'cosmolot', 'космолот', 'slotoking', 'слотокінг',
-    'онлайн-казино', 'промокод', 'партнерський матеріал', 'на правах реклами',
-    'erid:', 'рекламний пост', 'підпишись на наш інший канал'
+    'vbet', 'вбет', 'ggbet', 'pin-up', 'пінап', 'онлайн-казино', 'фріспін', 'фриспин',
+    'ставки на спорт', 'букмекер', 'промокод', 'промо-код', 'партнерський матеріал',
+    'партнерський проєкт', 'спецпроєкт', 'спецпроект', 'на правах реклами', '#реклама',
+    'erid:', 'рекламний пост', 'підпишись на наш інший канал', 'наш резервний канал',
+    'заробіток без вкладень', 'сигнали для трейдингу', 'арбітраж трафіку',
+    'безоплатний вебінар', 'безкоштовний вебінар', 'встигни замовити', 'встигни купити',
+    'забирай бонус', 'створено за підтримки',
+    # Промо/анонси інтерв'ю, подкастів, YouTube-шоу та бренд-піару
+    'hro talk', 'hrotalk', 'у новому випуску', 'новий випуск',
+    "дивіться в інтерв'ю", 'дивіться в інтерв’ю',
+    "повне інтерв'ю", 'повне інтерв’ю',
+    "обговорюються в інтерв'ю", 'обговорюються в інтерв’ю',
+    "обговорили в інтерв'ю", 'обговорили в інтерв’ю',
+    'дивіться на нашому youtube', 'на нашому youtube',
+    'слухайте в подкасті', 'новий епізод подкасту',
+    'читайте в матеріалі', 'повний текст за посиланням'
 ]
 
-def is_strict_ad(text: str) -> bool:
+def is_strict_ad(text: str, raw_html: str = "") -> bool:
     t = text.lower()
-    return any(kw in t for kw in STRICT_AD_KEYWORDS)
+    if any(kw in t for kw in STRICT_AD_KEYWORDS):
+        return True
+    if raw_html and re.search(r'(?:utm_source=|utm_medium=|erid=|/advert/|/promo/)', raw_html, re.IGNORECASE):
+        return True
+    return False
 
 DIGEST_KEYWORDS = [
     'вечірній підсумок', 'ранковий підсумок', 'підсумок дня', 'підсумки дня',
@@ -224,7 +242,7 @@ def is_air_tracking_alert(text: str) -> bool:
 # ОЧИЩЕННЯ ВІД СУРЖИКУ ТА ПАФОСУ
 # ---------------------------------------------------------
 SURZHYK_MAP = [
-    (r'\bрозгорнулися вибухи\b', 'пролунали вибухи'),
+            (r'\bрозгорнулися вибухи\b', 'пролунали вибухи'),
     (r'\bвідбулись вибухи\b', 'пролунали вибухи'),
     (r'\bвідбулися вибухи\b', 'пролунали вибухи'),
     (r'\bв конфлікті\b', 'під час війни'),
@@ -233,7 +251,7 @@ SURZHYK_MAP = [
     (r'\bбаллістик', 'балістик'),
     (r'\bбаллістичн', 'балістичн'),
     (r'\bмілітарні сили\b', 'військові'),
-    (r'\bзамглавы\b', 'заступник керівника'),
+(r'\bзамглавы\b', 'заступник керівника'),
     (r'\bзапасаемся\b', 'запасаємося'),
     (r'\bготовимся\b', 'готуємося'),
     (r'\bдлительной войне\b', 'тривалої війни'),
@@ -246,7 +264,7 @@ SURZHYK_MAP = [
     (r'\bводой\b', 'водою'),
     (r'\bводы\b', 'води'),
     (r'\bводу\b', 'воду'),
-    (r'\bв октябр[іе]\b', 'у жовтні'),
+(r'\bв октябр[іе]\b', 'у жовтні'),
     (r'\bв ноябр[іе]\b', 'у листопаді'),
     (r'\bв декабр[іе]\b', 'у грудні'),
     (r'\bв январ[іе]\b', 'у січні'),
@@ -321,6 +339,7 @@ def clean_ai_fluff(text: str) -> str:
     for p in fluff_patterns:
         cleaned = re.sub(p, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
     return cleaned.strip()
+
 
 def remove_redundant_body(text: str) -> str:
     """
@@ -408,6 +427,7 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
 
 PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 
+# Резервні моделі — вмикаються ТІЛЬКИ якщо основна модель не пропустила новину (429 або цензура)
 BACKUP_GROQ_MODELS = [
     "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
@@ -451,6 +471,7 @@ def is_ai_refusal(text: str) -> bool:
             return True
     return False
 
+
 def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
     """
     Програмна перевірка на вигадані нейромережею факти:
@@ -461,16 +482,19 @@ def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
     src_l = source_text.lower()
     out_l = output_text.lower()
 
+    # 1. Перевірка часу (HH:MM)
     out_times = set(re.findall(r"\b\d{1,2}:\d{2}\b", out_l))
     src_times = set(re.findall(r"\b\d{1,2}:\d{2}\b", src_l))
     if out_times - src_times:
         logger.warning(f"Галюцинація часу! Вигадано: {out_times - src_times}")
         return True
 
+    # 2. Перевірка штучного роздування короткого тексту
     if len(source_text.strip()) < 160 and len(output_text.strip()) > max(360, len(source_text.strip()) * 3 + 120):
         logger.warning(f"Штучне роздування короткої новини ({len(source_text)} -> {len(output_text)} символів)")
         return True
 
+    # 3. Перевірка вигаданих трагічних/екстрених подробиць (укр + рос)
     sensitive_groups = [
         (["евакуац", "эвакуац"], ["евакуац", "эвакуац"]),
         (["пожежник", "пожарн", "рятувальн", "спасател"], ["пожежник", "пожарн", "рятувальн", "спасател", "дснс", "гсчс"]),
@@ -508,12 +532,14 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
         "Content-Type": "application/json"
     }
 
+    # Наша основна модель ЗАВЖДИ стоїть на 1-му місці!
     models_to_try = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
 
     now = time.time()
     for model_name in models_to_try:
         is_primary = (model_name == PRIMARY_GROQ_MODEL)
 
+        # Перевірка 429 кулдауну
         if now < model_cooldowns.get(model_name, 0):
             wait_left = int(model_cooldowns[model_name] - now)
             if is_primary:
@@ -576,6 +602,7 @@ def has_russian_text(text: str) -> bool:
     ]
     if any(re.search(p, t) for p in ru_markers):
         return True
+    # Якщо текст кирилицею (> 25 символів) і не містить жодної української літери (і, ї, є, ґ) — це російська
     cyrillic_count = len(re.findall(r"[а-яА-ЯёЁ]", t))
     has_ukr_letters = any(ch in t for ch in ["і", "ї", "є", "ґ"])
     if cyrillic_count > 25 and not has_ukr_letters:
@@ -620,6 +647,7 @@ def translate_to_ukrainian(text: str) -> str:
         if translated and not is_ai_refusal(translated):
             return strip_donor_artifacts(clean_surzhyk_and_russian(translated))
 
+    # Якщо всі моделі Groq вичерпали ліміт або відмовили — перекладаємо через безлімітний резерв
     gt = _google_translate_ru_to_uk(text)
     if gt:
         logger.info("Використано резервний переклад Google Translate (Groq недоступний)")
@@ -661,7 +689,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 1. Якщо це ТА САМА подія, що вже була у списку — напиши тільки DUPLICATE.
 2. Якщо це ДАЙДЖЕСТ (підсумок дня/вечора, перелік кількох подій) — напиши SKIP.
 3. Якщо це ПОВІТРЯНА ТРИВОГА, загроза балістики/ракет/шахедів, радарне стеження чи попередження про небезпеку БЕЗ фактів реальних влучань, вибухів чи руйнувань — напиши тільки SKIP.
-4. Якщо це прихований піар, реклама чи пустий саркастичний мем — напиши SKIP.
+4. Якщо це реклама, нативний/прихований піар бренду чи компанії, анонс інтерв'ю/подкасту/YouTube-шоу (напр. «обговорюються в інтерв'ю», «новий випуск», річниці бізнесу) чи пустий саркастичний мем — напиши SKIP.
 5. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ СУТО ЗА ФАКТАМИ ОРИГІНАЛУ:
    - Рядок 1: **Емодзі + чіткий інформативний заголовок** (джерело вказуй ТІЛЬКИ якщо це Reuters/Генштаб/чиновник; для відео/повідомлень із соцмереж жодних приписок не став!).
    {length_instruction}
@@ -693,6 +721,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     content = strip_donor_artifacts(content)
     content = remove_redundant_body(content)
 
+    # Перевірка на галюцинації: якщо модель щось довигадала — робимо 1 сувору спробу з temperature=0.1
     if has_hallucinated_facts(cleaned_input, content):
         strict_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -702,7 +731,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
         if not retry_content or is_ai_refusal(retry_content) or has_hallucinated_facts(cleaned_input, retry_content):
             logger.warning("Повторна спроба також містила домисли. Пропускаємо пост, щоб не публікувати фейк.")
             return ""
-        content = remove_redundant_body(strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content))))
+        content = strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content)))
 
     return content
 
@@ -736,6 +765,7 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     content = call_groq_with_fallback(messages, temperature=0.40, max_tokens=2048)
 
     if not content or is_ai_refusal(content) or has_hallucinated_facts(cleaned_input, content):
+        # Сувора спроба без фантазії
         strict_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"ПЕРЕКЛАДИ УКРАЇНСЬКОЮ ТА ОФОРМИ ПО ФАКТАХ ОРИГІНАЛУ, НІЧОГО НЕ ВИГАДУЙ І НЕ ДОДАВАЙ ВІД СЕБЕ:\n\n{cleaned_input}"}
@@ -905,8 +935,8 @@ def scrape_channel(channel: str, seen_set: set) -> list:
                 seen_set.add(post_id)
                 continue
 
-            if is_strict_ad(raw_text):
-                logger.info(f"Пропуск явної реклами у {post_id}")
+            if is_strict_ad(raw_text, chunk):
+                logger.info(f"Пропуск реклами/промо/анонсу у {post_id}")
                 seen_set.add(post_id)
                 continue
 
@@ -955,6 +985,7 @@ def markdown_to_telegram_html(text: str) -> str:
     header = parts[0].strip()
     body = parts[1].strip() if len(parts) > 1 else ""
 
+    # Завжди робимо заголовок жирним, якщо він ще не обгорнутий
     if not (header.startswith("**") and header.endswith("**")) and not (header.startswith("<b>") and header.endswith("</b>")):
         m = re.match(r"^([‼️❗️⚡️🚨🔴👉⏩➡️▶️🇪🇺🇺🇦🇷🇺🇺🇸🇬🇧\s]+)(.*)$", header)
         if m and m.group(2).strip():
@@ -1047,7 +1078,7 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) ->
         except Exception as e:
             logger.error(f"Помилка фото: {e}")
 
-    # 3. Текст
+    # 3. Текст (вимикаємо прев'ю посилань, щоб не було великої плашки каналу знизу)
     try:
         full_text = formatted_text + signature
         res = requests.post(
@@ -1090,6 +1121,7 @@ def post_media_group_to_telegram(text: str, media_items: list) -> bool:
 
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+    # Telegram дозволяє до 10 медіа в одному альбомі
     all_ok = True
     for start in range(0, len(media_items), 10):
         batch = media_items[start:start + 10]
@@ -1263,6 +1295,7 @@ def handle_incoming_update(update: dict):
             })
         return
 
+    # Якщо це альбом (кілька фото/відео в одному пості) — збираємо всі частини разом!
     if media_group_id and media_item:
         is_first = False
         with media_group_lock:
@@ -1324,11 +1357,13 @@ def bot_worker_loop():
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
     global_published_titles = fetch_own_channel_history(TELEGRAM_CHANNEL_ID)
     published_history = load_published_history()
+    # Синхронізуємо історію каналу
     for t in global_published_titles:
         st = extract_keywords_stemmed(t)
         if st and not any(h.get("headline") == t for h in published_history):
             published_history.append({"headline": t, "stems": list(st), "timestamp": time.time()})
     save_published_history(published_history)
+
 
     # 2. ЗАХИСТ ВІД СТАРТОВОЇ ЛАВИНИ:
     logger.info(f"Ініціалізація {len(DONOR_CHANNELS)} донорів: фіксуємо старий беклог, щоб не спамити...")
@@ -1379,6 +1414,9 @@ def bot_worker_loop():
 
                     is_breaking = is_breaking_news(raw_text)
 
+                    # --- ЛОГІКА РОЗПОДІЛУ ТЕМПУ ---
+                    # Якщо новина МЕГА ВАЖЛИВА (термінова) -> ЛІМІТИ НЕ ДІЮТЬ! Публікується ОДРАЗУ!
+                    # Якщо новина ЗВИЧАЙНА -> діє пауза 3 хвилини і годинний ліміт
                     if not is_breaking:
                         if posted_in_this_cycle:
                             continue
@@ -1391,6 +1429,7 @@ def bot_worker_loop():
                         if time_since_last < REGULAR_COOLDOWN:
                             continue
 
+                    # Семантична перевірка на повтор та фільтрація через Groq
                     # АЛГОРИТМІЧНИЙ ЗАХИСТ ВІД ПОВТОРІВ (ДО ЗАПИТУ В GROQ):
                     if is_duplicate_news(raw_text, published_history):
                         logger.info(f"Алгоритмічний фільтр відхилив повтор новини: {raw_text[:60]}...")
@@ -1419,7 +1458,6 @@ def bot_worker_loop():
                             "timestamp": current_t
                         })
                         save_published_history(published_history)
-
                         if len(global_published_titles) > 30:
                             global_published_titles.pop(0)
 
@@ -1434,6 +1472,7 @@ def bot_worker_loop():
 
                 time.sleep(0.8)
 
+            # Пауза між колами перевірки каналів
             time.sleep(25)
 
         except Exception as e:
