@@ -81,26 +81,72 @@ global_published_titles = []
 # ---------------------------------------------------------
 # ЗЧИТУВАННЯ ВЛАСНОГО КАНАЛУ (ЗАХИСТ ПРИ ПЕРЕЗАПУСКУ НА RENDER)
 # ---------------------------------------------------------
-def fetch_own_channel_history(channel_username: str) -> list:
+def fetch_own_channel_history(channel_username: str, pages: int = 3) -> tuple:
     ch = channel_username.replace("@", "").strip()
-    url = f"https://t.me/s/{ch}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
     }
-    history = []
+    titles = []
+    full_posts = []
+    seen_ids = set()
+    before_id = None
+
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            texts = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', resp.text, re.DOTALL)
-            for raw_t in texts:
-                clean_t = re.sub(r'<[^>]+>', '', raw_t).strip()
-                if clean_t and len(clean_t) > 20:
-                    first_line = clean_t.split('\n')[0].replace('*', '').strip()
-                    history.append(first_line)
-            logger.info(f"Завантажено {len(history)} останніх заголовків із каналу @{ch}")
+        for _ in range(pages):
+            url = f"https://t.me/s/{ch}" + (f"?before={before_id}" if before_id else "")
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                break
+
+            chunks = re.findall(
+                r'(<div class="tgme_widget_message_wrap[^"]*"[^>]*>.*?)(?=<div class="tgme_widget_message_wrap|$)',
+                resp.text,
+                re.DOTALL
+            )
+            if not chunks:
+                break
+
+            page_ids = []
+            page_entries = []
+            for chunk in chunks:
+                id_m = re.search(r'data-post="[^/]+/(\d+)"', chunk)
+                if id_m:
+                    msg_num = int(id_m.group(1))
+                    page_ids.append(msg_num)
+                    if msg_num in seen_ids:
+                        continue
+                    seen_ids.add(msg_num)
+
+                text_m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', chunk, re.DOTALL)
+                if not text_m:
+                    continue
+                clean_t = clean_html_text(text_m.group(1))
+                # Прибираємо підпис каналу, щоб не засмічувати стемінг
+                lines = [l.strip() for l in clean_t.splitlines() if l.strip() and "NEWS УКРАЇНА 365 | Підписатися" not in l]
+                if not lines:
+                    continue
+                body_clean = "\n".join(lines)
+                if len(body_clean) > 20:
+                    first_line = lines[0].replace('*', '').strip()
+                    page_entries.append((first_line, body_clean))
+
+            # Зберігаємо хронологічний порядок (старіші -> новіші)
+            titles = [e[0] for e in page_entries] + titles
+            full_posts = [e[1] for e in page_entries] + full_posts
+
+            if not page_ids:
+                break
+            min_id = min(page_ids)
+            if before_id is not None and min_id >= before_id:
+                break
+            before_id = min_id
+            time.sleep(0.3)
+
+        logger.info(f"Завантажено {len(titles)} останніх постів із каналу @{ch}")
     except Exception as e:
         logger.warning(f"Не вдалося зчитати історію @{ch}: {e}")
-    return history[-30:]
+
+    return titles[-50:], full_posts[-80:]
 
 # ---------------------------------------------------------
 # ВИЗНАЧЕННЯ ТЕРМІНОВОСТІ (ЕКСКЛЮЗИВ / МЕГА ВАЖЛИВЕ)
@@ -671,7 +717,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     is_short = len(cleaned_input) < 160
 
-    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-30:]]) if published_titles else "(ще немає публікацій)"
+    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-50:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
         "- Це КОРОТКЕ повідомлення! Якщо в тексті лише одна цитата чи один факт — напиши ТІЛЬКИ 1 рядок (сам заголовок) БЕЗ абзацу, щоб не повторювати заголовок двічі! Абзац пиши лише якщо є окремі нові деталі."
@@ -793,7 +839,7 @@ def clean_html_text(raw_html: str) -> str:
     return text.strip()
 
 PUBLISHED_HISTORY_FILE = "published_history.json"
-MAX_PUBLISHED_HISTORY = 60
+MAX_PUBLISHED_HISTORY = 120
 
 STOP_WORDS = {
     'про', 'що', 'для', 'але', 'або', 'який', 'яка', 'яке', 'які', 'його',
@@ -825,6 +871,20 @@ def stem_ru_ukr(word: str) -> str:
         return "готов"
     if "тривал" in w_norm or "длител" in w_norm:
         return "тривал"
+    if "константин" in w_norm or "костянтин" in w_norm:
+        return "костянтин"
+    if "алешк" in w_norm or "олешк" in w_norm:
+        return "олешк"
+    if "харьков" in w_norm or "харкив" in w_norm:
+        return "харкив"
+    if "киев" in w_norm or "киив" in w_norm:
+        return "киив"
+    if "николаев" in w_norm or "миколаив" in w_norm:
+        return "миколаив"
+    if "запорож" in w_norm or "запориж" in w_norm:
+        return "запориж"
+    if "днепр" in w_norm or "днипр" in w_norm:
+        return "днипр"
 
     endings = [
         "ості", "ости", "остях", "івського", "івському", "ського", "ському",
@@ -1194,7 +1254,7 @@ def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = Non
                 "timestamp": time.time()
             })
             save_published_history(h)
-            if len(global_published_titles) > 30:
+            if len(global_published_titles) > 50:
                 global_published_titles.pop(0)
 
         if chat_id:
@@ -1355,13 +1415,14 @@ def bot_worker_loop():
     last_regular_post_time = 0
 
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
-    global_published_titles = fetch_own_channel_history(TELEGRAM_CHANNEL_ID)
+    global_published_titles, own_full_posts = fetch_own_channel_history(TELEGRAM_CHANNEL_ID, pages=3)
     published_history = load_published_history()
-    # Синхронізуємо історію каналу
-    for t in global_published_titles:
-        st = extract_keywords_stemmed(t)
-        if st and not any(h.get("headline") == t for h in published_history):
-            published_history.append({"headline": t, "stems": list(st), "timestamp": time.time()})
+    # Синхронізуємо історію каналу (разом із текстом постів для точного пошуку дублікатів)
+    for full_p in own_full_posts:
+        first_l = full_p.split('\n')[0].replace('*', '').strip()
+        st = extract_keywords_stemmed(full_p)
+        if st and not any(h.get("headline") == first_l for h in published_history):
+            published_history.append({"headline": first_l, "stems": list(st), "timestamp": time.time()})
     save_published_history(published_history)
 
 
@@ -1442,6 +1503,11 @@ def bot_worker_loop():
                     if not rewritten:
                         continue
 
+                    # Повторна перевірка на дублікат ВЖЕ ПІСЛЯ рерайту українською
+                    if is_duplicate_news(rewritten, published_history):
+                        logger.info(f"Повтор виявлено після рерайту: {rewritten.splitlines()[0][:60]}...")
+                        continue
+
                     success = post_to_telegram(
                         text=rewritten,
                         photo_url=item.get("photo_url"),
@@ -1458,7 +1524,7 @@ def bot_worker_loop():
                             "timestamp": current_t
                         })
                         save_published_history(published_history)
-                        if len(global_published_titles) > 30:
+                        if len(global_published_titles) > 50:
                             global_published_titles.pop(0)
 
                         if is_breaking:
