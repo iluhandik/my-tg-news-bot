@@ -81,7 +81,7 @@ global_published_titles = []
 # ---------------------------------------------------------
 # ЗЧИТУВАННЯ ВЛАСНОГО КАНАЛУ (ЗАХИСТ ПРИ ПЕРЕЗАПУСКУ НА RENDER)
 # ---------------------------------------------------------
-def fetch_own_channel_history(channel_username: str, pages: int = 8) -> tuple:
+def fetch_own_channel_history(channel_username: str, pages: int = 10) -> tuple:
     ch = channel_username.replace("@", "").strip()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
@@ -146,7 +146,7 @@ def fetch_own_channel_history(channel_username: str, pages: int = 8) -> tuple:
     except Exception as e:
         logger.warning(f"Не вдалося зчитати історію @{ch}: {e}")
 
-    return titles[-50:], full_posts[-200:]
+    return titles[-80:], full_posts[-250:]
 
 # ---------------------------------------------------------
 # ВИЗНАЧЕННЯ ТЕРМІНОВОСТІ (ЕКСКЛЮЗИВ / МЕГА ВАЖЛИВЕ)
@@ -770,7 +770,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     is_short = len(cleaned_input) < 160
 
-    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-50:]]) if published_titles else "(ще немає публікацій)"
+    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-80:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
         "- Це КОРОТКЕ повідомлення! Якщо в тексті лише одна цитата чи один факт — напиши ТІЛЬКИ 1 рядок (сам заголовок) БЕЗ абзацу, щоб не повторювати заголовок двічі! Абзац пиши лише якщо є окремі нові деталі."
@@ -892,7 +892,7 @@ def clean_html_text(raw_html: str) -> str:
     return text.strip()
 
 PUBLISHED_HISTORY_FILE = "published_history.json"
-MAX_PUBLISHED_HISTORY = 250
+MAX_PUBLISHED_HISTORY = 300
 
 STOP_WORDS = {
     'про', 'що', 'для', 'але', 'або', 'який', 'яка', 'яке', 'які', 'його',
@@ -966,10 +966,15 @@ def extract_keywords_stemmed(text: str) -> set:
     return stems
 
 GENERIC_NEWS_STEMS = {
-    'украин', 'україн', 'роси', 'росі', 'сша', 'трамп', 'путин', 'путін',
-    'зеленськ', 'войн', 'військ', 'президент', 'министр', 'міністр', 'официальн',
-    'офіційн', 'заяв', 'повідом', 'сообщ', 'власт', 'влад', 'країн', 'стран',
-    'област', 'міст', 'город', 'люд', 'після', 'біл', 'щод', 'час', 'року'
+    'украин', 'україн', 'українськ', 'украинск', 'роси', 'росі', 'російськ', 'российск',
+    'сша', 'трамп', 'путин', 'путін', 'зеленськ', 'войн', 'військ', 'військов', 'военн',
+    'президент', 'президентськ', 'министр', 'міністр', 'официальн', 'офіційн',
+    'заяв', 'повідом', 'сообщ', 'власт', 'влад', 'країн', 'стран', 'держав',
+    'област', 'міст', 'город', 'люд', 'після', 'біл', 'щод', 'час', 'року',
+    'дани', 'нові', 'нове', 'новин', 'пост', 'фото', 'віде', 'сьогодн', 'вже',
+    'може', 'буде', 'також', 'післ', 'чере', 'європейськ', 'европейск',
+    'американськ', 'американск', 'окупаційн', 'оккупацион', 'територ', 'ситуац',
+    'рішен', 'решен', 'поді', 'компан', 'робот'
 }
 
 def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.33) -> bool:
@@ -984,8 +989,9 @@ def is_duplicate_news(new_text: str, published_history: list, threshold: float =
         common = new_kw & old_kw
         smaller_len = min(len(new_kw), len(old_kw))
         score = len(common) / smaller_len if smaller_len > 0 else 0
-        rare_common = {w for w in common if len(w) >= 5 and w not in GENERIC_NEWS_STEMS}
-        if score >= threshold or len(rare_common) >= 3:
+        rare_common = {w for w in common if len(w) >= 4 and w not in GENERIC_NEWS_STEMS}
+        very_rare_common = {w for w in rare_common if len(w) >= 7}
+        if score >= threshold or len(rare_common) >= 3 or len(very_rare_common) >= 2:
             logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, рідкісні спільні корені: {rare_common or common}")
             return True
     return False
@@ -1315,7 +1321,7 @@ def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = Non
                 "timestamp": time.time()
             })
             save_published_history(h)
-            if len(global_published_titles) > 50:
+            if len(global_published_titles) > 80:
                 global_published_titles.pop(0)
 
         if chat_id:
@@ -1476,7 +1482,7 @@ def bot_worker_loop():
     last_regular_post_time = 0
 
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
-    global_published_titles, own_full_posts = fetch_own_channel_history(TELEGRAM_CHANNEL_ID, pages=8)
+    global_published_titles, own_full_posts = fetch_own_channel_history(TELEGRAM_CHANNEL_ID, pages=10)
     published_history = load_published_history()
     # Синхронізуємо історію каналу (разом із текстом постів для точного пошуку дублікатів)
     for full_p in own_full_posts:
@@ -1585,7 +1591,7 @@ def bot_worker_loop():
                             "timestamp": current_t
                         })
                         save_published_history(published_history)
-                        if len(global_published_titles) > 50:
+                        if len(global_published_titles) > 80:
                             global_published_titles.pop(0)
 
                         if is_breaking:
