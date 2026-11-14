@@ -21,7 +21,9 @@ logger = logging.getLogger("NEWS_365_BOT")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+_raw_groq_keys = os.getenv("GROQ_API_KEYS", "").strip() or os.getenv("GROQ_API_KEY", "").strip()
+GROQ_API_KEYS = [k.strip() for k in _raw_groq_keys.split(",") if k.strip()]
+GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
@@ -672,74 +674,100 @@ def _parse_retry_after_seconds(err_text: str) -> int:
         return max(30, min(int(mins * 60 + secs), 3600))
     return 120
 
+def _any_groq_model_available() -> bool:
+    if not GROQ_API_KEYS:
+        return False
+    now = time.time()
+    all_models = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
+    for model_name in all_models:
+        for key_idx in range(len(GROQ_API_KEYS)):
+            if now >= model_cooldowns.get((key_idx, model_name), 0):
+                return True
+    return False
+
+def _soonest_groq_reset_seconds() -> int:
+    if not GROQ_API_KEYS:
+        return 30
+    now = time.time()
+    all_models = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
+    waits = [
+        model_cooldowns.get((key_idx, model_name), now + 30) - now
+        for model_name in all_models
+        for key_idx in range(len(GROQ_API_KEYS))
+    ]
+    soonest = min(waits, default=30)
+    return max(15, min(int(soonest) + 2, 60))
+
 def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_tokens: int = 2048) -> str:
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEYS:
         logger.error("GROQ_API_KEY не задано!")
         return ""
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    # Наша основна модель ЗАВЖДИ стоїть на 1-му місці!
+    # Наша основна модель ЗАВЖДИ стоїть на 1-му місці, і ми перебираємо всі ключі спочатку на ній!
     models_to_try = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
 
     now = time.time()
     for model_name in models_to_try:
         is_primary = (model_name == PRIMARY_GROQ_MODEL)
 
-        # Перевірка 429 кулдауну
-        if now < model_cooldowns.get(model_name, 0):
-            wait_left = int(model_cooldowns[model_name] - now)
-            if is_primary:
-                logger.info(f"Основна модель {PRIMARY_GROQ_MODEL} ще чекає завершення ліміту ({wait_left}с). Тимчасово використовуємо резерв...")
-            continue
+        for key_idx, api_key in enumerate(GROQ_API_KEYS):
+            cd_key = (key_idx, model_name)
+            if now < model_cooldowns.get(cd_key, 0):
+                continue
 
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-        try:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=25
-            )
-            if resp.status_code == 200:
-                res_json = resp.json()
-                content = res_json["choices"][0]["message"]["content"].strip()
-                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                if is_ai_refusal(content):
-                    logger.warning(f"Модель {model_name} видала safety refusal: {content[:100]}. Для цієї новини перемикаюсь на резервну...")
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            try:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=25
+                )
+                if resp.status_code == 200:
+                    res_json = resp.json()
+                    content = res_json["choices"][0]["message"]["content"].strip()
+                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    if is_ai_refusal(content):
+                        logger.warning(f"Модель {model_name} (ключ #{key_idx + 1}) видала safety refusal: {content[:100]}. Перемикаюсь далі...")
+                        break
+                    if is_corrupted_output(content):
+                        logger.warning(f"Модель {model_name} (ключ #{key_idx + 1}) видала зламаний текст/теги. Перемикаюсь далі...")
+                        break
+
+                    if not is_primary:
+                        logger.info(f"Новину успішно оброблено резервною {model_name} (ключ #{key_idx + 1}). На наступну новину бот повертається на {PRIMARY_GROQ_MODEL}!")
+                    return content
+                elif resp.status_code == 429:
+                    wait_sec = _parse_retry_after_seconds(resp.text)
+                    model_cooldowns[cd_key] = time.time() + wait_sec
+                    logger.warning(f"Ключ #{key_idx + 1} на {model_name} вперся в ліміт (429), пауза {wait_sec}с. Перемикаюсь на наступний ключ/резерв...")
                     continue
-                if is_corrupted_output(content):
-                    logger.warning(f"Модель {model_name} видала зламаний текст/теги (<parameter> тощо). Перемикаюсь на наступну модель...")
+                elif resp.status_code == 401:
+                    for m in models_to_try:
+                        model_cooldowns[(key_idx, m)] = time.time() + 86400
+                    logger.error(f"Ключ Groq #{key_idx + 1} недійсний (401). Вимикаю його на 24 години.")
                     continue
+                elif resp.status_code in (400, 404):
+                    model_cooldowns[cd_key] = time.time() + 86400
+                    logger.warning(f"Модель {model_name} недоступна ({resp.status_code}): {resp.text[:200]}")
+                    continue
+                else:
+                    logger.error(f"Помилка Groq {model_name} (ключ #{key_idx + 1}, {resp.status_code}): {resp.text[:300]}")
+                    continue
+            except Exception as e:
+                logger.error(f"Виняток Groq {model_name} (ключ #{key_idx + 1}): {e}")
+                continue
 
-                if not is_primary:
-                    logger.info(f"Новину успішно оброблено резервною {model_name}. На наступну новину бот автоматично повертається на нашу основну {PRIMARY_GROQ_MODEL}!")
-                return content
-            elif resp.status_code == 429:
-                wait_sec = _parse_retry_after_seconds(resp.text)
-                model_cooldowns[model_name] = time.time() + wait_sec
-                logger.warning(f"Модель {model_name} вперлася в ліміт (429), пауза {wait_sec}с. Перемикаюсь на резерв...")
-                continue
-            elif resp.status_code in (400, 404):
-                model_cooldowns[model_name] = time.time() + 3600
-                logger.warning(f"Модель {model_name} недоступна ({resp.status_code}): {resp.text[:200]}")
-                continue
-            else:
-                logger.error(f"Помилка Groq {model_name} ({resp.status_code}): {resp.text[:300]}")
-                continue
-        except Exception as e:
-            logger.error(f"Виняток Groq {model_name}: {e}")
-            continue
-
-    logger.error("Усі моделі Groq наразі вичерпали ліміти або не змогли відповісти.")
+    logger.error("Усі ключі та моделі Groq наразі вичерпали ліміти або не змогли відповісти.")
     return ""
 
 
@@ -785,10 +813,7 @@ def _google_translate_ru_to_uk(text: str) -> str:
         logger.warning(f"Помилка резервного перекладу Google Translate: {e}")
     return ""
 
-def _any_groq_model_available() -> bool:
-    now = time.time()
-    all_models = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
-    return any(now >= model_cooldowns.get(m, 0) for m in all_models)
+
 
 def translate_to_ukrainian(text: str) -> str:
     if not text.strip():
@@ -829,7 +854,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     is_short = len(cleaned_input) < 160
 
-    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-40:]]) if published_titles else "(ще немає публікацій)"
+    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-80:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
         "- Це КОРОТКЕ повідомлення! Якщо в тексті лише одна цитата чи один факт — напиши ТІЛЬКИ 1 рядок (сам заголовок) БЕЗ абзацу, щоб не повторювати заголовок двічі! Абзац пиши лише якщо є окремі нові деталі."
@@ -1655,6 +1680,12 @@ def bot_worker_loop():
             recent_regular_post_timestamps[:] = [t for t in recent_regular_post_timestamps if now - t < 3600]
             regular_limit_reached = len(recent_regular_post_timestamps) >= MAX_REGULAR_PER_HOUR
             posted_in_this_cycle = False
+
+            if not _any_groq_model_available():
+                sleep_sec = _soonest_groq_reset_seconds()
+                logger.info(f"Усі ключі та моделі Groq тимчасово на паузі 429. Чекаємо {sleep_sec}с без втрати новин...")
+                time.sleep(sleep_sec)
+                continue
 
             for channel in DONOR_CHANNELS:
                 posts = scrape_channel(channel, seen_set)
