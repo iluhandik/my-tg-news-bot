@@ -626,7 +626,7 @@ def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
         return True
 
     # 2. Перевірка штучного роздування короткого тексту
-    if len(source_text.strip()) < 160 and len(output_text.strip()) > max(220, len(source_text.strip()) * 2 + 40):
+    if len(source_text.strip()) < 160 and len(output_text.strip()) > max(280, len(source_text.strip()) * 2 + 80):
         logger.warning(f"Штучне роздування короткої новини ({len(source_text)} -> {len(output_text)} символів)")
         return True
 
@@ -852,14 +852,14 @@ def format_fallback_post(text: str) -> str:
 
 def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
-    is_short = len(cleaned_input) < 160
+    is_short = len(cleaned_input) < 95
 
     recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-80:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
-        "- Це КОРОТКЕ повідомлення! Якщо в тексті лише одна цитата чи один факт — напиши ТІЛЬКИ 1 рядок (сам заголовок) БЕЗ абзацу, щоб не повторювати заголовок двічі! Абзац пиши лише якщо є окремі нові деталі."
+        "- Це КОРОТКЕ повідомлення! Передай УСЮ суть в 1 рядку (сам заголовок) БЕЗ втрати ключових деталей; не обрізай зміст до розмитого анонсу типу «Кушнер про ідеї...»."
         if is_short else
-        "- Тіло: 1–2 грамотні стислі абзаци з виділенням **жирним** ключових слів, суто за фактами оригіналу."
+        "- Тіло: 1–2 грамотні стислі абзаци з виділенням **жирним** ключових слів, суто за фактами оригіналу (для однієї цитати достатньо заголовка + 1 речення з повною суттю, без втрати деталей)."
     )
 
     user_prompt = f"""СПИСОК ОСТАННІХ ОПУБЛІКОВАНИХ НОВИН:
@@ -923,11 +923,11 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     if not GROQ_API_KEY:
         return cleaned_input
 
-    is_short = len(cleaned_input) < 160
+    is_short = len(cleaned_input) < 95
     length_instruction = (
-        "- Це КОРОТКЕ повідомлення! Якщо це одна цитата чи один факт — напиши ТІЛЬКИ заголовок БЕЗ другого абзацу! НЕ повторюй заголовок у тексті нижче!"
+        "- Це КОРОТКЕ повідомлення! Передай УСЮ суть в 1 рядку (сам заголовок) БЕЗ втрати ключових деталей; не обрізай зміст до розмитого анонсу!"
         if is_short else
-        "- Тіло: 1–2 стислі динамічні абзаци суто по суті з **жирним виділенням** ключових слів."
+        "- Тіло: 1–2 стислі динамічні абзаци суто по суті з **жирним виділенням** ключових слів (обов'язково збережи головну суть цитати/факту, не обрізай її до одного лише заголовка-анонсу)."
     )
 
     spacer_line = "" if is_short else "- Порожній рядок\n"
