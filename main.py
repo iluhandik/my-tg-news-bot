@@ -11,7 +11,7 @@ import html
 import requests
 
 # ---------------------------------------------------------
-# НАЛАШТУВАННЯ ТА ЛОГУВНЯ
+# НАЛАШТУВАННЯ ТА ЛОГУВАННЯ
 # ---------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -529,9 +529,11 @@ PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "
 # Резервні моделі — вмикаються ТІЛЬКИ якщо основна модель не пропустила новину (429 або цензура)
 BACKUP_GROQ_MODELS = [
     "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
     "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
+    "moonshotai/kimi-k2-instruct",
     "qwen/qwen3-32b",
+    "qwen/qwen3.8-27b",
     "llama-3.1-8b-instant",
 ]
 
@@ -783,10 +785,15 @@ def _google_translate_ru_to_uk(text: str) -> str:
         logger.warning(f"Помилка резервного перекладу Google Translate: {e}")
     return ""
 
+def _any_groq_model_available() -> bool:
+    now = time.time()
+    all_models = [PRIMARY_GROQ_MODEL] + [m for m in BACKUP_GROQ_MODELS if m != PRIMARY_GROQ_MODEL]
+    return any(now >= model_cooldowns.get(m, 0) for m in all_models)
+
 def translate_to_ukrainian(text: str) -> str:
     if not text.strip():
         return text
-    if GROQ_API_KEY:
+    if GROQ_API_KEY and _any_groq_model_available():
         messages = [
             {
                 "role": "system",
@@ -822,7 +829,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     is_short = len(cleaned_input) < 160
 
-    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-80:]]) if published_titles else "(ще немає публікацій)"
+    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-40:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
         "- Це КОРОТКЕ повідомлення! Якщо в тексті лише одна цитата чи один факт — напиши ТІЛЬКИ 1 рядок (сам заголовок) БЕЗ абзацу, щоб не повторювати заголовок двічі! Абзац пиши лише якщо є окремі нові деталі."
@@ -915,7 +922,11 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     ]
     content = call_groq_with_fallback(messages, temperature=0.40, max_tokens=2048)
 
-    if not content or is_ai_refusal(content) or has_hallucinated_facts(cleaned_input, content):
+    if not content:
+        logger.warning("Усі моделі Groq наразі на паузі (429). Оформлюємо чистий переклад через резерв.")
+        return format_fallback_post(cleaned_input)
+
+    if is_ai_refusal(content) or has_hallucinated_facts(cleaned_input, content):
         # Сувора спроба без фантазії
         strict_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
