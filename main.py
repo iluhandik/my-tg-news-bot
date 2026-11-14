@@ -11,7 +11,7 @@ import html
 import requests
 
 # ---------------------------------------------------------
-# НАЛАШТУВАННЯ ТА ЛОГУВАННЯ
+# НАЛАШТУВАННЯ ТА ЛОГУВНЯ
 # ---------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -275,13 +275,65 @@ def is_air_tracking_alert(text: str) -> bool:
     if has_target and has_tracking:
         return True
 
-    if len(t) < 250 and re.search(
-        r"\b(?:каб(?:и|і|ів)?|шахед(?:и|ів)?|бпла|дрон(?:и|ів)?|ракет(?:а|и)?)\s+(?:на|у\s+бік|в\s+бік|до|в\s+напрямку|над)\b",
+    extra_targets = [
+        'бандерол', 'молні', 'молния', 'гербер', 'пароді', 'геран',
+        'ланцет', 'орлан', 'х-101', 'х-59', 'х-69', 'х-22', 'калібр',
+        'калибр', 'циркон', 'орешник', 'фаб', 'фпв', 'fpv'
+    ]
+    if any(m in t for m in extra_targets) and (has_tracking or any(x in t for x in ['напрямку', 'в бік', 'у бік', 'курсом', 'над '])):
+        return True
+
+    if len(t) < 260 and re.search(
+        r"(?:каб(?:и|і|ів)?|шахед(?:и|ів)?|бпла|дрон(?:и|ів)?|ракет(?:а|и)?|бандерол[ьіяі]|молні[яї]|гербер[аи]?)\S*\s+(?:на|у\s+бік|в\s+бік|до|в\s+напрямку|у\s+напрямку|над)\b",
         t,
         re.IGNORECASE
     ):
         return True
 
+    # Короткі радарні зведення формату «Область: <ціль> в напрямку <місто/область>»
+    if len(t) < 240 and re.search(r"(?:в\s+напрямку|у\s+напрямку|в\s+бік|у\s+бік|курсом\s+на)\s+[а-яіїєґa-z\-]+", t, re.IGNORECASE):
+        if any(ch in text for ch in ['🚀', '🛸', '✈️', '🚨', '🔴', '⚠️']) or any(w in t for w in ['обл', 'щина', 'щини', 'район', 'море', 'кордон']):
+            return True
+
+    return False
+
+
+def is_routine_reminder(text: str) -> bool:
+    """
+    Відсікаємо щоденні рутинні нагадування (хвилина мовчання о 9:00 тощо).
+    """
+    t = text.lower()
+    markers = [
+        'хвилина мовчання', 'хвилиною мовчання', 'хвилину мовчання',
+        'минута молчания', 'минутой молчания', 'минуту молчания',
+        'загальнонаціональна хвилина', 'вшановує пам’ять загиблих',
+        "вшановує пам'ять загиблих", 'вшануймо пам’ять', "вшануймо пам'ять",
+        'щоранку о 9:00', 'о 09:00 вшановуємо', 'о 9:00 україна'
+    ]
+    return any(m in t for m in markers)
+
+
+def is_outdated_event(text: str) -> bool:
+    """
+    Відсікаємо перепости старих подій (минулого тижня / кілька днів тому),
+    якщо в тексті немає свіжих офіційних дій сьогодні (підозра, затримання, вирок, суд).
+    """
+    t = text.lower()
+    fresh_action_markers = [
+        'підозру', 'затримал', 'затримано',
+        'суд обрав', 'суд виніс', 'вирок', 'засудил', 'вручили підозру',
+        'розслідування завершено', 'справу передано до суду'
+    ]
+    if any(m in t for m in fresh_action_markers):
+        return False
+
+    old_markers = [
+        'минулого тижня', 'на прошлой неделе', 'тиждень тому', 'неделю назад',
+        'два тижні тому', 'две недели назад', 'кілька днів тому', 'несколько дней назад',
+        'архівне відео', 'архивное видео', 'місяць тому', 'месяц назад'
+    ]
+    if any(m in t for m in old_markers):
+        return True
     return False
 
 # ---------------------------------------------------------
@@ -788,7 +840,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 1. Якщо це ТА САМА подія, що вже була у списку — напиши тільки DUPLICATE.
 2. Якщо це ДАЙДЖЕСТ (підсумок дня/вечора, перелік кількох подій) — напиши SKIP.
 3. Якщо це ПОВІТРЯНА ТРИВОГА, загроза балістики/ракет/шахедів, радарне стеження чи попередження про небезпеку БЕЗ фактів реальних влучань, вибухів чи руйнувань — напиши тільки SKIP.
-4. Якщо це реклама, нативний/прихований піар бренду чи компанії, анонс інтерв'ю/подкасту/YouTube-шоу (напр. «обговорюються в інтерв'ю», «новий випуск», річниці бізнесу) чи пустий саркастичний мем — напиши SKIP.
+4. Якщо це реклама, нативний/прихований піар бренду чи компанії, анонс інтерв'ю/подкасту/YouTube-шоу (напр. «обговорюються в інтерв'ю», «новий випуск», річниці бізнесу), щоденне нагадування про хвилину мовчання о 9:00, перепост старої події (минулого тижня/давно) без нової дії сьогодні чи пустий саркастичний мем — напиши SKIP.
 5. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ СУТО ЗА ФАКТАМИ ОРИГІНАЛУ:
    - Рядок 1: **Емодзі + чіткий інформативний заголовок** (джерело вказуй ТІЛЬКИ якщо це Reuters/Генштаб/чиновник; для відео/повідомлень із соцмереж жодних приписок не став!).
    {length_instruction}
@@ -1077,6 +1129,16 @@ def scrape_channel(channel: str, seen_set: set) -> list:
                 seen_set.add(post_id)
                 continue
 
+            if is_routine_reminder(raw_text):
+                logger.info(f"Пропуск щоденного нагадування (хвилина мовчання) у {post_id}")
+                seen_set.add(post_id)
+                continue
+
+            if is_outdated_event(raw_text):
+                logger.info(f"Пропуск застарілої події у {post_id}")
+                seen_set.add(post_id)
+                continue
+
             photo_url = None
             photo_match = re.search(r'tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:url\([\'"]?(.*?)[\'"]?\)', chunk)
             if photo_match:
@@ -1127,7 +1189,7 @@ def markdown_to_telegram_html(text: str) -> str:
     t = re.sub(r"\*(.*?)\*", r"<i>\1</i>", t)
     return t
 
-def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) -> bool:
+def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, photo_file_id: str = None, video_file_id: str = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
         logger.error("TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не задано!")
         return False
@@ -1143,7 +1205,28 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) ->
 
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-    # 1. Відео
+    # 1. Відео по file_id (миттєво і без ліміту 20 МБ на скачування!)
+    if video_file_id:
+        try:
+            res = requests.post(
+                f"{base_api}/sendVideo",
+                json={
+                    "chat_id": TELEGRAM_CHANNEL_ID,
+                    "video": video_file_id,
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                },
+                timeout=30
+            )
+            if res.status_code == 200:
+                logger.info("Відео (file_id) успішно опубліковано")
+                return True
+            else:
+                logger.warning(f"sendVideo по file_id помилка ({res.status_code}): {res.text[:200]}")
+        except Exception as e:
+            logger.error(f"Помилка sendVideo по file_id: {e}")
+
+    # 1b. Відео по URL (для скрапера донорів)
     if video_url:
         try:
             v_resp = requests.get(video_url, timeout=20, stream=True)
@@ -1175,7 +1258,28 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None) ->
         except Exception as e:
             logger.error(f"Помилка відео: {e}")
 
-    # 2. Фото
+    # 2. Фото по file_id
+    if photo_file_id:
+        try:
+            res = requests.post(
+                f"{base_api}/sendPhoto",
+                json={
+                    "chat_id": TELEGRAM_CHANNEL_ID,
+                    "photo": photo_file_id,
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                },
+                timeout=30
+            )
+            if res.status_code == 200:
+                logger.info("Фото (file_id) успішно опубліковано")
+                return True
+            else:
+                logger.warning(f"sendPhoto по file_id помилка ({res.status_code}): {res.text[:200]}")
+        except Exception as e:
+            logger.error(f"Помилка sendPhoto по file_id: {e}")
+
+    # 2b. Фото по URL
     if photo_url:
         try:
             p_resp = requests.get(photo_url, timeout=15)
@@ -1286,7 +1390,7 @@ def post_media_group_to_telegram(text: str, media_items: list) -> bool:
 media_group_buffer = {}
 media_group_lock = threading.Lock()
 
-def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = None, video_url: str = None, media_items: list = None):
+def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = None, video_url: str = None, media_items: list = None, photo_file_id: str = None, video_file_id: str = None):
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
     if chat_id:
@@ -1307,7 +1411,9 @@ def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = Non
         success = post_to_telegram(
             text=rewritten,
             photo_url=photo_url,
-            video_url=video_url
+            video_url=video_url,
+            photo_file_id=photo_file_id,
+            video_file_id=video_file_id
         )
 
     if success:
@@ -1377,22 +1483,28 @@ def handle_incoming_update(update: dict):
         raw_text = msg.get("caption") or msg.get("text") or ""
 
     photo = msg.get("photo")
-    video = msg.get("video")
+    video = msg.get("video") or msg.get("animation")
+    doc = msg.get("document")
+    if not video and doc and str(doc.get("mime_type", "")).startswith("video/"):
+        video = doc
+
     media_group_id = msg.get("media_group_id")
 
     photo_url = None
     video_url = None
+    photo_file_id = None
+    video_file_id = None
     media_item = None
 
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     file_base = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 
     if photo:
-        file_id = photo[-1]["file_id"]
-        media_item = {"type": "photo", "file_id": file_id}
+        photo_file_id = photo[-1]["file_id"]
+        media_item = {"type": "photo", "file_id": photo_file_id}
         if not media_group_id:
             try:
-                res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+                res = requests.get(f"{base_api}/getFile?file_id={photo_file_id}", timeout=10).json()
                 if res.get("ok"):
                     photo_url = f"{file_base}/{res['result']['file_path']}"
                     media_item["photo_url"] = photo_url
@@ -1400,11 +1512,11 @@ def handle_incoming_update(update: dict):
                 logger.error(f"Помилка отримання фото від користувача: {e}")
 
     if video:
-        file_id = video["file_id"]
-        media_item = {"type": "video", "file_id": file_id}
+        video_file_id = video["file_id"]
+        media_item = {"type": "video", "file_id": video_file_id}
         if not media_group_id:
             try:
-                res = requests.get(f"{base_api}/getFile?file_id={file_id}", timeout=10).json()
+                res = requests.get(f"{base_api}/getFile?file_id={video_file_id}", timeout=10).json()
                 if res.get("ok"):
                     video_url = f"{file_base}/{res['result']['file_path']}"
                     media_item["video_url"] = video_url
@@ -1446,7 +1558,9 @@ def handle_incoming_update(update: dict):
         chat_id=chat_id,
         raw_text=raw_text,
         photo_url=photo_url,
-        video_url=video_url
+        video_url=video_url,
+        photo_file_id=photo_file_id,
+        video_file_id=video_file_id
     )
 
 # ---------------------------------------------------------
