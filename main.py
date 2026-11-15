@@ -21,8 +21,27 @@ logger = logging.getLogger("NEWS_365_BOT")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
-_raw_groq_keys = os.getenv("GROQ_API_KEYS", "").strip() or os.getenv("GROQ_API_KEY", "").strip()
-GROQ_API_KEYS = [k.strip() for k in _raw_groq_keys.split(",") if k.strip()]
+def _load_groq_keys() -> list:
+    raw_sources = [
+        os.getenv("GROQ_API_KEY", ""),
+        os.getenv("GROQ_API_KEYS", ""),
+        os.getenv("GROQ_API_KEY_1", ""),
+        os.getenv("GROQ_API_KEY_2", ""),
+        os.getenv("GROQ_API_KEY_3", ""),
+        os.getenv("GROQ_API_KEY_4", ""),
+        os.getenv("GROQ_API_KEY_5", ""),
+    ]
+    keys = []
+    seen = set()
+    for src in raw_sources:
+        for part in re.split(r"[\s,;]+", src.strip()):
+            k = part.strip().strip('"').strip("'")
+            if k and k not in seen:
+                seen.add(k)
+                keys.append(k)
+    return keys
+
+GROQ_API_KEYS = _load_groq_keys()
 GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
@@ -327,7 +346,7 @@ def is_outdated_event(text: str) -> bool:
     t = text.lower()
     fresh_action_markers = [
         'підозру', 'затримал', 'затримано',
-        'суд обрав', 'суд виніс', 'вирок', 'засудил', 'вручили підозру',
+        'суд обрав', 'суд виніс', 'вирок', 'засудили', 'вручили підозру',
         'розслідування завершено', 'справу передано до суду'
     ]
     if any(m in t for m in fresh_action_markers):
@@ -459,21 +478,35 @@ def remove_redundant_body(text: str) -> str:
     if not body:
         return header
 
-    ignore = {'що', 'заявив', 'заявила', 'заявили', 'повідомив', 'повідомила', 'розповів', 'наголосив', 'підкреслив', 'додав', 'між', 'для', 'про'}
+    ignore = {
+        'що', 'від', 'для', 'про', 'між', 'при', 'під', 'над', 'без', 'через',
+        'до', 'на', 'за', 'по', 'та', 'із', 'зі', 'не', 'це', 'як',
+        'заявив', 'заявила', 'заявили', 'повідомив', 'повідомила', 'повідомили',
+        'розповів', 'розповіла', 'наголосив', 'підкреслив', 'додав', 'зазначив',
+        'сказав', 'інформація', 'інформацію', 'відомо', 'стало', 'словами'
+    }
+    ignore_stems = {stem_ru_ukr(w) for w in ignore}
 
-    def content_words(s: str) -> set:
+    def content_stems(s: str) -> set:
         s_clean = re.sub(r"\*+", "", s.lower())
-        return {w for w in re.findall(r"[а-яіїєґa-z0-9]{3,}", s_clean) if w not in ignore}
+        stems = set()
+        for w in re.findall(r"[а-яіїєґa-z0-9]{2,}", s_clean):
+            if w in ignore:
+                continue
+            st = stem_ru_ukr(w)
+            if st not in ignore_stems:
+                stems.add(st)
+        return stems
 
-    h_words = content_words(header)
-    b_words = content_words(body)
-    if not h_words or not b_words:
+    h_stems = content_stems(header)
+    b_stems = content_stems(body)
+    if not h_stems or not b_stems:
         return text.strip()
 
-    overlap = len(h_words & b_words) / max(1, min(len(h_words), len(b_words)))
-    new_words_in_body = len(b_words - h_words)
+    overlap = len(h_stems & b_stems) / max(1, min(len(h_stems), len(b_stems)))
+    new_stems_in_body = len(b_stems - h_stems)
 
-    if overlap >= 0.72 and new_words_in_body <= 2:
+    if (overlap >= 0.65 and new_stems_in_body <= 2) or (overlap >= 0.80 and new_stems_in_body <= 3):
         logger.info("Прибрано дублювання заголовка в абзаці (нових фактів немає)")
         return header
 
@@ -534,12 +567,10 @@ PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "
 
 # Резервні моделі — вмикаються ТІЛЬКИ якщо основна модель не пропустила новину (429 або цензура)
 BACKUP_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
     "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
     "moonshotai/kimi-k2-instruct",
     "qwen/qwen3-32b",
-    "qwen/qwen3.8-27b",
     "llama-3.1-8b-instant",
 ]
 
@@ -889,12 +920,12 @@ def format_fallback_post(text: str) -> str:
 
 def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
-    is_short = len(cleaned_input) < 95
+    is_short = len(cleaned_input) < 135 and cleaned_input.count(".") <= 1
 
     recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-40:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
-        "- Це КОРОТКЕ повідомлення! Передай УСЮ суть в 1 рядку (сам заголовок) БЕЗ втрати ключових деталей; не обрізай зміст до розмитого анонсу типу «Кушнер про ідеї...»."
+        "- Це КОРОТКЕ повідомлення (1 речення)! Напиши ТІЛЬКИ 1 рядок (сам заголовок) з УСІЄЮ суттю — КАТЕГОРИЧНО ЗАБОРОНЕНО додавати другий абзац і повторювати ту саму думку двічі!"
         if is_short else
         "- Тіло: 1–2 грамотні стислі абзаци з виділенням **жирним** ключових слів, суто за фактами оригіналу (для однієї цитати достатньо заголовка + 1 речення з повною суттю, без втрати деталей)."
     )
@@ -951,7 +982,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
         if not retry_content or is_ai_refusal(retry_content) or has_hallucinated_facts(cleaned_input, retry_content):
             logger.warning("Повторна спроба також містила домисли. Пропускаємо пост, щоб не публікувати фейк.")
             return ""
-        content = strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content)))
+        content = remove_redundant_body(strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content))))
 
     return content
 
@@ -960,9 +991,9 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     if not GROQ_API_KEY:
         return cleaned_input
 
-    is_short = len(cleaned_input) < 95
+    is_short = len(cleaned_input) < 135 and cleaned_input.count(".") <= 1
     length_instruction = (
-        "- Це КОРОТКЕ повідомлення! Передай УСЮ суть в 1 рядку (сам заголовок) БЕЗ втрати ключових деталей; не обрізай зміст до розмитого анонсу!"
+        "- Це КОРОТКЕ повідомлення (1 речення)! Напиши ТІЛЬКИ 1 рядок (сам заголовок) з УСІЄЮ суттю — КАТЕГОРИЧНО ЗАБОРОНЕНО додавати другий абзац і повторювати ту саму думку двічі!"
         if is_short else
         "- Тіло: 1–2 стислі динамічні абзаци суто по суті з **жирним виділенням** ключових слів (обов'язково збережи головну суть цитати/факту, не обрізай її до одного лише заголовка-анонсу)."
     )
@@ -1075,7 +1106,10 @@ def stem_ru_ukr(word: str) -> str:
         "ами", "ями", "ові", "еві", "єві", "ий", "ій", "ый", "ать", "ить", "еть",
         "а", "е", "є", "и", "і", "о", "у", "ю", "я"
     ]
-    for end in endings:
+    if "их" not in endings:
+        endings.insert(endings.index("ях"), "их")
+    for end_raw in endings:
+        end = end_raw.replace("і", "и").replace("ї", "и")
         if w_norm.endswith(end) and len(w_norm) - len(end) >= 3:
             return w_norm[:-len(end)]
     return w_norm
@@ -1667,7 +1701,7 @@ def telegram_polling_loop():
 # ---------------------------------------------------------
 def bot_worker_loop():
     global global_published_titles
-    logger.info("Запуск бота...")
+    logger.info(f"Запуск бота... Завантажено ключів Groq: {len(GROQ_API_KEYS)}")
     seen_set = set()
     last_regular_post_time = 0
 
