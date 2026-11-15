@@ -185,7 +185,11 @@ STRICT_AD_KEYWORDS = [
     "обговорили в інтерв'ю", 'обговорили в інтерв’ю',
     'дивіться на нашому youtube', 'на нашому youtube',
     'слухайте в подкасті', 'новий епізод подкасту',
-    'читайте в матеріалі', 'повний текст за посиланням'
+    'читайте в матеріалі', 'повний текст за посиланням',
+    # Промо вистав, культурних оглядів та нерелевантних регіональних репортажів РФ
+    'вистава «', 'виставу', 'театральну подію', 'театральна подія',
+    'прем’єра вистави', "прем'єра вистави", 'розкриває матеріал',
+    'люди байкала', 'людей байкала', 'людям байкала'
 ]
 
 def is_strict_ad(text: str, raw_html: str = "") -> bool:
@@ -556,7 +560,13 @@ AI_REFUSAL_PATTERNS = [
     r"текст новини, яку треба",
     r"я підготую стильний",
     r"ось варіант",
-    r"ось рерайт"
+    r"ось рерайт",
+    r"текст уже надано українською",
+    r"текст вже надано українською",
+    r"текст уже українською",
+    r"текст вже українською",
+    r"переклад не потрібен",
+    r"не потребує перекладу"
 ]
 
 def is_ai_refusal(text: str) -> bool:
@@ -779,7 +789,8 @@ def has_russian_text(text: str) -> bool:
         r"\bв киеве\b", r"\bв харькове\b", r"\bв одессе\b", r"\bв днепре\b",
         r"\bпопадание\b", r"\bместные сми\b", r"\bсообщают\b", r"\bв результате\b",
         r"\bпроизошел\b", r"\bпроизошла\b", r"\bсейчас\b", r"\bтакже\b", r"\bоднако\b",
-        r"\bмид\b", r"\bсша\b", r"\bрасскажет\b", r"\bзаявил\b", r"\bпозицию\b"
+        r"\bмид\b", r"\bсша\b", r"\bрасскажет\b", r"\bзаявил\b", r"\bпозицию\b",
+        r"\bесли\b", r"\bтоже\b", r"\bразрушит\b", r"\bокажутся\b", r"\bмосты\b"
     ]
     if any(re.search(p, t) for p in ru_markers):
         return True
@@ -791,6 +802,9 @@ def has_russian_text(text: str) -> bool:
     return False
 
 def _google_translate_ru_to_uk(text: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
     try:
         resp = requests.get(
             "https://translate.googleapis.com/translate_a/single",
@@ -801,16 +815,39 @@ def _google_translate_ru_to_uk(text: str) -> str:
                 "dt": "t",
                 "q": text
             },
-            timeout=10
+            headers=headers,
+            timeout=12
         )
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and data and isinstance(data[0], list):
                 translated = "".join(part[0] for part in data[0] if part and part[0])
-                if translated.strip():
+                if translated.strip() and has_russian_text(translated) is False:
+                    return translated.strip()
+                if translated.strip() and translated.strip() != text.strip():
                     return translated.strip()
     except Exception as e:
         logger.warning(f"Помилка резервного перекладу Google Translate: {e}")
+
+    # Другий безкоштовний резерв (MyMemory API), якщо Google Translate заблокував IP
+    try:
+        chunks = [text[i:i+450] for i in range(0, len(text), 450)]
+        out_parts = []
+        for ch in chunks:
+            r2 = requests.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": ch, "langpair": "ru|uk"},
+                headers=headers,
+                timeout=12
+            )
+            if r2.status_code == 200:
+                tr = r2.json().get("responseData", {}).get("translatedText", "").strip()
+                if tr:
+                    out_parts.append(tr)
+        if out_parts:
+            return " ".join(out_parts).strip()
+    except Exception as e:
+        logger.warning(f"Помилка резервного перекладу MyMemory: {e}")
     return ""
 
 
@@ -854,7 +891,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
     is_short = len(cleaned_input) < 95
 
-    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-80:]]) if published_titles else "(ще немає публікацій)"
+    recent_titles_str = "\n".join([f"- {t}" for t in published_titles[-40:]]) if published_titles else "(ще немає публікацій)"
 
     length_instruction = (
         "- Це КОРОТКЕ повідомлення! Передай УСЮ суть в 1 рядку (сам заголовок) БЕЗ втрати ключових деталей; не обрізай зміст до розмитого анонсу типу «Кушнер про ідеї...»."
@@ -872,7 +909,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 1. Якщо це ТА САМА подія, що вже була у списку — напиши тільки DUPLICATE.
 2. Якщо це ДАЙДЖЕСТ (підсумок дня/вечора, перелік кількох подій) — напиши SKIP.
 3. Якщо це ПОВІТРЯНА ТРИВОГА, загроза балістики/ракет/шахедів, радарне стеження чи попередження про небезпеку БЕЗ фактів реальних влучань, вибухів чи руйнувань — напиши тільки SKIP.
-4. Якщо це реклама, нативний/прихований піар бренду чи компанії, анонс інтерв'ю/подкасту/YouTube-шоу (напр. «обговорюються в інтерв'ю», «новий випуск», річниці бізнесу), щоденне нагадування про хвилину мовчання о 9:00, перепост старої події (минулого тижня/давно) без нової дії сьогодні чи пустий саркастичний мем — напиши SKIP.
+4. Якщо це реклама, нативний/прихований піар бренду чи компанії, анонс інтерв'ю/подкасту/YouTube-шоу, огляд/промо театральної вистави чи книги, побутовий репортаж російських медіа (типу «Люди Байкала» про їхніх контрактників), щоденне нагадування про хвилину мовчання о 9:00, перепост старої події без нової дії сьогодні чи пустий саркастичний мем — напиши SKIP.
 5. Якщо це повноцінна новина — ЗРОБИ СТИЛЬНИЙ РЕРАЙТ СУТО ЗА ФАКТАМИ ОРИГІНАЛУ:
    - Рядок 1: **Емодзі + чіткий інформативний заголовок** (джерело вказуй ТІЛЬКИ якщо це Reuters/Генштаб/чиновник; для відео/повідомлень із соцмереж жодних приписок не став!).
    {length_instruction}
@@ -953,9 +990,10 @@ def rewrite_news_for_admin(raw_text: str) -> str:
 
     if is_ai_refusal(content) or has_hallucinated_facts(cleaned_input, content):
         # Сувора спроба без фантазії
+        strict_prefix = "ПЕРЕКЛАДИ УКРАЇНСЬКОЮ ТА ОФОРМИ" if has_russian_text(cleaned_input) else "ОФОРМИ ГОТОВИЙ ПОСТ УКРАЇНСЬКОЮ (БЕЗ ЖОДНИХ КОМЕНТАРІВ)"
         strict_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"ПЕРЕКЛАДИ УКРАЇНСЬКОЮ ТА ОФОРМИ ПО ФАКТАХ ОРИГІНАЛУ, НІЧОГО НЕ ВИГАДУЙ І НЕ ДОДАВАЙ ВІД СЕБЕ:\n\n{cleaned_input}"}
+            {"role": "user", "content": f"{strict_prefix} СУВОРО ПО ФАКТАХ ОРИГІНАЛУ, НІЧОГО НЕ ВИГАДУЙ І НЕ ДОДАВАЙ ВІД СЕБЕ:\n\n{cleaned_input}"}
         ]
         retry_content = call_groq_with_fallback(strict_messages, temperature=0.1, max_tokens=1024)
         if retry_content and not is_ai_refusal(retry_content) and not has_hallucinated_facts(cleaned_input, retry_content):
@@ -1062,10 +1100,10 @@ GENERIC_NEWS_STEMS = {
     'дани', 'нові', 'нове', 'новин', 'пост', 'фото', 'віде', 'сьогодн', 'вже',
     'може', 'буде', 'також', 'післ', 'чере', 'європейськ', 'европейск',
     'американськ', 'американск', 'окупаційн', 'оккупацион', 'територ', 'ситуац',
-    'рішен', 'решен', 'поді', 'компан', 'робот'
+    'рішен', 'решен', 'поді', 'компан', 'робот', 'официйн', 'офіційн', 'продукци', 'продукці', 'ринок', 'рынок', 'російськ', 'українськ'
 }
 
-def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.33) -> bool:
+def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.36) -> bool:
     new_kw = extract_keywords_stemmed(new_text)
     if len(new_kw) < 3:
         return False
@@ -1077,9 +1115,8 @@ def is_duplicate_news(new_text: str, published_history: list, threshold: float =
         common = new_kw & old_kw
         smaller_len = min(len(new_kw), len(old_kw))
         score = len(common) / smaller_len if smaller_len > 0 else 0
-        rare_common = {w for w in common if len(w) >= 4 and w not in GENERIC_NEWS_STEMS}
-        very_rare_common = {w for w in rare_common if len(w) >= 7}
-        if score >= threshold or len(rare_common) >= 3 or len(very_rare_common) >= 2:
+        rare_common = {w for w in common if len(w) >= 5 and w not in GENERIC_NEWS_STEMS}
+        if score >= threshold or (score >= 0.22 and len(rare_common) >= 4):
             logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, рідкісні спільні корені: {rare_common or common}")
             return True
     return False
@@ -1181,9 +1218,12 @@ def scrape_channel(channel: str, seen_set: set) -> list:
                 photo_url = photo_match.group(1)
 
             video_url = None
-            video_match = re.search(r'<video[^>]+src="([^"]+)"', chunk)
+            video_match = re.search(r'<video[^>]+src="([^"]+)"', chunk) or re.search(r'<source[^>]+src="([^"]+\.mp4[^"]*)"', chunk)
             if video_match:
                 video_url = video_match.group(1)
+            # Якщо це відеопост (є плеєр), але не вдалося витягти mp4 — не публікуємо обрізану обкладинку як фото
+            if not video_url and "tgme_widget_message_video" in chunk:
+                photo_url = None
 
             results.append({
                 "post_id": post_id,
@@ -1265,7 +1305,7 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, ph
     # 1b. Відео по URL (для скрапера донорів)
     if video_url:
         try:
-            v_resp = requests.get(video_url, timeout=20, stream=True)
+            v_resp = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=35, stream=True)
             if v_resp.status_code == 200:
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
                     for chunk in v_resp.iter_content(chunk_size=1024 * 1024):
