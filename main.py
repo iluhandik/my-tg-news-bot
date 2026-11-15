@@ -6,7 +6,8 @@ import logging
 import datetime
 import tempfile
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import hmac
 import html
 import requests
 
@@ -21,6 +22,25 @@ logger = logging.getLogger("NEWS_365_BOT")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@kropivnit").strip()
+
+
+def _load_admin_user_ids() -> set:
+    """Telegram numeric user IDs allowed to submit manual posts (optional)."""
+    raw = os.getenv("ADMIN_USER_IDS", "")
+    result = set()
+    for item in re.split(r"[\s,;]+", raw.strip()):
+        if item:
+            try:
+                result.add(int(item))
+            except ValueError:
+                logger.warning("ADMIN_USER_IDS містить некоректний ID: %r", item)
+    return result
+
+
+ADMIN_USER_IDS = _load_admin_user_ids()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
+
 def _load_groq_keys() -> list:
     raw_sources = [
         os.getenv("GROQ_API_KEY", ""),
@@ -41,6 +61,7 @@ def _load_groq_keys() -> list:
                 keys.append(k)
     return keys
 
+
 GROQ_API_KEYS = _load_groq_keys()
 GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
 PORT = int(os.getenv("PORT", "10000"))
@@ -50,7 +71,7 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 REGULAR_COOLDOWN = int(os.getenv("REGULAR_COOLDOWN", "180"))
 MAX_REGULAR_PER_HOUR = int(os.getenv("MAX_REGULAR_PER_HOUR", "8"))
 
-# ПОВНИЙ СПИСОК КАНАЛІВ-ДОНОРІВ (24 БАЗОВІ + 10 ДОДАНИХ ВАМИ):
+# ПОВНИЙ СПИСОК КАНАЛІВ-ДОНОРІВ:
 DEFAULT_DONORS = [
     # Загальнонаціональні оперативні медіа та офіційні структури:
     "insiderUKR",            # Інсайдер UA
@@ -85,7 +106,7 @@ DEFAULT_DONORS = [
     "zsuwar",                # Збройні Сили України. Війна з окупантами
     "radnyknews",            # Радник
     "insider_zsy",           # Інсайдер ЗСУ
-    "inslandd",              # INVASION (очищаємо від сарказму / меми пропускаємо)
+    "inslandd",              # INVASION
     "nefedovv365",           # 365.nefed
     "xameleon_ua",           # ✙ Хамелеон
     "chp_zahid"              # ЧП Захід | НОВИНИ 24/7
@@ -93,17 +114,75 @@ DEFAULT_DONORS = [
 
 DONOR_CHANNELS = [ch.strip().replace("@", "") for ch in os.getenv("DONOR_CHANNELS", "").split(",") if ch.strip()] or DEFAULT_DONORS
 
+# Передобчислений патерн для видалення @-згадок САМЕ донорів (не чіпає легітимні @username)
+DONOR_USERNAME_PATTERN = "|".join(re.escape(c.lower()) for c in DONOR_CHANNELS) if DONOR_CHANNELS else ""
+
 SEEN_POSTS_FILE = "seen_posts.txt"
-MAX_SEEN_POSTS = 3000
+MAX_SEEN_POSTS = 10000
 
 recent_regular_post_timestamps = []
 global_published_titles = []
+
+
+def load_seen_posts() -> set:
+    """Load processed Telegram post IDs from a local persistent file."""
+    try:
+        with open(SEEN_POSTS_FILE, "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:
+        logger.warning("Не вдалося прочитати %s: %s", SEEN_POSTS_FILE, exc)
+        return set()
+
+
+def _seen_sort_key(value: str) -> tuple:
+    parts = value.rsplit("/", 1)
+    try:
+        return (int(parts[-1]), value)
+    except ValueError:
+        return (0, value)
+
+
+def save_seen_posts(seen: set) -> None:
+    """Atomically persist a bounded set of processed post IDs."""
+    try:
+        values = sorted(seen, key=_seen_sort_key)[-MAX_SEEN_POSTS:]
+        directory = os.path.dirname(os.path.abspath(SEEN_POSTS_FILE))
+        fd, temp_path = tempfile.mkstemp(prefix="seen_", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(values))
+                if values:
+                    f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, SEEN_POSTS_FILE)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    except Exception as exc:
+        logger.warning("Не вдалося зберегти %s: %s", SEEN_POSTS_FILE, exc)
+
+
+def mark_post_processed(seen: set, post_id: str) -> None:
+    seen.add(post_id)
+    if len(seen) > MAX_SEEN_POSTS:
+        seen_copy = sorted(seen, key=_seen_sort_key)
+        seen.clear()
+        seen.update(seen_copy[-MAX_SEEN_POSTS:])
+    save_seen_posts(seen)
+
 
 # ---------------------------------------------------------
 # ЗЧИТУВАННЯ ВЛАСНОГО КАНАЛУ (ЗАХИСТ ПРИ ПЕРЕЗАПУСКУ НА RENDER)
 # ---------------------------------------------------------
 def fetch_own_channel_history(channel_username: str, pages: int = 10) -> tuple:
     ch = channel_username.replace("@", "").strip()
+    # Якщо ID не у форматі @username (numeric -100...), історію з t.me/s/ не отримати
+    if not ch or ch.lstrip("-").isdigit():
+        logger.info("Пропускаю зчитування історії: TELEGRAM_CHANNEL_ID не є @username (%r)", channel_username)
+        return [], []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
     }
@@ -169,20 +248,27 @@ def fetch_own_channel_history(channel_username: str, pages: int = 10) -> tuple:
 
     return titles[-80:], full_posts[-250:]
 
+
 # ---------------------------------------------------------
 # ВИЗНАЧЕННЯ ТЕРМІНОВОСТІ (ЕКСКЛЮЗИВ / МЕГА ВАЖЛИВЕ)
 # ---------------------------------------------------------
-BREAKING_KEYWORDS = [
-    'термінов', 'breaking', 'блискавк', 'вибух', 'влучан', 'приліт',
-    'масован', 'почався обстріл', 'заява зеленськ', 'путін', 'трамп',
-    'ексклюзив', 'важливо!', 'офіційно', 'переговори', 'надзвичайн',
-    'повітряні сили повідомляють', 'збито ракету', 'збито літак',
-    'атака на', 'загиблих', 'постраждалих'
+HARD_BREAKING_TRIGGERS = [
+    'термінов', 'breaking', 'блискавк', 'масован', 'масована атака',
+    'пряме влучання', 'загинули люди', 'є загиблі', 'є постраждалі',
+    'атакували місто', 'атака на місто', 'повітряні сили повідомляють про пуск',
 ]
+SOFT_BREAKING_TRIGGERS = [
+    'влучан', 'приліт', 'прильот', 'вибух у', 'вибухи у', 'вибух в', 'вибухи в',
+]
+
 
 def is_breaking_news(text: str) -> bool:
     t = text.lower()
-    return any(k in t for k in BREAKING_KEYWORDS)
+    if any(k in t for k in HARD_BREAKING_TRIGGERS):
+        return True
+    # М'які тригери (звичайні "вибухи"/"приліт") — тільки якщо Є 2+ маркери одночасно
+    return sum(1 for k in SOFT_BREAKING_TRIGGERS if k in t) >= 2
+
 
 # ---------------------------------------------------------
 # ФІЛЬТРИ: РЕКЛАМА, ДАЙДЖЕСТИ ТА РАДАРНІ ТРИВОГИ
@@ -211,6 +297,7 @@ STRICT_AD_KEYWORDS = [
     'люди байкала', 'людей байкала', 'людям байкала'
 ]
 
+
 def is_strict_ad(text: str, raw_html: str = "") -> bool:
     t = text.lower()
     if any(kw in t for kw in STRICT_AD_KEYWORDS):
@@ -218,6 +305,7 @@ def is_strict_ad(text: str, raw_html: str = "") -> bool:
     if raw_html and re.search(r'(?:utm_source=|utm_medium=|erid=|/advert/|/promo/)', raw_html, re.IGNORECASE):
         return True
     return False
+
 
 DIGEST_KEYWORDS = [
     'вечірній підсумок', 'ранковий підсумок', 'підсумок дня', 'підсумки дня',
@@ -229,6 +317,7 @@ DIGEST_KEYWORDS = [
     'вечерний итог', 'итоги дня', 'главное за день', 'утренний дайджест',
     'вечерний дайджест', 'главное к этому часу'
 ]
+
 
 def is_digest_post(text: str) -> bool:
     t = text.lower()
@@ -244,6 +333,7 @@ def is_digest_post(text: str) -> bool:
         return True
 
     return False
+
 
 def is_air_tracking_alert(text: str) -> bool:
     """
@@ -361,11 +451,12 @@ def is_outdated_event(text: str) -> bool:
         return True
     return False
 
+
 # ---------------------------------------------------------
 # ОЧИЩЕННЯ ВІД СУРЖИКУ ТА ПАФОСУ
 # ---------------------------------------------------------
 SURZHYK_MAP = [
-            (r'\bрозгорнулися вибухи\b', 'пролунали вибухи'),
+    (r'\bрозгорнулися вибухи\b', 'пролунали вибухи'),
     (r'\bвідбулись вибухи\b', 'пролунали вибухи'),
     (r'\bвідбулися вибухи\b', 'пролунали вибухи'),
     (r'\bв конфлікті\b', 'під час війни'),
@@ -374,7 +465,7 @@ SURZHYK_MAP = [
     (r'\bбаллістик', 'балістик'),
     (r'\bбаллістичн', 'балістичн'),
     (r'\bмілітарні сили\b', 'військові'),
-(r'\bзамглавы\b', 'заступник керівника'),
+    (r'\bзамглавы\b', 'заступник керівника'),
     (r'\bзапасаемся\b', 'запасаємося'),
     (r'\bготовимся\b', 'готуємося'),
     (r'\bдлительной войне\b', 'тривалої війни'),
@@ -387,7 +478,7 @@ SURZHYK_MAP = [
     (r'\bводой\b', 'водою'),
     (r'\bводы\b', 'води'),
     (r'\bводу\b', 'воду'),
-(r'\bв октябр[іе]\b', 'у жовтні'),
+    (r'\bв октябр[іе]\b', 'у жовтні'),
     (r'\bв ноябр[іе]\b', 'у листопаді'),
     (r'\bв декабр[іе]\b', 'у грудні'),
     (r'\bв январ[іе]\b', 'у січні'),
@@ -422,6 +513,7 @@ SURZHYK_MAP = [
     (r'\bвідмовили\s+візи\b', 'відмовили у візах')
 ]
 
+
 def _fix_trump_title(m) -> str:
     s = m.group(0)
     cap = s[0].isupper()
@@ -436,6 +528,7 @@ def _fix_trump_title(m) -> str:
         res = "президент США Трамп"
     return res[0].upper() + res[1:] if cap else res
 
+
 def clean_surzhyk_and_russian(text: str) -> str:
     cleaned = text
     for pattern, replacement in SURZHYK_MAP:
@@ -447,6 +540,7 @@ def clean_surzhyk_and_russian(text: str) -> str:
         flags=re.IGNORECASE
     )
     return cleaned
+
 
 DONOR_CHANNEL_TAGS = [
     r"insider\s*ua", r"інсайдер\s*ua", r"инсайдер\s*ua", r"інсайдер", r"инсайдер",
@@ -463,10 +557,13 @@ DONOR_CHANNEL_TAGS = [
 ]
 DONOR_TAG_PATTERN = r"(?i)\s*[,—–-]\s*(?:" + "|".join(DONOR_CHANNEL_TAGS) + r")[^\n]*$"
 
+
 def strip_donor_artifacts(text: str) -> str:
     cleaned = re.sub(r"https?://(?:t|telegram)\.me/[A-Za-z0-9_+/]+", "", text, flags=re.IGNORECASE)
     cleaned = re.sub(r"t\.me/[A-Za-z0-9_+/]+", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"@[A-Za-z0-9_]{3,}", "", cleaned)
+    # Видаляємо @-згадки лише донорів, не чіпаючи легітимні @username (напр. офіційні канали)
+    if DONOR_USERNAME_PATTERN:
+        cleaned = re.sub(rf"(?i)@(?:{DONOR_USERNAME_PATTERN})\b", "", cleaned)
 
     lines = cleaned.splitlines()
     filtered_lines = []
@@ -479,6 +576,7 @@ def strip_donor_artifacts(text: str) -> str:
     cleaned = "\n".join(filtered_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
 
 def clean_ai_fluff(text: str) -> str:
     fluff_patterns = [
@@ -538,6 +636,7 @@ def remove_redundant_body(text: str) -> str:
         return header
 
     return text.strip()
+
 
 # ---------------------------------------------------------
 # GROQ API: СУЧАСНИЙ ДИНАМІЧНИЙ ТЕЛЕГРАМ-СТИЛЬ
@@ -613,7 +712,7 @@ AI_REFUSAL_PATTERNS = [
     r"language model",
     r"safety guidelines",
     r"вибачте",
-    r"я не можу",
+    r"я не можу (?:допомогти|виконати|надати|обробити|перекласти|опублікувати|відповісти|опрацювати)",
     r"надішліть(?:, будь ласка)?",
     r"надішли(?:, будь ласка)?",
     r"текст новини, яку треба",
@@ -627,6 +726,7 @@ AI_REFUSAL_PATTERNS = [
     r"переклад не потрібен",
     r"не потребує перекладу"
 ]
+
 
 def is_ai_refusal(text: str) -> bool:
     if not text:
@@ -699,7 +799,7 @@ def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
         logger.warning(f"Штучне роздування короткої новини ({len(source_text)} -> {len(output_text)} символів)")
         return True
 
-    # 2.5. Перевірка вигаданих політиків/посадовців (напр. приписали Зеленському слова про «бункерного»)
+    # 2.5. Перевірка вигаданих політиків/посадовців
     person_guards = [
         (["зеленськ"], ["зеленськ", "зеленск", "президент україни", "президент украины", "глава держави"]),
         (["путін", "путин"], ["путін", "путин", "бункерн", "кремл", "диктатор"]),
@@ -723,7 +823,7 @@ def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
         (["загибл", "погиб", "жертв", "смерт"], ["загибл", "загинул", "погиб", "жертв", "смерт", "труп", "200"]),
         (["постраждал", "поранен", "пострадав", "ранен", "травм"], ["постраждал", "поранен", "пострадав", "ранен", "травм", "ушкодж"]),
         (["заперечил", "спростувал", "опроверг"], ["заперечил", "спростувал", "опроверг", "фейк"]),
-        (["запалені будівл", "районному сектору"], ["будівл", "здани", "дом", "сектор"]),
+        (["запалені будівл", "районному сектору"], ["запалені", "підпал", "горіла будівля", "районний сектор"]),
         (["касетн", "кассетн"], ["касетн", "кассетн"]),
     ]
     for out_markers, src_markers in sensitive_groups:
@@ -733,7 +833,9 @@ def has_hallucinated_facts(source_text: str, output_text: str) -> bool:
 
     return False
 
+
 model_cooldowns = {}
+
 
 def _parse_retry_after_seconds(err_text: str) -> int:
     m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", err_text, re.IGNORECASE)
@@ -742,6 +844,7 @@ def _parse_retry_after_seconds(err_text: str) -> int:
         secs = float(m.group(2) or 0)
         return max(30, min(int(mins * 60 + secs), 3600))
     return 120
+
 
 def _any_groq_model_available() -> bool:
     if not GROQ_API_KEYS:
@@ -753,6 +856,7 @@ def _any_groq_model_available() -> bool:
             if now >= model_cooldowns.get((key_idx, model_name), 0):
                 return True
     return False
+
 
 def _soonest_groq_reset_seconds() -> int:
     if not GROQ_API_KEYS:
@@ -766,6 +870,7 @@ def _soonest_groq_reset_seconds() -> int:
     ]
     soonest = min(waits, default=30)
     return max(15, min(int(soonest) + 2, 60))
+
 
 def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_tokens: int = 2048) -> str:
     if not GROQ_API_KEYS:
@@ -802,9 +907,17 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
                     timeout=25
                 )
                 if resp.status_code == 200:
-                    res_json = resp.json()
-                    content = res_json["choices"][0]["message"]["content"].strip()
+                    try:
+                        res_json = resp.json()
+                        content = (res_json["choices"][0]["message"].get("content") or "").strip()
+                    except (KeyError, IndexError, ValueError) as exc:
+                        logger.warning(f"Модель {model_name} (ключ #{key_idx + 1}): неочікувана структура відповіді ({exc}). Пропуск.")
+                        continue
+
                     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    if not content:
+                        logger.warning(f"Модель {model_name} (ключ #{key_idx + 1}): порожня відповідь. Пропуск.")
+                        continue
                     if is_ai_refusal(content):
                         logger.warning(f"Модель {model_name} (ключ #{key_idx + 1}) видала safety refusal: {content[:100]}. Перемикаюсь далі...")
                         break
@@ -826,9 +939,10 @@ def call_groq_with_fallback(messages: list, temperature: float = 0.45, max_token
                     logger.error(f"Ключ Groq #{key_idx + 1} недійсний (401). Вимикаю його на 24 години.")
                     continue
                 elif resp.status_code in (400, 404):
-                    model_cooldowns[cd_key] = time.time() + 86400
+                    for k_idx in range(len(GROQ_API_KEYS)):
+                        model_cooldowns[(k_idx, model_name)] = time.time() + 86400
                     logger.warning(f"Модель {model_name} недоступна ({resp.status_code}): {resp.text[:200]}")
-                    continue
+                    break
                 else:
                     logger.error(f"Помилка Groq {model_name} (ключ #{key_idx + 1}, {resp.status_code}): {resp.text[:300]}")
                     continue
@@ -853,12 +967,12 @@ def has_russian_text(text: str) -> bool:
     ]
     if any(re.search(p, t) for p in ru_markers):
         return True
-    # Якщо текст кирилицею (> 25 символів) і не містить жодної української літери (і, ї, є, ґ) — це російська
     cyrillic_count = len(re.findall(r"[а-яА-ЯёЁ]", t))
     has_ukr_letters = any(ch in t for ch in ["і", "ї", "є", "ґ"])
     if cyrillic_count > 25 and not has_ukr_letters:
         return True
     return False
+
 
 def _google_translate_ru_to_uk(text: str) -> str:
     headers = {
@@ -910,7 +1024,6 @@ def _google_translate_ru_to_uk(text: str) -> str:
     return ""
 
 
-
 def translate_to_ukrainian(text: str) -> str:
     if not text.strip():
         return text
@@ -931,11 +1044,16 @@ def translate_to_ukrainian(text: str) -> str:
     if gt:
         logger.info("Використано резервний переклад Google Translate (Groq недоступний)")
         return strip_donor_artifacts(clean_surzhyk_and_russian(gt))
-    return text
+
+    logger.error("Не вдалося перекласти російський текст українською. Публікацію скасовано.")
+    return ""
+
 
 def format_fallback_post(text: str) -> str:
     if has_russian_text(text):
         text = translate_to_ukrainian(text)
+        if not text.strip():
+            return ""
     text = clean_surzhyk_and_russian(text)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if not lines:
@@ -945,6 +1063,7 @@ def format_fallback_post(text: str) -> str:
     starts_with_emoji = bool(re.match(r"^[‼️❗️⚡️🚨🔴👉⏩➡️▶️💥🔥🇺🇦🇷🇺🇺🇸🇪🇺🇬🇧]", first_line))
     header = f"**{first_line}**" if starts_with_emoji else f"**⚡️ {first_line}**"
     return f"{header}\n\n{body}" if body else header
+
 
 def rewrite_news(raw_text: str, published_titles: list) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
@@ -997,6 +1116,9 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
     content = clean_surzhyk_and_russian(content)
     if has_russian_text(content):
         content = translate_to_ukrainian(content)
+        if not content.strip():
+            logger.warning("Після рерайту текст залишився російськомовним і переклад не вдався — пропуск.")
+            return ""
     content = strip_donor_artifacts(content)
     content = remove_redundant_body(content)
 
@@ -1013,6 +1135,7 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
         content = remove_redundant_body(strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content))))
 
     return content
+
 
 def rewrite_news_for_admin(raw_text: str) -> str:
     cleaned_input = strip_donor_artifacts(raw_text)
@@ -1048,7 +1171,6 @@ def rewrite_news_for_admin(raw_text: str) -> str:
         return format_fallback_post(cleaned_input)
 
     if is_ai_refusal(content) or has_hallucinated_facts(cleaned_input, content):
-        # Сувора спроба без фантазії
         strict_prefix = "ПЕРЕКЛАДИ УКРАЇНСЬКОЮ ТА ОФОРМИ" if has_russian_text(cleaned_input) else "ОФОРМИ ГОТОВИЙ ПОСТ УКРАЇНСЬКОЮ (БЕЗ ЖОДНИХ КОМЕНТАРІВ)"
         strict_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -1065,9 +1187,13 @@ def rewrite_news_for_admin(raw_text: str) -> str:
     content = clean_surzhyk_and_russian(content)
     if has_russian_text(content):
         content = translate_to_ukrainian(content)
+        if not content.strip():
+            logger.warning("Переклад не вдався. Оформлюємо fallback-версію.")
+            return format_fallback_post(cleaned_input)
     content = strip_donor_artifacts(content)
     content = remove_redundant_body(content)
     return content
+
 
 def clean_html_text(raw_html: str) -> str:
     text = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
@@ -1076,8 +1202,10 @@ def clean_html_text(raw_html: str) -> str:
     text = html.unescape(text)
     return text.strip()
 
+
 PUBLISHED_HISTORY_FILE = "published_history.json"
 MAX_PUBLISHED_HISTORY = 300
+published_history_lock = threading.RLock()
 
 STOP_WORDS = {
     'про', 'що', 'для', 'але', 'або', 'який', 'яка', 'яке', 'які', 'його',
@@ -1090,6 +1218,7 @@ STOP_WORDS = {
     'было', 'будет', 'были', 'когда', 'если', 'после', 'этого', 'этому',
     'также', 'может', 'могут', 'более', 'менее', 'очень', 'сообщает', 'сообщил'
 }
+
 
 def stem_ru_ukr(word: str) -> str:
     w = word.lower().strip()
@@ -1142,6 +1271,7 @@ def stem_ru_ukr(word: str) -> str:
             return w_norm[:-len(end)]
     return w_norm
 
+
 def extract_keywords_stemmed(text: str) -> set:
     words = re.findall(r'[а-яіїєґa-z0-9]{3,}', text.lower())
     stems = set()
@@ -1152,6 +1282,7 @@ def extract_keywords_stemmed(text: str) -> set:
         if len(st) >= 3 and st not in STOP_WORDS:
             stems.add(st)
     return stems
+
 
 GENERIC_NEWS_STEMS = {
     'украин', 'україн', 'українськ', 'украинск', 'роси', 'росі', 'російськ', 'российск',
@@ -1165,12 +1296,18 @@ GENERIC_NEWS_STEMS = {
     'рішен', 'решен', 'поді', 'компан', 'робот', 'официйн', 'офіційн', 'продукци', 'продукці', 'ринок', 'рынок', 'російськ', 'українськ'
 }
 
-def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.36) -> bool:
+
+def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.36,
+                      max_age_seconds: int = 7 * 24 * 3600) -> bool:
     new_kw = extract_keywords_stemmed(new_text)
     if len(new_kw) < 3:
         return False
 
+    now = time.time()
     for item in published_history:
+        # Ігноруємо старі записи (> 7 днів) — новина вже не «свіжа»
+        if item.get("timestamp") and (now - item["timestamp"]) > max_age_seconds:
+            continue
         old_kw = set(item.get("stems", []))
         if not old_kw:
             continue
@@ -1183,23 +1320,41 @@ def is_duplicate_news(new_text: str, published_history: list, threshold: float =
             return True
     return False
 
+
 def load_published_history() -> list:
-    if os.path.exists(PUBLISHED_HISTORY_FILE):
-        try:
-            with open(PUBLISHED_HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception as e:
-            logger.warning(f"Не вдалося завантажити {PUBLISHED_HISTORY_FILE}: {e}")
-    return []
+    with published_history_lock:
+        if os.path.exists(PUBLISHED_HISTORY_FILE):
+            try:
+                with open(PUBLISHED_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return data[-MAX_PUBLISHED_HISTORY:]
+            except Exception as e:
+                logger.warning(f"Не вдалося завантажити {PUBLISHED_HISTORY_FILE}: {e}")
+        return []
+
 
 def save_published_history(history: list):
-    try:
-        with open(PUBLISHED_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history[-MAX_PUBLISHED_HISTORY:], f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"Не вдалося зберегти {PUBLISHED_HISTORY_FILE}: {e}")
+    """Write history atomically so an interrupted process cannot leave broken JSON."""
+    with published_history_lock:
+        temp_path = None
+        try:
+            directory = os.path.dirname(os.path.abspath(PUBLISHED_HISTORY_FILE))
+            fd, temp_path = tempfile.mkstemp(prefix="history_", suffix=".tmp", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(history[-MAX_PUBLISHED_HISTORY:], f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, PUBLISHED_HISTORY_FILE)
+        except Exception as e:
+            logger.warning(f"Не вдалося зберегти {PUBLISHED_HISTORY_FILE}: {e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
 
 def scrape_channel(channel: str, seen_set: set) -> list:
     url = f"https://t.me/s/{channel}"
@@ -1222,7 +1377,7 @@ def scrape_channel(channel: str, seen_set: set) -> list:
         now = datetime.datetime.now(datetime.timezone.utc)
         results = []
 
-        for chunk in message_chunks[-5:]:
+        for chunk in message_chunks[-25:]:
             id_match = re.search(r'data-post="([^"]+)"', chunk)
             if not id_match:
                 continue
@@ -1300,9 +1455,18 @@ def scrape_channel(channel: str, seen_set: set) -> list:
         logger.error(f"Помилка скрапінгу {channel}: {e}")
         return []
 
+
 # ---------------------------------------------------------
 # ПУБЛІКАЦІЯ В TELEGRAM КАНАЛ
 # ---------------------------------------------------------
+def telegram_response_ok(response) -> bool:
+    try:
+        payload = response.json()
+        return response.status_code == 200 and payload.get("ok") is True
+    except Exception:
+        return False
+
+
 def markdown_to_telegram_html(text: str) -> str:
     raw = text.strip()
     if not raw:
@@ -1327,19 +1491,25 @@ def markdown_to_telegram_html(text: str) -> str:
     t = re.sub(r"\*(.*?)\*", r"<i>\1</i>", t)
     return t
 
-def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, photo_file_id: str = None, video_file_id: str = None) -> bool:
+
+def post_to_telegram(text: str, photo_url: str = None, video_url: str = None,
+                     photo_file_id: str = None, video_file_id: str = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
         logger.error("TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не задано!")
         return False
 
     formatted_text = markdown_to_telegram_html(text)
     signature = '\n\n👉 <a href="https://t.me/kropivnit">NEWS УКРАЇНА 365 | Підписатися</a>'
-    
+
+    # Caption для медіа — ліміт 1024 символи
     caption = formatted_text + signature
     if len(caption) > 1020:
-        max_body_len = 1020 - len(signature)
-        formatted_text = formatted_text[:max_body_len].rstrip()
-        caption = formatted_text + signature
+        caption = formatted_text[:1020 - len(signature)].rstrip() + signature
+
+    # Повний текст для sendMessage — ліміт 4096 символів
+    full_text = formatted_text + signature
+    if len(full_text) > 4096:
+        full_text = formatted_text[:4096 - len(signature)].rstrip() + signature
 
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -1356,25 +1526,45 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, ph
                 },
                 timeout=30
             )
-            if res.status_code == 200:
+            if telegram_response_ok(res):
                 logger.info("Відео (file_id) успішно опубліковано")
                 return True
-            else:
-                logger.warning(f"sendVideo по file_id помилка ({res.status_code}): {res.text[:200]}")
+            if res.status_code == 429:
+                try:
+                    wait = int(res.json().get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    wait = 5
+                wait = min(max(wait, 1), 60)
+                logger.warning(f"Telegram 429 на sendVideo, чекаю {wait}с і повторюю...")
+                time.sleep(wait)
+                res = requests.post(
+                    f"{base_api}/sendVideo",
+                    json={
+                        "chat_id": TELEGRAM_CHANNEL_ID,
+                        "video": video_file_id,
+                        "caption": caption,
+                        "parse_mode": "HTML"
+                    },
+                    timeout=30
+                )
+                if telegram_response_ok(res):
+                    logger.info("Відео (file_id) успішно опубліковано після retry")
+                    return True
+            logger.warning(f"sendVideo по file_id помилка ({res.status_code}): {res.text[:200]}")
         except Exception as e:
             logger.error(f"Помилка sendVideo по file_id: {e}")
 
     # 1b. Відео по URL (для скрапера донорів)
     if video_url:
+        tmp_path = None
         try:
-            v_resp = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=35, stream=True)
+            v_resp = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, stream=True)
             if v_resp.status_code == 200:
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                    tmp_path = tf.name
                     for chunk in v_resp.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             tf.write(chunk)
-                    tmp_path = tf.name
-
                 try:
                     with open(tmp_path, "rb") as vf:
                         res = requests.post(
@@ -1385,13 +1575,14 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, ph
                                 "parse_mode": "HTML"
                             },
                             files={"video": vf},
-                            timeout=60
+                            timeout=90
                         )
-                        if res.status_code == 200:
+                        if telegram_response_ok(res):
                             logger.info("Відео успішно опубліковано")
                             return True
+                        logger.warning(f"sendVideo(URL) помилка ({res.status_code}): {res.text[:200]}")
                 finally:
-                    if os.path.exists(tmp_path):
+                    if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
         except Exception as e:
             logger.error(f"Помилка відео: {e}")
@@ -1409,23 +1600,22 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, ph
                 },
                 timeout=30
             )
-            if res.status_code == 200:
+            if telegram_response_ok(res):
                 logger.info("Фото (file_id) успішно опубліковано")
                 return True
-            else:
-                logger.warning(f"sendPhoto по file_id помилка ({res.status_code}): {res.text[:200]}")
+            logger.warning(f"sendPhoto по file_id помилка ({res.status_code}): {res.text[:200]}")
         except Exception as e:
             logger.error(f"Помилка sendPhoto по file_id: {e}")
 
     # 2b. Фото по URL
     if photo_url:
+        tmp_path = None
         try:
-            p_resp = requests.get(photo_url, timeout=15)
+            p_resp = requests.get(photo_url, timeout=20)
             if p_resp.status_code == 200:
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
                     tf.write(p_resp.content)
                     tmp_path = tf.name
-
                 try:
                     with open(tmp_path, "rb") as pf:
                         res = requests.post(
@@ -1438,18 +1628,18 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, ph
                             files={"photo": pf},
                             timeout=30
                         )
-                        if res.status_code == 200:
+                        if telegram_response_ok(res):
                             logger.info("Фото успішно опубліковано")
                             return True
+                        logger.warning(f"sendPhoto(URL) помилка ({res.status_code}): {res.text[:200]}")
                 finally:
-                    if os.path.exists(tmp_path):
+                    if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
         except Exception as e:
             logger.error(f"Помилка фото: {e}")
 
-    # 3. Текст (вимикаємо прев'ю посилань, щоб не було великої плашки каналу знизу)
+    # 3. Текст (4096 ліміт!) — вимикаємо прев'ю посилань
     try:
-        full_text = formatted_text + signature
         res = requests.post(
             f"{base_api}/sendMessage",
             json={
@@ -1463,15 +1653,15 @@ def post_to_telegram(text: str, photo_url: str = None, video_url: str = None, ph
             },
             timeout=20
         )
-        if res.status_code == 200:
+        if telegram_response_ok(res):
             logger.info("Текст успішно опубліковано")
             return True
-        else:
-            logger.error(f"sendMessage помилка: {res.text}")
-            return False
+        logger.error(f"sendMessage помилка ({res.status_code}): {res.text[:300]}")
+        return False
     except Exception as e:
         logger.error(f"Виняток sendMessage: {e}")
         return False
+
 
 def post_media_group_to_telegram(text: str, media_items: list) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID or not media_items:
@@ -1482,16 +1672,15 @@ def post_media_group_to_telegram(text: str, media_items: list) -> bool:
         formatted_text = markdown_to_telegram_html(text)
         caption = formatted_text + signature
         if len(caption) > 1020:
-            max_body_len = 1020 - len(signature)
-            formatted_text = formatted_text[:max_body_len].rstrip()
-            caption = formatted_text + signature
+            caption = formatted_text[:1020 - len(signature)].rstrip() + signature
     else:
         caption = '👉 <a href="https://t.me/kropivnit">NEWS УКРАЇНА 365 | Підписатися</a>'
 
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-    # Telegram дозволяє до 10 медіа в одному альбомі
+    any_success = False
     all_ok = True
+    # Telegram дозволяє до 10 медіа в одному альбомі
     for start in range(0, len(media_items), 10):
         batch = media_items[start:start + 10]
         media_payload = []
@@ -1514,8 +1703,9 @@ def post_media_group_to_telegram(text: str, media_items: list) -> bool:
                 },
                 timeout=30
             )
-            if res.status_code == 200:
+            if telegram_response_ok(res):
                 logger.info(f"Альбом із {len(batch)} медіафайлів успішно опубліковано")
+                any_success = True
             else:
                 logger.error(f"sendMediaGroup помилка: {res.text}")
                 all_ok = False
@@ -1523,25 +1713,41 @@ def post_media_group_to_telegram(text: str, media_items: list) -> bool:
             logger.error(f"Виняток sendMediaGroup: {e}")
             all_ok = False
 
-    return all_ok
+    if any_success and not all_ok:
+        logger.warning("Альбом опубліковано ЧАСТКОВО (деякі батчі не пройшли)")
+    return any_success
+
 
 media_group_buffer = {}
 media_group_lock = threading.Lock()
 
-def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = None, video_url: str = None, media_items: list = None, photo_file_id: str = None, video_file_id: str = None):
+
+def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = None,
+                                    video_url: str = None, media_items: list = None,
+                                    photo_file_id: str = None, video_file_id: str = None):
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
     if chat_id:
-        requests.post(f"{base_api}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": "⏳ Обробляю новину та готую публікацію..."
-        })
+        try:
+            requests.post(f"{base_api}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "⏳ Обробляю новину та готую публікацію..."
+            }, timeout=10)
+        except Exception:
+            pass
 
     rewritten = ""
     if raw_text and raw_text.strip():
         rewritten = rewrite_news_for_admin(raw_text)
         if not rewritten:
             rewritten = strip_donor_artifacts(raw_text)
+
+    if media_items and len(media_items) == 1:
+        it = media_items[0]
+        if it["type"] == "photo" and not photo_file_id:
+            photo_file_id = it.get("file_id")
+        elif it["type"] == "video" and not video_file_id:
+            video_file_id = it.get("file_id")
 
     if media_items and len(media_items) > 1:
         success = post_media_group_to_telegram(text=rewritten, media_items=media_items)
@@ -1557,33 +1763,42 @@ def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = Non
     if success:
         first_line = rewritten.split('\n')[0].replace('*', '').strip() if rewritten else "(медіа без тексту)"
         if rewritten:
+            global global_published_titles
             global_published_titles.append(first_line)
-            h = load_published_history()
-            h.append({
-                "headline": first_line,
-                "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
-                "timestamp": time.time()
-            })
-            save_published_history(h)
             if len(global_published_titles) > 80:
                 global_published_titles.pop(0)
+            with published_history_lock:
+                h = load_published_history()
+                h.append({
+                    "headline": first_line,
+                    "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
+                    "timestamp": time.time()
+                })
+                save_published_history(h)
 
         if chat_id:
-            requests.post(f"{base_api}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": f"✅ <b>Новину опубліковано в каналі!</b>\n\n<b>Заголовок:</b> {first_line}",
-                "parse_mode": "HTML"
-            })
+            try:
+                requests.post(f"{base_api}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": f"✅ <b>Новину опубліковано в каналі!</b>\n\n<b>Заголовок:</b> {first_line}",
+                    "parse_mode": "HTML"
+                }, timeout=10)
+            except Exception:
+                pass
         logger.info(f"Новину від користувача опубліковано: {first_line}")
     else:
         if chat_id:
-            requests.post(f"{base_api}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "❌ Помилка під час публікації. Перевірте статус бота."
-            })
+            try:
+                requests.post(f"{base_api}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": "❌ Помилка під час публікації. Перевірте статус бота."
+                }, timeout=10)
+            except Exception:
+                pass
+
 
 def _flush_media_group(media_group_id: str):
-    time.sleep(2.2)
+    time.sleep(2.5)
     with media_group_lock:
         group = media_group_buffer.pop(media_group_id, None)
     if not group:
@@ -1606,12 +1821,18 @@ def _flush_media_group(media_group_id: str):
         media_items=items
     )
 
+
 # ---------------------------------------------------------
 # ОБРОБКА ПОВІДОМЛЕНЬ ВІД КОРИСТУВАЧА (В ПРИВАТНІ ПОВІДОМЛЕННЯ)
 # ---------------------------------------------------------
 def handle_incoming_update(update: dict):
     msg = update.get("message")
     if not msg:
+        return
+
+    sender_id = (msg.get("from") or {}).get("id")
+    if ADMIN_USER_IDS and sender_id not in ADMIN_USER_IDS:
+        logger.warning("Відхилено ручне повідомлення від неавторизованого Telegram user_id=%s", sender_id)
         return
 
     chat_id = msg.get("chat", {}).get("id")
@@ -1666,10 +1887,13 @@ def handle_incoming_update(update: dict):
 
     if raw_text.strip() == "/start":
         if chat_id:
-            requests.post(f"{base_api}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "👋 Привіт! Надішли мені новину (текст, фото, відео або альбом), і я відредагую її та опублікую в каналі NEWS УКРАЇНА 365."
-            })
+            try:
+                requests.post(f"{base_api}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": "👋 Привіт! Надішли мені новину (текст, фото, відео або альбом), і я відредагую її та опублікую в каналі NEWS УКРАЇНА 365."
+                }, timeout=10)
+            except Exception:
+                pass
         return
 
     # Якщо це альбом (кілька фото/відео в одному пості) — збираємо всі частини разом!
@@ -1691,7 +1915,7 @@ def handle_incoming_update(update: dict):
             threading.Thread(target=_flush_media_group, args=(media_group_id,), daemon=True).start()
         return
 
-    logger.info(f"Отримано новину від користувача (chat_id: {chat_id}): {raw_text[:50]}...")
+    logger.info("Отримано ручну новину від користувача (chat_id: %s, chars: %s)", chat_id, len(raw_text))
     _process_and_publish_admin_post(
         chat_id=chat_id,
         raw_text=raw_text,
@@ -1701,28 +1925,52 @@ def handle_incoming_update(update: dict):
         video_file_id=video_file_id
     )
 
+
 # ---------------------------------------------------------
 # TELEGRAM POLLING LOOP (ЯКЩО ВЕБХУК НЕ НАЛАШТОВАНО)
 # ---------------------------------------------------------
 def telegram_polling_loop():
     logger.info("Запуск Telegram Polling для прийому ручних новин...")
-    offset = 0
+    offset_file = "telegram_update_offset.txt"
+    try:
+        with open(offset_file, "r", encoding="utf-8") as f:
+            offset = max(0, int(f.read().strip() or 0))
+    except (OSError, ValueError):
+        offset = 0
+
     base_api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     while True:
         try:
-            resp = requests.get(f"{base_api}/getUpdates?offset={offset}&timeout=20", timeout=30)
+            resp = requests.get(
+                f"{base_api}/getUpdates",
+                params={"offset": offset, "timeout": 20, "allowed_updates": ["message"]},
+                timeout=30
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("ok"):
                     for update in data.get("result", []):
+                        threading.Thread(
+                            target=handle_incoming_update,
+                            args=(update,),
+                            daemon=True
+                        ).start()
                         offset = update["update_id"] + 1
-                        threading.Thread(target=handle_incoming_update, args=(update,), daemon=True).start()
+                        try:
+                            with open(offset_file, "w", encoding="utf-8") as f:
+                                f.write(str(offset))
+                        except OSError as exc:
+                            logger.warning("Не вдалося зберегти polling offset: %s", exc)
             elif resp.status_code == 409:
-                time.sleep(60)
+                logger.error("Telegram polling отримав 409 Conflict: перевірте, чи не працює інший екземпляр бота або webhook.")
+                time.sleep(30)
             else:
+                logger.warning("Telegram getUpdates: HTTP %s", resp.status_code)
                 time.sleep(5)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Помилка Telegram polling: %s", exc)
             time.sleep(5)
+
 
 # ---------------------------------------------------------
 # ГОЛОВНИЙ ЦИКЛ БОТА ІЗ РОЗУМНИМ КОНТРОЛЕМ
@@ -1730,7 +1978,7 @@ def telegram_polling_loop():
 def bot_worker_loop():
     global global_published_titles
     logger.info(f"Запуск бота... Завантажено ключів Groq: {len(GROQ_API_KEYS)}")
-    seen_set = set()
+    seen_set = load_seen_posts()
     last_regular_post_time = 0
 
     # 1. ЗАХИСТ ВІД ПОВТОРІВ ПІСЛЯ РЕСТАРТУ НА RENDER:
@@ -1744,28 +1992,39 @@ def bot_worker_loop():
             published_history.append({"headline": first_l, "stems": list(st), "timestamp": time.time()})
     save_published_history(published_history)
 
-
     # 2. ЗАХИСТ ВІД СТАРТОВОЇ ЛАВИНИ:
-    logger.info(f"Ініціалізація {len(DONOR_CHANNELS)} донорів: фіксуємо старий беклог, щоб не спамити...")
-    for ch in DONOR_CHANNELS:
-        try:
-            url = f"https://t.me/s/{ch}"
-            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-            if resp.status_code == 200:
-                post_ids = re.findall(r'data-post="([^"]+)"', resp.text)
-                for pid in post_ids:
-                    seen_set.add(pid)
-        except Exception:
-            pass
-        time.sleep(0.4)
-    logger.info(f"Ініціалізацію завершено. Зафіксовано {len(seen_set)} існуючих постів. Бот чекає свіжих новин!")
+    if not seen_set:
+        logger.info(f"Перше ініціювання {len(DONOR_CHANNELS)} донорів: позначаємо поточний беклог, щоб не створити лавину постів...")
+        for ch in DONOR_CHANNELS:
+            try:
+                url = f"https://t.me/s/{ch}"
+                resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+                if resp.status_code == 200:
+                    for pid in re.findall(r'data-post="([^"]+)"', resp.text):
+                        seen_set.add(pid)
+            except Exception as exc:
+                logger.warning("Не вдалося ініціалізувати донор %s: %s", ch, exc)
+            time.sleep(0.4)
+        save_seen_posts(seen_set)
+    else:
+        logger.info("Завантажено %s раніше оброблених ID; нові повідомлення залишаються в черзі.", len(seen_set))
+    logger.info(f"Ініціалізацію завершено. Відомих ID: {len(seen_set)}.")
 
     # 3. Реєстрація вебхука або запуск polling для прийому новин від адміна в ПП
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
+        wh_payload = {"url": webhook_url, "allowed_updates": ["message"]}
+        if TELEGRAM_WEBHOOK_SECRET:
+            wh_payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
         try:
-            w_res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_url}", timeout=10)
-            logger.info(f"Встановлення Webhook на {webhook_url}: {w_res.text}")
+            w_res = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+                json=wh_payload,
+                timeout=10
+            )
+            logger.info("Встановлення webhook на %s: HTTP %s, ok=%s",
+                        webhook_url, w_res.status_code,
+                        (w_res.json().get("ok") if w_res.headers.get("content-type", "").startswith("application/json") else False))
         except Exception as e:
             logger.error(f"Помилка setWebhook: {e}")
     else:
@@ -1796,8 +2055,6 @@ def bot_worker_loop():
                     post_id = item["post_id"]
                     raw_text = item["text"]
 
-                    seen_set.add(post_id)
-
                     is_breaking = is_breaking_news(raw_text)
 
                     # --- ЛОГІКА РОЗПОДІЛУ ТЕМПУ ---
@@ -1819,18 +2076,23 @@ def bot_worker_loop():
                     # АЛГОРИТМІЧНИЙ ЗАХИСТ ВІД ПОВТОРІВ (ДО ЗАПИТУ В GROQ):
                     if is_duplicate_news(raw_text, published_history):
                         logger.info(f"Алгоритмічний фільтр відхилив повтор новини: {raw_text[:60]}...")
-                        seen_set.add(post_id)
+                        mark_post_processed(seen_set, post_id)
                         continue
 
                     logger.info(f"Обробка поста {post_id} (Терміново: {is_breaking})...")
                     rewritten = rewrite_news(raw_text, global_published_titles)
 
                     if not rewritten:
+                        if not _any_groq_model_available():
+                            # Усі ключі/моделі на паузі 429 — не позначаємо як оброблене, щоб дочекатися скидання ліміту
+                            break
+                        mark_post_processed(seen_set, post_id)
                         continue
 
                     # Повторна перевірка на дублікат ВЖЕ ПІСЛЯ рерайту українською
                     if is_duplicate_news(rewritten, published_history):
                         logger.info(f"Повтор виявлено після рерайту: {rewritten.splitlines()[0][:60]}...")
+                        mark_post_processed(seen_set, post_id)
                         continue
 
                     success = post_to_telegram(
@@ -1840,15 +2102,19 @@ def bot_worker_loop():
                     )
 
                     if success:
+                        mark_post_processed(seen_set, post_id)
                         current_t = time.time()
                         first_line = rewritten.split('\n')[0].replace('*', '').strip()
                         global_published_titles.append(first_line)
-                        published_history.append({
-                            "headline": first_line,
-                            "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
-                            "timestamp": current_t
-                        })
-                        save_published_history(published_history)
+                        with published_history_lock:
+                            h = load_published_history()
+                            h.append({
+                                "headline": first_line,
+                                "stems": list(extract_keywords_stemmed(rewritten + " " + raw_text)),
+                                "timestamp": current_t
+                            })
+                            save_published_history(h)
+                            published_history = h
                         if len(global_published_titles) > 80:
                             global_published_titles.pop(0)
 
@@ -1870,42 +2136,60 @@ def bot_worker_loop():
             logger.error(f"Помилка в головному циклі: {e}", exc_info=True)
             time.sleep(20)
 
+
 # ---------------------------------------------------------
 # ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH CHECK ТА WEBHOOK ДЛЯ ПОВІДОМЛЕНЬ)
 # ---------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
+    def log_message(self, fmt, *args):
+        return
+
+    def _send_json(self, code: int, payload: dict):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        response = json.dumps({
-            "status": "healthy",
-            "service": "NEWS УКРАЇНА 365 Bot",
-            "donor_channels_count": len(DONOR_CHANNELS),
-            "regular_posts_last_hour": len(recent_regular_post_timestamps)
-        })
-        self.wfile.write(response.encode("utf-8"))
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            self._send_json(200, {"status": "ok", "service": "NEWS_365_BOT"})
+        else:
+            self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length)
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path != "/webhook":
+            self._send_json(404, {"error": "not_found"})
+            return
+
+        if TELEGRAM_WEBHOOK_SECRET:
+            incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(incoming, TELEGRAM_WEBHOOK_SECRET):
+                logger.warning("Webhook: невірний secret_token, запит відхилено")
+                self._send_json(403, {"error": "forbidden"})
+                return
 
         try:
-            update = json.loads(post_data.decode("utf-8"))
-            threading.Thread(target=handle_incoming_update, args=(update,), daemon=True).start()
-        except Exception as e:
-            logger.error(f"Помилка обробки вебхука від користувача: {e}")
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            update = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception as exc:
+            logger.warning("Webhook: не вдалося розпарсити update: %s", exc)
+            self._send_json(400, {"error": "bad_request"})
+            return
 
-    def log_message(self, format, *args):
-        pass
+        # Відповідаємо Telegram ОДРАЗУ (він ретраїть, якщо >60с), а обробку робимо у фоні
+        self._send_json(200, {"ok": True})
+        try:
+            threading.Thread(
+                target=handle_incoming_update,
+                args=(update,),
+                daemon=True
+            ).start()
+        except Exception as exc:
+            logger.error("Webhook: не вдалося запустити обробку: %s", exc)
 
-def start_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health check та Webhook сервер слухає порт {PORT}")
-    server.serve_forever()
 
 def keep_alive_pinger():
     if not RENDER_EXTERNAL_URL:
@@ -1918,14 +2202,20 @@ def keep_alive_pinger():
         except Exception:
             pass
 
-# ---------------------------------------------------------
-# ТОЧКА ВХОДУ
-# ---------------------------------------------------------
+
 if __name__ == "__main__":
-    server_thread = threading.Thread(target=start_health_server, daemon=True)
-    server_thread.start()
+    logger.info(f"Старт NEWS_365_BOT, порт {PORT}")
+    worker_thread = threading.Thread(target=bot_worker_loop, daemon=True)
+    worker_thread.start()
 
     pinger_thread = threading.Thread(target=keep_alive_pinger, daemon=True)
     pinger_thread.start()
 
-    bot_worker_loop()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"HTTP-сервер слухає 0.0.0.0:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Отримано SIGINT, зупиняюсь...")
+    finally:
+        server.server_close()
