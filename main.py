@@ -1227,7 +1227,7 @@ def stem_ru_ukr(word: str) -> str:
     if len(w) <= 3:
         return w
     w = w.replace("ы", "и").replace("э", "е").replace("ё", "е").replace("ъ", "")
-    w_norm = w.replace("і", "и").replace("ї", "и")
+    w_norm = re.sub(r"([а-яa-z])\1+", r"\1", w.replace("і", "и").replace("ї", "и"))
 
     if "войн" in w_norm or "вийн" in w_norm:
         return "войн"
@@ -1260,7 +1260,7 @@ def stem_ru_ukr(word: str) -> str:
         "яться", "ються", "ється", "итися", "атися", "уться", "ются", "ется",
         "емся", "етесь", "итесь", "ались", "ились", "елись",
         "ного", "ному", "ними", "них", "ний", "ним", "ною", "ній",
-        "ому", "ого", "его", "ему", "ими", "ыми", "ою", "ею", "ей", "ой", "ях", "ах", "ів", "ям", "ам",
+        "ому", "ого", "его", "ему", "ими", "ыми", "ої", "еї", "ою", "ею", "ей", "ой", "ях", "ах", "ів", "ям", "ам",
         "ами", "ями", "ові", "еві", "єві", "ий", "ій", "ый", "ать", "ить", "еть",
         "а", "е", "є", "и", "і", "о", "у", "ю", "я"
     ]
@@ -1316,7 +1316,9 @@ def is_duplicate_news(new_text: str, published_history: list, threshold: float =
         smaller_len = min(len(new_kw), len(old_kw))
         score = len(common) / smaller_len if smaller_len > 0 else 0
         rare_common = {w for w in common if len(w) >= 5 and w not in GENERIC_NEWS_STEMS}
-        if score >= threshold or (score >= 0.22 and len(rare_common) >= 4):
+        is_recent_short = bool(item.get("timestamp") and (now - item["timestamp"]) < 3 * 3600 and smaller_len <= 12)
+        non_generic_common = {w for w in common if w not in GENERIC_NEWS_STEMS}
+        if score >= threshold or (score >= 0.22 and len(rare_common) >= 4) or (is_recent_short and score >= 0.18 and len(non_generic_common) >= 2 and any(len(w) >= 6 for w in non_generic_common)):
             logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, рідкісні спільні корені: {rare_common or common}")
             return True
     return False
@@ -1765,7 +1767,9 @@ def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = Non
         first_line = rewritten.split('\n')[0].replace('*', '').strip() if rewritten else "(медіа без тексту)"
         if rewritten:
             global global_published_titles
-            global_published_titles.append(first_line)
+            body_preview = ' '.join(rewritten.split('\n')[1:]).replace('*', '').strip()[:120]
+            summary_entry = f"{first_line} ({body_preview})" if body_preview else first_line
+            global_published_titles.append(summary_entry)
             if len(global_published_titles) > 80:
                 global_published_titles.pop(0)
             with published_history_lock:
@@ -2106,7 +2110,9 @@ def bot_worker_loop():
                         mark_post_processed(seen_set, post_id)
                         current_t = time.time()
                         first_line = rewritten.split('\n')[0].replace('*', '').strip()
-                        global_published_titles.append(first_line)
+                        body_preview = ' '.join(rewritten.split('\n')[1:]).replace('*', '').strip()[:120]
+                        summary_entry = f"{first_line} ({body_preview})" if body_preview else first_line
+                        global_published_titles.append(summary_entry)
                         with published_history_lock:
                             h = load_published_history()
                             h.append({
