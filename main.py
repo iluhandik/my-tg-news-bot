@@ -12,7 +12,7 @@ import html
 import requests
 
 # ---------------------------------------------------------
-# НАЛАШТУВАННЯ ТА ЛОГУВАННЯ
+# НАЛАШТУВАННЯ ТА ЛОГУВНЯ
 # ---------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -1285,17 +1285,24 @@ def extract_keywords_stemmed(text: str) -> set:
     return stems
 
 
-GENERIC_NEWS_STEMS = {
+def _normalize_generic_stem(s: str) -> str:
+    s = s.lower().strip().replace("і", "и").replace("ї", "и").replace("ы", "и").replace("э", "е").replace("ё", "е").replace("ъ", "")
+    return re.sub(r"([а-яa-z])\1+", r"\1", s)
+
+
+_RAW_GENERIC_NEWS_STEMS = {
     'украин', 'україн', 'українськ', 'украинск', 'роси', 'росі', 'російськ', 'российск',
     'сша', 'трамп', 'путин', 'путін', 'зеленськ', 'войн', 'військ', 'військов', 'военн',
+    'допомог', 'підтрим', 'пакет', 'оборон', 'безпек', 'надан', 'надаст',
     'президент', 'президентськ', 'министр', 'міністр', 'официальн', 'офіційн',
     'заяв', 'повідом', 'сообщ', 'власт', 'влад', 'країн', 'стран', 'держав',
     'област', 'міст', 'город', 'люд', 'після', 'біл', 'щод', 'час', 'року',
     'дани', 'нові', 'нове', 'новин', 'пост', 'фото', 'віде', 'сьогодн', 'вже',
     'може', 'буде', 'також', 'післ', 'чере', 'європейськ', 'европейск',
     'американськ', 'американск', 'окупаційн', 'оккупацион', 'територ', 'ситуац',
-    'рішен', 'решен', 'поді', 'компан', 'робот', 'официйн', 'офіційн', 'продукци', 'продукці', 'ринок', 'рынок', 'російськ', 'українськ'
+    'рішен', 'решен', 'поді', 'компан', 'робот', 'официйн', 'продукци', 'продукці', 'ринок', 'рынок'
 }
+GENERIC_NEWS_STEMS = {_normalize_generic_stem(s) for s in _RAW_GENERIC_NEWS_STEMS}
 
 
 def is_duplicate_news(new_text: str, published_history: list, threshold: float = 0.36,
@@ -1318,7 +1325,7 @@ def is_duplicate_news(new_text: str, published_history: list, threshold: float =
         rare_common = {w for w in common if len(w) >= 5 and w not in GENERIC_NEWS_STEMS}
         is_recent_short = bool(item.get("timestamp") and (now - item["timestamp"]) < 3 * 3600 and smaller_len <= 12)
         non_generic_common = {w for w in common if w not in GENERIC_NEWS_STEMS}
-        if score >= threshold or (score >= 0.22 and len(rare_common) >= 4) or (is_recent_short and score >= 0.18 and len(non_generic_common) >= 2 and any(len(w) >= 6 for w in non_generic_common)):
+        if (score >= threshold and (len(non_generic_common) >= 1 or score >= 0.60)) or (score >= 0.22 and len(rare_common) >= 4) or (is_recent_short and score >= 0.18 and len(non_generic_common) >= 2 and any(len(w) >= 6 for w in non_generic_common)):
             logger.info(f"Алгоритмічний дублікат! Схожість {score:.2f}, рідкісні спільні корені: {rare_common or common}")
             return True
     return False
@@ -1767,9 +1774,7 @@ def _process_and_publish_admin_post(chat_id, raw_text: str, photo_url: str = Non
         first_line = rewritten.split('\n')[0].replace('*', '').strip() if rewritten else "(медіа без тексту)"
         if rewritten:
             global global_published_titles
-            body_preview = ' '.join(rewritten.split('\n')[1:]).replace('*', '').strip()[:120]
-            summary_entry = f"{first_line} ({body_preview})" if body_preview else first_line
-            global_published_titles.append(summary_entry)
+            global_published_titles.append(first_line)
             if len(global_published_titles) > 80:
                 global_published_titles.pop(0)
             with published_history_lock:
