@@ -311,6 +311,8 @@ STRICT_AD_KEYWORDS = [
     'закрити збір', 'відкрито збір', 'триває збір', 'підтримати збір', 'підтримайте збір',
     'долучайтеся до збору', 'долучитись до збору', 'збір у хлопців', 'збір для хлопців',
     'збір на авто', 'збір на дрон', 'збір на реб',
+    'потрібна допомога з', 'потрібна допомога на', 'потрібен пікап', 'евакуаційним пікапом',
+    'на евакуаційний пікап', 'потрібно авто', 'допоможіть закрити', 'хто скільки може',
     # Промо статей/аналітики та локальний політичний піар / заказуха
     'у статті «', 'в статті «', 'розглядається питання', 'розглядає, що', 'що стоїть за цими словами', 'кавказ.реалії', 'кавказ.реалии', 'розбирає, чому', 'розбирає, як', 'розбирає, що', 'розбираємо, чому', 'розбираємо, як', 'аналіз виконав',
     'загід краснов', 'загид краснов', 'громадської сили',
@@ -355,14 +357,16 @@ def is_irrelevant_russian_local_news(text: str) -> bool:
     """
     t = text.lower()
     war_or_ukraine_markers = [
-        'україн', 'украин', 'зсу', 'всу', 'гур', 'сбу', 'київ', 'киев',
-        'харків', 'одес', 'дніпр', 'запоріж', 'херсон', 'суми', 'львів',
+        'україн', 'украин', 'київ', 'киев',
+        'харків', 'одес', 'дніпр', 'запоріж', 'херсон', 'львів',
         'фронт', 'війн', 'войн', 'обстріл', 'обстрел', 'приліт', 'прилет',
-        'дрон', 'бпла', 'шахед', 'ракет', 'ппо', 'пво', 'нпз', 'вибух', 'взрыв',
+        'дрон', 'бпла', 'шахед', 'ракет', 'вибух', 'взрыв',
         'пожеж', 'пожар', 'окупац', 'оккупац', 'крим', 'крым', 'донбас',
-        'зеленськ', 'трамп', 'нато', 'санкц', 'мобілізац', 'контрактник'
+        'зеленськ', 'трамп', 'мобілізац', 'контрактник'
     ]
     if any(m in t for m in war_or_ukraine_markers):
+        return False
+    if re.search(r"\b(?:зсу|всу|гур|сбу|ппо|пво|нпз|нато|суми)\b", t):
         return False
 
     ru_local_markers = [
@@ -381,7 +385,9 @@ def is_irrelevant_russian_local_news(text: str) -> bool:
         'млн рублів', 'млрд рублів', 'млн рублей', 'млрд рублей',
         'wildberries', 'вайлдберриз', 'татяна кім', 'татьяна ким', 'бакальчук',
         'останнє слово в суді', 'последнее слово в суде', 'сюткін', 'сюткин',
-        "політв'яз", 'політв’яз', 'политзаключен'
+        "політв'яз", 'політв’яз', 'политзаключен',
+        'силуанов', 'набіуллін', 'набиуллин', 'мішустін', 'мишустин', 'чубайс',
+        'фінансового щита', 'бюджетного дефіциту', 'державних позик'
     ]
     return any(m in t for m in ru_local_markers)
 
@@ -628,7 +634,9 @@ SURZHYK_MAP = [
     (r'\bКадыров', 'Кадиров'),
     (r'\bЧеченої\b', 'Чеченської'),
     (r'\bнарекання\b', 'нарікання'),
-    (r'(нарікання|претензії|невдоволення)»?\s+у\s+владі\b', r'\1 у влади')
+    (r'(нарікання|претензії|невдоволення)»?\s+у\s+владі\b', r'\1 у влади'),
+    (r'\bКремлє\b', 'Кремль'),
+    (r'\bподаткова\s+меч\b', 'податковий меч')
 ]
 
 
@@ -808,7 +816,7 @@ SYSTEM_PROMPT = """Ти — головний редактор провідног
 
      За його словами, реальний прогрес почнеться лише тоді, коли **Трамп** і санкції створять жорсткий тиск на **воєнну машину РФ**.
 
-4. СУВОРО 100% ДЕРЖАВНА УКРАЇНСЬКА МОВА:
+4. СУВОРО 100% ДЕРЖАВНА УКРАЇНСКА МОВА:
    - Якщо новина російською мовою — ПОВНІСТЮ переклади заголовок і весь текст чистою солов'їною українською. Жодного російського слова («Запасаємося», «Заступниця керівника ОП»).
    - Стеж за граматичними родами, числом, пунктуацією та географією: не плутай країни з містами (пиши «у Бельгії», а не «в місті Бельгії»), узгоджуй підмет і присудок («Комісія оголосила», а не «Комісія оголосили»), узгоджуй роди («пропанового балона», «сильний землетрус», а не «сильне землетрус») і не став зайвих ком («що містив», а не «що, містив»).
    - Пиши правильні назви країн і природних явищ без вигаданих слів: «Молдова / Молдови» (НЕ «Молодової»), «підземні поштовхи» (НЕ «землетрусне підбурення» чи «тремтіння»), «у низці регіонів» (НЕ «в ряді регіонів»).
@@ -1153,16 +1161,28 @@ def has_russian_text(text: str) -> bool:
     return False
 
 
+def has_foreign_language_text(text: str) -> bool:
+    """Виявляє англомовні або не перекладені латиницею тексти."""
+    latin_count = len(re.findall(r"[a-zA-Z]", text))
+    cyrillic_count = len(re.findall(r"[а-яА-ЯіїєґІЇЄҐ]", text))
+    if latin_count > 25 and latin_count > cyrillic_count:
+        return True
+    if cyrillic_count < 12 and latin_count > 12:
+        return True
+    return False
+
+
 def _google_translate_ru_to_uk(text: str) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
+    src_lang = "en" if has_foreign_language_text(text) else "ru"
     try:
         resp = requests.get(
             "https://translate.googleapis.com/translate_a/single",
             params={
                 "client": "gtx",
-                "sl": "ru",
+                "sl": "auto",
                 "tl": "uk",
                 "dt": "t",
                 "q": text
@@ -1188,7 +1208,7 @@ def _google_translate_ru_to_uk(text: str) -> str:
         for ch in chunks:
             r2 = requests.get(
                 "https://api.mymemory.translated.net/get",
-                params={"q": ch, "langpair": "ru|uk"},
+                params={"q": ch, "langpair": f"{src_lang}|uk"},
                 headers=headers,
                 timeout=12
             )
@@ -1229,7 +1249,7 @@ def translate_to_ukrainian(text: str) -> str:
 
 
 def format_fallback_post(text: str) -> str:
-    if has_russian_text(text):
+    if has_russian_text(text) or has_foreign_language_text(text):
         text = translate_to_ukrainian(text)
         if not text.strip():
             return ""
@@ -1293,13 +1313,16 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
 
     content = clean_ai_fluff(content)
     content = clean_surzhyk_and_russian(content)
-    if has_russian_text(content):
+    if has_russian_text(content) or has_foreign_language_text(content):
         content = translate_to_ukrainian(content)
-        if not content.strip():
-            logger.warning("Після рерайту текст залишився російськомовним і переклад не вдався — пропуск.")
+        if not content.strip() or has_russian_text(content) or has_foreign_language_text(content):
+            logger.warning("Після рерайту текст залишився іншомовним (RU/EN) і переклад не вдався — пропуск.")
             return ""
     content = strip_donor_artifacts(content)
     content = remove_redundant_body(content)
+    if is_strict_ad(content) or is_irrelevant_russian_local_news(content) or is_corrupted_output(content):
+        logger.info("Повторний фільтр після рерайту відхилив рекламу/збір/РФ-флуд/обрив.")
+        return ""
 
     # Перевірка на галюцинації: якщо модель щось довигадала — робимо 1 сувору спробу з temperature=0.1
     if has_hallucinated_facts(cleaned_input, content):
@@ -1364,7 +1387,7 @@ def rewrite_news_for_admin(raw_text: str) -> str:
 
     content = clean_ai_fluff(content)
     content = clean_surzhyk_and_russian(content)
-    if has_russian_text(content):
+    if has_russian_text(content) or has_foreign_language_text(content):
         content = translate_to_ukrainian(content)
         if not content.strip():
             logger.warning("Переклад не вдався. Оформлюємо fallback-версію.")
