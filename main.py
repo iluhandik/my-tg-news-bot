@@ -970,12 +970,11 @@ def is_corrupted_output(text: str) -> bool:
     if any(g in t_lower for g in gibberish_words):
         return True
 
-    # Перевірка на обірваний посеред речення абзац (напр. "...заморозили приблизно триста")
+    # Перевірка на обірваний посеред речення абзац (напр. "Ексголова МЗ" або "...заморозили приблизно триста")
     if len(non_empty_lines) >= 2:
         last_clean = re.sub(r"[*_<>b/]+$", "", non_empty_lines[-1]).strip()
-        if len(last_clean) > 25 and (last_clean.endswith("...") or last_clean.endswith("…") or last_clean[-1] not in ".!?»\"')"):
+        if len(last_clean) >= 2 and (last_clean.endswith("...") or last_clean.endswith("…") or last_clean[-1] not in ".!?»\"'')"):
             return True
-
     return False
 
 
@@ -1373,6 +1372,8 @@ def rewrite_news(raw_text: str, published_titles: list) -> str:
             logger.warning("Повторна спроба також містила домисли. Пропускаємо пост, щоб не публікувати фейк.")
             return ""
         content = remove_redundant_body(strip_donor_artifacts(clean_surzhyk_and_russian(clean_ai_fluff(retry_content))))
+        if is_corrupted_output(content):
+            return ""
 
     return content
 
